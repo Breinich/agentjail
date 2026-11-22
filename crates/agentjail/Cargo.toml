@@ -1,0 +1,22 @@
+[package]
+name = "agentjail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CLI for agentjail: profiles, launch, selftest, doctor"
+default-run = "agentjail"
+
+[[bin]]
+name = "agentjail"
+path = "src/main.rs"
+
+[dependencies]
+agentjail-core = { path = "../agentjail-core" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

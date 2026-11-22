@@ -1,0 +1,334 @@
+name: ci
+
+# One required check named `ci`, plus a two-second `changes` job that decides
+# whether the expensive one needs to run. Every pull request produces a run and
+# therefore a check run: a job that is skipped reports Success, so a docs-only
+# PR stays mergeable instead of waiting forever on a required check that never
+# appeared. This repository is private, so runner minutes are billed; the
+# `changes` job is the only price paid for a PR that touches nothing that
+# affects the build.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artefacts only cost cache space we no longer pay for.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Cheap gate: one checkout, one shallow fetch of the base commit, one diff.
+  # No toolchain, no cache, no third-party path-filter action (the repository's
+  # selected-actions policy only allows GitHub-owned and verified actions).
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+      diagrams: ${{ steps.filter.outputs.diagrams }}
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Decide what needs to run
+        id: filter
+        run: |
+          set -euo pipefail
+          # Fetch exactly the base commit from the event. If that fails (or this
+          # is a manual run), treat everything as relevant: running the heavy
+          # job is cheaper than skipping a required check.
+          changed="__unknown__"
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base" ]; then
+            if git fetch --no-tags --depth=1 origin "$base"; then
+              changed="$(git diff --name-only "$base" HEAD || echo "__unknown__")"
+            fi
+          fi
+          printf '%s\n' "$changed"
+
+          relevant=false
+          diagrams=false
+          image=false
+          if [ "$changed" = "__unknown__" ]; then
+            relevant=true
+            diagrams=true
+            image=true
+          else
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              case "$path" in
+                *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|rust-toolchain.toml|schema/*|profiles/*|images/*|docs/diagrams/*|.github/workflows/*)
+                  relevant=true
+                  ;;
+              esac
+              case "$path" in
+                *.md|docs/diagrams/*) diagrams=true ;;
+              esac
+              case "$path" in
+                images/*|Cargo.lock) image=true ;;
+              esac
+            done <<< "$changed"
+          fi
+
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "diagrams=$diagrams" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          {
+            echo "### changes"
+            echo "- event: ${{ github.event_name }}"
+            echo "- relevant: $relevant"
+            echo "- diagrams: $diagrams"
+            echo "- image build: $image"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    name: ci
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      # No third-party toolchain action: this repository's Actions policy allows
+      # only GitHub-owned and verified actions, and a pinned third-party action
+      # was rejected at startup. rust-toolchain.toml is the single source of the
+      # pinned channel, components, and target; the runner image's own rustup
+      # installs exactly that. The component/target checks fail loudly instead of
+      # surfacing on the first cargo call.
+      - name: Rust toolchain (preinstalled rustup + rust-toolchain.toml)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          rustup --version
+          rustup show
+          rustup component list --installed
+          installed="$(rustup component list --installed)"
+          for component in clippy rustfmt; do
+            if ! printf '%s\n' "$installed" | grep -q "^${component}-"; then
+              echo "missing rustup component: $component" >&2
+              exit 1
+            fi
+          done
+          if ! rustup target list --installed | grep -qx x86_64-unknown-linux-musl; then
+            echo "missing rustup target: x86_64-unknown-linux-musl" >&2
+            exit 1
+          fi
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+
+      # Registry only: a ~380 MB target/ cache costs more to save and restore on
+      # a fresh runner than it saves, and the account was carrying one per ref.
+      - name: Cache cargo registry and git
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Which paths changed
+        id: changes
+        run: |
+          set -euo pipefail
+          changed="__unknown__"
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base" ]; then
+            if git fetch --no-tags --depth=1 origin "$base"; then
+              changed="$(git diff --name-only "$base" HEAD || echo "__unknown__")"
+            fi
+          fi
+          printf '%s\n' "$changed" > changed-files.txt
+          cat changed-files.txt
+
+          if printf '%s\n' "$changed" | grep -qE '__unknown__|(^|/)docs/diagrams/|\.md$'; then
+            echo "diagrams=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "diagrams=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$changed" | grep -qE '__unknown__|(^|/)images/|(^|/)Cargo\.lock$'; then
+            echo "image=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Cheapest first: a formatting error must not cost a compile.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy --locked -D warnings
+        timeout-minutes: 8
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: cargo test --locked
+        timeout-minutes: 8
+        run: cargo test --locked --workspace
+
+      - name: Validate example profiles
+        run: |
+          set -euo pipefail
+          for profile in profiles/*.toml; do
+            echo "== $profile"
+            cargo run --locked --quiet -p agentjail -- profile validate "$profile"
+          done
+          cargo run --locked --quiet -p agentjail-gateway -- --profile profiles/allowlist.toml --check
+
+      - name: A deliberately invalid profile fails
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cat > "$tmp/broken.toml" <<'TOML'
+          version = 1
+          workdir = "/work"
+          home = "/home/agent"
+          [image]
+          name = "localhost/agentjail-base:1"
+          digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          [network]
+          mode = "allowlist"
+          dns = "gateway"
+          [agent]
+          command = "bash"
+          TOML
+          if cargo run --locked --quiet -p agentjail -- profile validate "$tmp/broken.toml"; then
+            echo "expected validation to fail" >&2
+            exit 1
+          fi
+
+      - name: A bridged network is refused by run preflight
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cat > "$tmp/podman" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            --version) echo "podman version ci-fixture" ;;
+            info)
+              case "$3" in
+                *Rootless*) echo "true" ;;
+                *GraphDriverName*) echo "overlay" ;;
+                *CgroupManager*) echo "systemd" ;;
+              esac
+              ;;
+            network)
+              echo '[{"name":"bridged","driver":"bridge","internal":false,"subnets":[{"subnet":"10.88.0.0/16","gateway":"10.88.0.1"}]}]'
+              ;;
+          esac
+          SH
+          chmod +x "$tmp/podman"
+          cat > "$tmp/bridged.toml" <<'TOML'
+          version = 1
+          workdir = "/work"
+          home = "/home/agent"
+          [image]
+          name = "localhost/agentjail-base:1"
+          digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          [network]
+          name = "bridged"
+          mode = "none"
+          dns = "none"
+          [agent]
+          command = "bash"
+          TOML
+          AGENTJAIL_PODMAN="$tmp/podman" cargo run --locked --quiet -p agentjail -- run "$tmp/bridged.toml" \
+            > "$tmp/out" 2> "$tmp/err" && status=0 || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected a refusal (exit 1), got $status" >&2
+            cat "$tmp/out" "$tmp/err" >&2
+            exit 1
+          fi
+          grep -q "refusing to launch" "$tmp/err"
+          grep -q "not internal" "$tmp/err"
+
+      # One release build for the whole workspace, for one target. No per-binary
+      # invocations and no matrix.
+      - name: Static musl build (whole workspace)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target x86_64-unknown-linux-musl --workspace
+          target=target/x86_64-unknown-linux-musl/release
+          cli="$target/agentjail"
+          launcher="$target/agentjail-launcher"
+          gateway="$target/agentjail-gateway"
+          file "$cli" "$launcher" "$gateway"
+          for binary in "$cli" "$launcher" "$gateway"; do
+            if ldd "$binary" 2>&1 | grep -q "=>"; then
+              echo "$binary is dynamically linked" >&2
+              exit 1
+            fi
+          done
+          "$cli" --version
+          AGENTJAIL_ALLOW_ROOT=1 "$launcher" -- sh -c 'exit 7' \
+            && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
+          "$gateway" --profile profiles/allowlist.toml --check > /dev/null
+
+      # The remaining two checks are path-gated: a Rust-only PR must not pay for
+      # a PlantUML image pull or an image build.
+      - name: Diagrams (-checkonly, render, drift)
+        if: steps.changes.outputs.diagrams == 'true'
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          image='docker.io/plantuml/plantuml@sha256:2cf2f097652701319e29b9e6a809e68d4ddb06fbeeb696705c097da8fa6d0507'
+          if ! docker run --rm -v "$PWD/docs/diagrams:/d" "$image" -checkonly '/d/*.puml'; then
+            echo "::error::PlantUML syntax check failed; fix the file and line reported above"
+            exit 1
+          fi
+          docker run --rm --user 0:0 -v "$PWD/docs/diagrams:/d" "$image" -tsvg '/d/*.puml'
+          if ! git diff --exit-code -- docs/diagrams; then
+            echo "::error::committed SVGs are stale or were edited by hand; re-render with the pinned image (see docs/adopting.md)"
+            exit 1
+          fi
+
+      - name: Containerfile checks (static)
+        run: cargo test --locked -p agentjail --test containerfile
+
+      - name: Base image build (docker; only when images/ or Cargo.lock changed)
+        if: steps.changes.outputs.image == 'true'
+        timeout-minutes: 6
+        continue-on-error: true
+        run: |
+          docker build -f images/base/Containerfile -t localhost/agentjail-base:ci images/base
+          docker image inspect --format '{{.Id}} {{.Size}}' localhost/agentjail-base:ci
+
+      # No uploads on success; only a failing run leaves an artefact behind.
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            changed-files.txt
+            target/x86_64-unknown-linux-musl/release/agentjail
+            target/x86_64-unknown-linux-musl/release/agentjail-launcher
+            target/x86_64-unknown-linux-musl/release/agentjail-gateway
+            docs/diagrams/*.svg
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### ci run" >> "$GITHUB_STEP_SUMMARY"
+          echo "- event: ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- changed files: $(wc -l < changed-files.txt 2>/dev/null || echo 0)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- diagrams step: ${{ steps.changes.outputs.diagrams }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- image build step: ${{ steps.changes.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"

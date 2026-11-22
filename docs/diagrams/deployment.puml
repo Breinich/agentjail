@@ -1,0 +1,33 @@
+@startuml deployment
+' UML deployment diagram: one jail, one route out.
+' Source of record for docs/diagrams/deployment.svg. Do not edit the SVG.
+title agentjail: one jail, one route out
+
+node "host" as host {
+  node "rootless podman" as runtime {
+    node "jail container" as jail {
+      artifact "agentjail-launcher\nstatic musl, PID 1" as launcher
+      component "agent process\nuid 10000, own home" as agent
+      launcher --> agent : exec, inherited fds
+    }
+
+    node "gateway container" as gateway {
+      component "agentjail-gateway\nDNS pinning + CONNECT allowlist" as proxy
+    }
+
+    node "internal network\ninternal=true, no upstream route" as net
+    jail --> net : attached
+    gateway --> net : attached
+  }
+
+  database "host credentials\nfiles, runtime socket" as secrets
+}
+
+cloud "allowlisted destination" as zone {
+  node "host:port from network.egress" as endpoint
+}
+
+agent --> gateway : CONNECT host:port\n(only allowlisted)
+gateway --> endpoint : TLS or TCP\n(only allowlisted)
+agent ..> secrets : no route, no peer, no socket\nrefused outside the agent
+@enduml

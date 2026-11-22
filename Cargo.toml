@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/agentjail-core", "crates/agentjail", "crates/agentjail-launcher", "crates/agentjail-gateway"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+license = "Apache-2.0"
+repository = "https://github.com/Breinich/agentjail"
+authors = ["agentjail contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+# No default features: the validator must not carry an HTTP resolver.
+jsonschema = { version = "0.62", default-features = false }
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.32", features = ["signal", "process"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+# The launcher and gateway are copied into jails; a static, small binary is the
+# point, so abort rather than unwind on panic.
+panic = "abort"

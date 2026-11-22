@@ -1,0 +1,13 @@
+@startuml run-lifecycle
+' UML state machine diagram: what `run` is allowed to do, in order.
+' Source of record for docs/diagrams/run-lifecycle.svg. Do not edit the SVG.
+title run: validate, verify, exec, reap
+
+[*] --> Validated : profile parses and validates
+Validated --> Refused : single-route invariant fails
+Validated --> NetworkReady : internal network verified
+NetworkReady --> Running : container starts, agent exec'd
+Running --> Reaped : agent exits or dies from signal
+Reaped --> [*] : container removed, exit code returned
+Refused --> [*] : exit 1, nothing started
+@enduml

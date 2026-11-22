@@ -1,0 +1,20 @@
+[package]
+name = "agentjail-launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Exec-in-jail shim: pipes, signal and resize forwarding, exit-code propagation"
+
+[[bin]]
+name = "agentjail-launcher"
+path = "src/main.rs"
+
+[dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+nix = { workspace = true }
+serde_json = { workspace = true }

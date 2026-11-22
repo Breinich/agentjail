@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1
+#
+# agentjail base image: common agent runtimes on a pinned Debian slim base.
+#
+# Build (rootless podman, from the repository root):
+#   podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
+#
+# The build needs network access for apt and npm. The image contains no
+# credentials and no agentjail state; everything a jail needs at run time is
+# supplied by the launcher.
+#
+# The base is pinned by digest. Tags move; digests do not. Update it with
+#   podman pull docker.io/library/node:24-bookworm-slim
+#   podman image inspect --format '{{index .RepoDigests 0}}' \
+#     docker.io/library/node:24-bookworm-slim
+#
+FROM docker.io/library/node:24-bookworm-slim@sha256:0e2646ab57e77b7a384a0cb59b6815b182c77e1f9c3ba36bd8435bd9c4e6680e
+
+LABEL org.opencontainers.image.title="agentjail-base" \
+      org.opencontainers.image.description="Agent runtimes for an agentjail rootless Podman jail" \
+      org.opencontainers.image.source="https://github.com/Breinich/agentjail" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+# No interactive prompts, no pip cache, no HOME pointing at root.
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    HOME=/home/agent \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+
+# Common runtimes and the tools agents expect. Keep this list boring: every
+# package is attack surface inside the jail.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      git \
+      git-lfs \
+      jq \
+      less \
+      openssh-client \
+      procps \
+      python3 \
+      python3-pip \
+      python3-venv \
+      ripgrep \
+      tar \
+      tini \
+      unzip \
+      xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+# Unprivileged agent user with a fixed, allocatable uid/gid. The jail never
+# runs as root, so a container escape starts from an unprivileged uid.
+RUN groupadd --gid 10000 agent \
+ && useradd --uid 10000 --gid 10000 --create-home --home-dir /home/agent \
+      --shell /bin/bash agent \
+ && install -d -o agent -g agent -m 0755 /work /opt/agentjail \
+ && install -d -o agent -g agent -m 0755 /home/agent/.cache /home/agent/.config
+
+# Node is already present in the base image. Global CLIs are installed with
+# --ignore-scripts so a compromised package cannot run postinstall hooks during
+# the image build; anything an agent installs later runs inside the jail, where
+# it has no host reach. The npm cache lives in /tmp so the agent home stays
+# owned by the agent.
+RUN npm install --global --ignore-scripts --cache /tmp/npm-cache \
+      typescript@5.7.3 \
+ && rm -rf /tmp/npm-cache
+
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/agentjail-entrypoint
+
+USER 10000:10000
+WORKDIR /work
+
+# tini as PID 1 reaps orphaned children so a killed agent cannot leave zombies
+# behind; the entrypoint then execs the agent so it inherits the pipes.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/agentjail-entrypoint"]
+CMD ["bash", "-l"]
