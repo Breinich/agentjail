@@ -1,0 +1,12 @@
+version: 2
+# Config for ggshield (local and CI secret scanning). The GitGuardian GitHub App
+# also posts a "GitGuardian Security Checks" status on every PR.
+secret:
+  # Test fixtures deliberately contain fake credentials so the jail can be shown
+  # keeping them out of reach. They are synthetic values, never live ones.
+  ignored-paths:
+    - "tests/fixtures/**"
+    - "**/tests/fixtures/**"
+    - "**/fixtures/**/*.env"
+  ignored-matches: []
+  show-secrets: false
