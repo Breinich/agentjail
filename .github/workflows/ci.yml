@@ -1,0 +1,192 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt (rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: tests (cargo test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - run: cargo test --workspace
+
+  profiles:
+    name: profile schema validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Validate every example profile
+        run: |
+          set -euo pipefail
+          for profile in profiles/*.toml; do
+            echo "== $profile"
+            cargo run --quiet -p agentjail -- profile validate "$profile"
+          done
+      - name: Gateway accepts the allowlist profile
+        run: cargo run --quiet -p agentjail-gateway -- --profile profiles/allowlist.toml --check
+      - name: A deliberately invalid profile fails non-zero
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cat > "$tmp/broken.toml" <<'TOML'
+          version = 1
+          workdir = "/work"
+          home = "/home/agent"
+          [image]
+          name = "localhost/agentjail-base:1"
+          digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          [network]
+          mode = "allowlist"
+          dns = "gateway"
+          [agent]
+          command = "bash"
+          TOML
+          if cargo run --quiet -p agentjail -- profile validate "$tmp/broken.toml"; then
+            echo "expected validation to fail" >&2
+            exit 1
+          fi
+      - name: A bridged network is refused by run preflight
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cat > "$tmp/podman" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            --version) echo "podman version ci-fixture" ;;
+            info)
+              case "$3" in
+                *Rootless*) echo "true" ;;
+                *GraphDriverName*) echo "overlay" ;;
+                *CgroupManager*) echo "systemd" ;;
+              esac
+              ;;
+            network)
+              echo '[{"name":"bridged","driver":"bridge","internal":false,"subnets":[{"subnet":"10.88.0.0/16","gateway":"10.88.0.1"}]}]'
+              ;;
+          esac
+          SH
+          chmod +x "$tmp/podman"
+          cat > "$tmp/bridged.toml" <<'TOML'
+          version = 1
+          workdir = "/work"
+          home = "/home/agent"
+          [image]
+          name = "localhost/agentjail-base:1"
+          digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          [network]
+          name = "bridged"
+          mode = "none"
+          dns = "none"
+          [agent]
+          command = "bash"
+          TOML
+          AGENTJAIL_PODMAN="$tmp/podman" cargo run --quiet -p agentjail -- run "$tmp/bridged.toml" \
+            > "$tmp/out" 2> "$tmp/err" && status=0 || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected a refusal (exit 1), got $status" >&2
+            cat "$tmp/out" "$tmp/err" >&2
+            exit 1
+          fi
+          grep -q "refusing to launch" "$tmp/err"
+          grep -q "not internal" "$tmp/err"
+
+  containerfile:
+    name: Containerfile checks (static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - run: cargo test -p agentjail --test containerfile
+
+  musl:
+    name: static musl build (launcher + gateway)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          targets: x86_64-unknown-linux-musl
+      - name: Build static binaries
+        run: cargo build --release --target x86_64-unknown-linux-musl -p agentjail-launcher -p agentjail-gateway
+      - name: They are static and they run
+        run: |
+          set -euo pipefail
+          file target/x86_64-unknown-linux-musl/release/agentjail-launcher
+          file target/x86_64-unknown-linux-musl/release/agentjail-gateway
+          if ldd target/x86_64-unknown-linux-musl/release/agentjail-launcher 2>&1 | grep -q "=>"; then
+            echo "launcher is dynamically linked" >&2
+            exit 1
+          fi
+          AGENTJAIL_ALLOW_ROOT=1 ./target/x86_64-unknown-linux-musl/release/agentjail-launcher -- sh -c 'exit 7' \
+            && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
+          ./target/x86_64-unknown-linux-musl/release/agentjail-gateway \
+            --profile profiles/allowlist.toml --check > /dev/null
+
+  image-build:
+    # Non-blocking on purpose: a real build depends on the apt and npm mirrors,
+    # which are an external service. A red run here is a signal to investigate,
+    # not a merge blocker; the static Containerfile job above is the blocker.
+    name: Containerfile build (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: containerfile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman
+          podman --version
+          podman info --format '{{.Host.Security.Rootless}}'
+      - name: Build the base image
+        run: |
+          podman build \
+            --tag localhost/agentjail-base:ci \
+            --file images/base/Containerfile \
+            images/base
+          podman image inspect --format '{{.Id}} {{.Size}}' localhost/agentjail-base:ci

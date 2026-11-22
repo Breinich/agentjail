@@ -1,0 +1,15 @@
+[package]
+name = "agentjail-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Profile model, validation, network posture checks, and host diagnostics for agentjail"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+jsonschema = { workspace = true }

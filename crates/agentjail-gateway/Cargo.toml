@@ -1,0 +1,17 @@
+[package]
+name = "agentjail-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "DNS and CONNECT egress gateway: the jail's only route out"
+
+[[bin]]
+name = "agentjail-gateway"
+path = "src/main.rs"
+
+[dependencies]
+agentjail-core = { path = "../agentjail-core" }
+clap = { workspace = true }

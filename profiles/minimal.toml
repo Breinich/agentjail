@@ -1,0 +1,40 @@
+# Minimal jail: no network at all, no mounts, no secrets.
+#
+# This is the profile to reason about first: if a task cannot be done here,
+# the extra capability it needs should be added one field at a time.
+version = 1
+description = "Offline jail: no egress, no mounts, no secrets."
+
+workdir = "/work"
+home = "/home/agent"
+
+[image]
+name = "localhost/agentjail-base:1"
+# NOTE: placeholder. Run `podman build -f images/base/Containerfile -t
+# localhost/agentjail-base:1 images/base` and paste the digest that
+# `podman image inspect --format '{{.Digest}}' localhost/agentjail-base:1`
+# prints. Tag names are never trusted on their own; the digest is the pin.
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[network]
+mode = "none"
+# "none" means no resolver is set up in the jail at all -- podman rejects DNS
+# options together with an isolated network, so there is nothing to inherit.
+# Allowlist profiles get --dns-search . so host search domains cannot leak in.
+dns = "none"
+
+[resources]
+cpus = 1
+memory = "1g"
+pids = 256
+nofile = 1024
+disk = "2g"
+
+[resources.tmpfs]
+"/tmp" = "64m"
+
+[agent]
+# A profile is agent-agnostic: this is any executable in the image, with any
+# arguments. Replace with pi, claude, codex, opencode, or your own program.
+command = "bash"
+args = ["-l"]

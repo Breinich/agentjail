@@ -1,0 +1,455 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Breinich/agentjail/blob/main/schema/profile.schema.json",
+  "title": "agentjail profile",
+  "description": "Machine-readable description of an agentjail profile. A profile is written as TOML (profiles/<name>.toml) and validated against this document before anything is launched. The document is agent-agnostic: it never names a harness, a session, or a vendor-specific credential. See docs/profiles.md for the prose reference and the semantics of each field.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "image",
+    "workdir",
+    "home",
+    "network",
+    "agent"
+  ],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Profile format version. Bumped only for breaking changes."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "Human-readable summary of what this jail is for."
+    },
+    "image": {
+      "$ref": "#/$defs/image"
+    },
+    "workdir": {
+      "$ref": "#/$defs/absolutePath"
+    },
+    "home": {
+      "$ref": "#/$defs/absolutePath"
+    },
+    "mounts": {
+      "type": "array",
+      "description": "Host paths exposed inside the jail. Anything not listed here does not exist inside the jail.",
+      "items": {
+        "$ref": "#/$defs/mount"
+      },
+      "default": []
+    },
+    "env": {
+      "type": "object",
+      "description": "Literal, non-secret environment values. Names that look like credentials are rejected: use secrets[] instead.",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "integer",
+          "boolean"
+        ]
+      },
+      "default": {}
+    },
+    "secrets": {
+      "type": "array",
+      "description": "Credentials, by reference only. Inline values are rejected. Secrets are delivered to the agent process environment (or to a tmpfs file) at launch time and never baked into the image or a bind mount.",
+      "items": {
+        "$ref": "#/$defs/secret"
+      },
+      "default": []
+    },
+    "network": {
+      "$ref": "#/$defs/network"
+    },
+    "resources": {
+      "$ref": "#/$defs/resources"
+    },
+    "agent": {
+      "$ref": "#/$defs/agent"
+    }
+  },
+  "allOf": [
+    {
+      "description": "network.mode=none means no route at all and no resolver.",
+      "if": {
+        "required": [
+          "network"
+        ],
+        "properties": {
+          "network": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "const": "none"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "network": {
+            "properties": {
+              "egress": {
+                "maxItems": 0
+              },
+              "dns": {
+                "enum": [
+                  "none"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "network.mode=allowlist requires at least one destination and a DNS strategy that does not hand the agent a general-purpose resolver.",
+      "if": {
+        "required": [
+          "network"
+        ],
+        "properties": {
+          "network": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "const": "allowlist"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "network": {
+            "properties": {
+              "egress": {
+                "minItems": 1
+              },
+              "dns": {
+                "enum": [
+                  "gateway",
+                  "pinned"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^/[^\\u0000]+$",
+      "description": "Absolute POSIX path inside the jail (or on the host for mounts)."
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "digest"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?::[0-9]+)?(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)+(?::[a-zA-Z0-9._-]+)?$",
+          "description": "Fully qualified image reference including registry and optional tag, e.g. ghcr.io/breinich/agentjail-base:1."
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Content digest the reference must resolve to. Tags are never trusted on their own."
+        }
+      }
+    },
+    "mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "target"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/absolutePath",
+          "description": "Absolute host path. Paths backed by FUSE (AppImage mounts such as /tmp/.mount_*/, gvfs, /run/user/*/doc) are rejected during semantic validation: crun cannot bind-mount them into the jail. Copy the runtime into the image or into a workspace-visible directory instead."
+        },
+        "target": {
+          "$ref": "#/$defs/absolutePath"
+        },
+        "read_only": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mount read-only. Defaults to true; writable mounts must be requested explicitly."
+        },
+        "required": {
+          "type": "boolean",
+          "default": true,
+          "description": "Fail the launch if the host path is missing. When false the mount is skipped and the launch continues."
+        }
+      }
+    },
+    "secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "ref",
+        "target"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "description": "Optional label used in diagnostics. Never printed with a value."
+        },
+        "source": {
+          "enum": [
+            "env",
+            "file",
+            "store"
+          ],
+          "description": "Where the reference points: a host environment variable, a host file, or a credential-store entry."
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "The reference itself: env var name, absolute host file path, or credential-store item identifier. Never the secret value."
+        },
+        "delivery": {
+          "enum": [
+            "env",
+            "file"
+          ],
+          "default": "env",
+          "description": "How the secret reaches the agent: as an environment variable of the agent process (default) or as a file on a tmpfs-backed path inside the jail."
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Where the secret appears inside the jail: the environment variable name when delivery=env, an absolute path when delivery=file."
+        },
+        "mode": {
+          "type": "string",
+          "pattern": "^0?[0-7]{3}$",
+          "description": "File mode for delivery=file (default 0400). Not allowed for delivery=env."
+        }
+      },
+      "allOf": [
+        {
+          "description": "delivery=env targets an environment variable name.",
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "delivery": {
+                    "const": "env"
+                  }
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "delivery"
+                  ]
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              }
+            }
+          }
+        },
+        {
+          "description": "delivery=file targets an absolute path inside a tmpfs mount.",
+          "if": {
+            "properties": {
+              "delivery": {
+                "const": "file"
+              }
+            },
+            "required": [
+              "delivery"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "$ref": "#/$defs/absolutePath"
+              }
+            }
+          }
+        },
+        {
+          "description": "mode is only meaningful for file delivery.",
+          "if": {
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "delivery": {
+                "const": "file"
+              }
+            },
+            "required": [
+              "delivery"
+            ]
+          }
+        }
+      ]
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "dns"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+          "description": "Attach to this existing podman network instead of creating one. The single-route invariant is verified from outside (this network's metadata) and from inside (inside the jail) on every start; run refuses a network that is not internal. Omit to let the launcher create a dedicated internal network."
+        },
+        "mode": {
+          "enum": [
+            "none",
+            "allowlist"
+          ],
+          "description": "none: the jail is attached to an internal network with no route out. allowlist: the only route out is the egress gateway, which permits the listed destinations."
+        },
+        "dns": {
+          "enum": [
+            "none",
+            "gateway",
+            "pinned"
+          ],
+          "description": "DNS strategy. none: no resolver. gateway: DNS is answered and pinned by the egress gateway. pinned: static entries only, no recursive resolver. Required with no default so it can never be unset by accident: an inherited host search domain can silently resolve internal names and defeat an allowlist. When the jail has a resolver (allowlist mode), the launcher additionally passes --dns-search . so host search domains cannot leak in; with dns=none there is no resolver at all (see docs/threat-model.md)."
+        },
+        "egress": {
+          "type": "array",
+          "description": "Destinations the egress gateway may permit.",
+          "items": {
+            "$ref": "#/$defs/egress"
+          },
+          "default": []
+        }
+      }
+    },
+    "egress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "port"
+      ],
+      "properties": {
+        "host": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$",
+          "description": "DNS name the gateway may resolve and connect to. Wildcards, schemes, paths, and ports belong elsewhere and are rejected."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "protocol": {
+          "enum": [
+            "tls",
+            "http",
+            "tcp"
+          ],
+          "default": "tls",
+          "description": "tls: HTTPS CONNECT with SNI pinned to host. http: plaintext CONNECT. tcp: raw TCP relay to host:port with no protocol inspection."
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpus": {
+          "type": [
+            "number",
+            "integer"
+          ],
+          "minimum": 0.1,
+          "maximum": 64,
+          "description": "CPU quota in cores."
+        },
+        "memory": {
+          "type": "string",
+          "pattern": "^[0-9]+[kKmMgG]?$",
+          "description": "Memory limit, e.g. 512m or 4g."
+        },
+        "pids": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4194304,
+          "description": "Maximum number of processes/threads."
+        },
+        "nofile": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 1048576,
+          "description": "Open file descriptor limit (RLIMIT_NOFILE)."
+        },
+        "tmpfs": {
+          "type": "object",
+          "description": "In-jail tmpfs mounts, keyed by absolute path. Every path listed here becomes a size-limited tmpfs; this is how scratch space (including secret delivery paths) gets a hard disk budget.",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9]+[kKmMgG]?$"
+          }
+        },
+        "disk": {
+          "type": "string",
+          "pattern": "^[0-9]+[kKmMgG]?$",
+          "description": "Size limit for the jail's writable layer, e.g. 4g. Enforced with the storage driver's per-container size option when the driver supports it; doctor reports when it cannot be."
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "Executable to run inside the jail, e.g. pi, claude, codex, opencode, or any other program."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Default arguments. Supports the placeholders {workdir} and {home}; anything else in braces is rejected."
+        }
+      }
+    }
+  }
+}

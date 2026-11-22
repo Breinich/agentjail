@@ -1,0 +1,7 @@
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+# The launcher and gateway are bind-mounted into jails built from arbitrary
+# bases, so they are built static against musl (see docs/cli.md).
+targets = ["x86_64-unknown-linux-musl"]
+profile = "minimal"

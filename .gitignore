@@ -1,0 +1,12 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Local profiles and jail state must never be committed
+profiles/local/
+profiles/*.local.toml
+.agentjail/
+
+# Local scratch
+.venv/
+*.log
