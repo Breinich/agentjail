@@ -19,7 +19,7 @@ FROM docker.io/library/node:24-bookworm-slim@sha256:0e2646ab57e77b7a384a0cb59b68
 LABEL org.opencontainers.image.title="agentjail-base" \
       org.opencontainers.image.description="Agent runtimes for an agentjail rootless Podman jail" \
       org.opencontainers.image.source="https://github.com/Breinich/agentjail" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="Apache-2.0"
 
 # No interactive prompts, no pip cache, no HOME pointing at root.
 ENV DEBIAN_FRONTEND=noninteractive \

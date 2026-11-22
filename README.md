@@ -195,4 +195,4 @@ bind-mounted into a jail built from any base, including `scratch`.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+Apache-2.0 (the repository's `LICENSE`, from `main`).

@@ -6,7 +6,7 @@ members = ["crates/agentjail-core", "crates/agentjail", "crates/agentjail-launch
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.100"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/Breinich/agentjail"
 authors = ["agentjail contributors"]
 
