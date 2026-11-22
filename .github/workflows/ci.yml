@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    name: tests (pytest, python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: pytest
+        run: pytest -q
+
+  profiles:
+    name: profile schema validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e .
+      - name: Packaged schema matches canonical schema
+        run: python scripts/sync_schema.py --check
+      - name: Validate every example profile
+        run: |
+          set -euo pipefail
+          for profile in profiles/*.toml; do
+            echo "== $profile"
+            python -m agentjail profile validate "$profile"
+          done
+      - name: Validate a deliberately invalid profile fails
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cat > "$tmp/broken.toml" <<'TOML'
+          version = 1
+          workdir = "/work"
+          home = "/home/agent"
+          [image]
+          name = "localhost/agentjail-base:1"
+          digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          [network]
+          mode = "allowlist"
+          dns = "gateway"
+          [agent]
+          command = "bash"
+          TOML
+          if python -m agentjail profile validate "$tmp/broken.toml"; then
+            echo "expected validation to fail" >&2
+            exit 1
+          fi
+
+  containerfile:
+    name: Containerfile checks (static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Digest pins, non-root user, no build-time secrets
+        run: python scripts/check_containerfile.py images
+
+  image-build:
+    # Non-blocking on purpose: a real build depends on the apt and npm mirrors,
+    # which are an external service. A red run here is a signal to investigate,
+    # not a merge blocker; the static Containerfile job above is the blocker.
+    name: Containerfile build (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: containerfile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman
+          podman --version
+          podman info --format '{{.Host.Security.Rootless}}'
+      - name: Build the base image
+        run: |
+          podman build \
+            --tag localhost/agentjail-base:ci \
+            --file images/base/Containerfile \
+            images/base
+          podman image inspect --format '{{.Id}} {{.Size}}' localhost/agentjail-base:ci
