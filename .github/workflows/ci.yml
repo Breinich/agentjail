@@ -1,22 +1,14 @@
 name: ci
 
-# One job, one runner boot: this repository is private, so every runner minute
-# and every cache byte is billed. No matrix, no `push` trigger (a pull request
-# commit would otherwise run twice), and the event path allowlist below keeps
-# documentation-only changes from starting a build at all while still checking
-# diagram changes.
+# One required check named `ci`, plus a two-second `changes` job that decides
+# whether the expensive one needs to run. Every pull request produces a run and
+# therefore a check run: a job that is skipped reports Success, so a docs-only
+# PR stays mergeable instead of waiting forever on a required check that never
+# appeared. This repository is private, so runner minutes are billed; the
+# `changes` job is the only price paid for a PR that touches nothing that
+# affects the build.
 on:
   pull_request:
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "schema/**"
-      - "profiles/**"
-      - "images/**"
-      - "docs/diagrams/**"
-      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
@@ -32,8 +24,78 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Cheap gate: one checkout, one shallow fetch of the base commit, one diff.
+  # No toolchain, no cache, no third-party path-filter action (the repository's
+  # selected-actions policy only allows GitHub-owned and verified actions).
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+      diagrams: ${{ steps.filter.outputs.diagrams }}
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Decide what needs to run
+        id: filter
+        run: |
+          set -euo pipefail
+          # Fetch exactly the base commit from the event. If that fails (or this
+          # is a manual run), treat everything as relevant: running the heavy
+          # job is cheaper than skipping a required check.
+          changed="__unknown__"
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base" ]; then
+            if git fetch --no-tags --depth=1 origin "$base"; then
+              changed="$(git diff --name-only "$base" HEAD || echo "__unknown__")"
+            fi
+          fi
+          printf '%s\n' "$changed"
+
+          relevant=false
+          diagrams=false
+          image=false
+          if [ "$changed" = "__unknown__" ]; then
+            relevant=true
+            diagrams=true
+            image=true
+          else
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              case "$path" in
+                *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|rust-toolchain.toml|schema/*|profiles/*|images/*|docs/diagrams/*|.github/workflows/*)
+                  relevant=true
+                  ;;
+              esac
+              case "$path" in
+                *.md|docs/diagrams/*) diagrams=true ;;
+              esac
+              case "$path" in
+                images/*|Cargo.lock) image=true ;;
+              esac
+            done <<< "$changed"
+          fi
+
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "diagrams=$diagrams" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          {
+            echo "### changes"
+            echo "- event: ${{ github.event_name }}"
+            echo "- relevant: $relevant"
+            echo "- diagrams: $diagrams"
+            echo "- image build: $image"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ci:
     name: ci
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -86,10 +148,6 @@ jobs:
         id: changes
         run: |
           set -euo pipefail
-          # Base SHA comes from the event, so no history depth is needed for the
-          # common case. If the fetch or diff fails, treat it as "everything
-          # changed": running a gated step is cheaper than skipping a required
-          # check.
           changed="__unknown__"
           base="${{ github.event.pull_request.base.sha }}"
           if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base" ]; then

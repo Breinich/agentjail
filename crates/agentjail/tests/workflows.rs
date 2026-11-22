@@ -118,16 +118,41 @@ fn triggers_stay_as_the_owner_decided() {
         !triggers.contains("push:"),
         "no speculative push trigger: {triggers}"
     );
-    // A paths allowlist, not a denylist: documentation-only changes must not
-    // start a build, but a diagram change must still reach the check.
+    // No workflow-level `paths:`: that would mean no run at all for a PR that
+    // touches only unlisted files, leaving a required `ci` check pending forever.
+    // Filtering happens inside the `changes` job instead, and a skipped job
+    // reports Success.
     assert!(
-        triggers.contains("paths:"),
-        "expected a paths allowlist: {triggers}"
+        !triggers.contains("paths:"),
+        "path filtering must be job-level, not event-level: {triggers}"
     );
-    assert!(triggers.contains("docs/diagrams/**"), "{triggers}");
-    assert!(triggers.contains("**/*.rs"), "{triggers}");
+}
+
+#[test]
+fn the_heavy_job_is_gated_by_the_changes_job() {
+    let text = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+        .expect("read ci workflow");
+
+    // A cheap gate that every run starts, with no toolchain and no third-party
+    // path-filter action.
+    assert!(text.contains("\n  changes:\n"), "missing changes job");
     assert!(
-        !triggers.contains("**/*.md"),
-        "Markdown-only changes must not start CI: {triggers}"
+        text.contains("relevant: ${{ steps.filter.outputs.relevant }}"),
+        "changes job must expose a relevant output"
+    );
+    assert!(
+        !text.contains("dorny/paths-filter") && !text.contains("tj-actions/changed-files"),
+        "a third-party path filter would be rejected by the selected-actions policy"
+    );
+
+    // The expensive job consumes it and is skipped (reported as Success) when
+    // the change cannot affect the build.
+    assert!(
+        text.contains("needs: changes"),
+        "heavy job must need changes"
+    );
+    assert!(
+        text.contains("if: needs.changes.outputs.relevant == 'true'"),
+        "heavy job must be gated on the relevant output"
     );
 }
