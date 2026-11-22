@@ -140,7 +140,7 @@ Increment 1 is the scaffolding PR. Spell it out plainly:
 | `profile validate`, `profile show` | **implemented** |
 | `doctor`, including the outside network-invariant check (`--network NAME`) | **implemented** |
 | CLI wiring, exit codes, help text, launcher/selftest contracts | **implemented** |
-| `agentjail-launcher`: pipes, SIGINT/SIGTERM/SIGQUIT + resize forwarding, exit codes, root refusal | **implemented** and tested |
+| `agentjail-launcher`: pipes, SIGINT/SIGTERM/SIGQUIT + resize forwarding, exit codes, root refusal, 3-turn JSON-RPC over pipes | **implemented** and tested |
 | `run` (container launch, secret injection, inside network check, cleanup) | **not implemented** (exit 3) |
 | `selftest` (negative set + positive control) | **not implemented** (exit 3) |
 | Gateway proxy (DNS pinning, CONNECT allowlist) | **not implemented** — allowlist parsing only (exit 3) |
@@ -189,8 +189,8 @@ changed paths. The repository is private, so billed minutes are a design
 constraint (`docs/adopting.md`).
 
 Runtime dependencies: none for the launcher, and no HTTP client anywhere — the
-JSON Schema validator is built without its network resolver. The launcher and
-gateway are static-pie binaries (about 485 KB and 6 MB) so they can be
+JSON Schema validator is built without its network resolver. All three binaries
+are static-pie (CLI, launcher, and gateway), so the launcher and gateway can be
 bind-mounted into a jail built from any base, including `scratch`.
 
 ## License

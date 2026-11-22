@@ -28,8 +28,11 @@ The agent runs with **pipes, not a TTY**:
 
 This is what a host harness needs: a container turns sockets into pipes, so the
 pipes/SIGTERM/exit-code/resize path decides whether adoption is possible at all.
-The later acceptance test is a 3+ turn JSON-RPC session over stdio inside the
-jail.
+`crates/agentjail-launcher/tests/transport.rs` already drives a line-framed
+JSON-RPC peer through the launcher for three round trips, closes stdin, and
+asserts a clean shutdown and exit code; it also covers SIGINT, SIGTERM,
+SIGQUIT, and SIGWINCH forwarding. The remaining acceptance test is the same
+session **inside the jail**, which needs the run path.
 
 ![Launcher contract: pipes, signals, exit code](diagrams/launcher-sequence.svg)
 

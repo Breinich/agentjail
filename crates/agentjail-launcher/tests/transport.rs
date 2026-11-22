@@ -147,3 +147,212 @@ fn is_root() -> bool {
         .map(|uid| uid == "0")
         .unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------
+// Signal coverage: SIGINT, SIGQUIT, SIGWINCH
+// ---------------------------------------------------------------------------
+
+fn send(pid: u32, signal: Signal) {
+    kill(Pid::from_raw(pid as i32), signal).expect("send signal");
+}
+
+fn wait_for_line(
+    receiver: &std::sync::mpsc::Receiver<String>,
+    timeout: Duration,
+    context: &str,
+) -> String {
+    receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
+}
+
+#[test]
+fn sigint_is_forwarded_to_the_agent_process_group() {
+    let mut child = launcher(&[
+        "--",
+        "sh",
+        "-c",
+        "trap 'exit 40' INT; while :; do sleep 0.05; done",
+    ])
+    .spawn()
+    .expect("spawn launcher");
+    std::thread::sleep(Duration::from_millis(400));
+    send(child.id(), Signal::SIGINT);
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(40),
+        "the child's SIGINT trap should have run; 130 would mean the launcher itself died"
+    );
+}
+
+#[test]
+fn sigquit_is_forwarded_to_the_agent_process_group() {
+    let mut child = launcher(&[
+        "--",
+        "sh",
+        "-c",
+        "trap 'exit 41' QUIT; while :; do sleep 0.05; done",
+    ])
+    .spawn()
+    .expect("spawn launcher");
+    std::thread::sleep(Duration::from_millis(400));
+    send(child.id(), Signal::SIGQUIT);
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(41),
+        "the child's SIGQUIT trap should have run"
+    );
+}
+
+#[test]
+fn sigwinch_is_forwarded_while_the_agent_keeps_running() {
+    // Without a PTY the child cannot ioctl a window size, so the observable
+    // evidence is the child's SIGWINCH handler running while the session stays
+    // alive (a merely killed or ignored signal would produce neither).
+    let mut child = launcher(&[
+        "--",
+        "sh",
+        "-c",
+        "trap 'echo winch' WINCH; while :; do sleep 0.05; done",
+    ])
+    .stdout(Stdio::piped())
+    .spawn()
+    .expect("spawn launcher");
+
+    let mut stdout = child.stdout.take().expect("stdout");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(&mut stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(400));
+    send(child.id(), Signal::SIGWINCH);
+    let line = wait_for_line(
+        &receiver,
+        Duration::from_secs(5),
+        "the SIGWINCH handler output",
+    );
+    assert_eq!(line, "winch");
+
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the agent must still be running after a resize"
+    );
+
+    send(child.id(), Signal::SIGTERM);
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "SIGTERM should terminate the agent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC over the pipes: the interface adoption depends on
+// ---------------------------------------------------------------------------
+
+/// A line-framed stdio JSON-RPC peer: answers every request with a result,
+/// then emits a shutdown notification when stdin closes.
+const JSONRPC_PEER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=${line#*\"id\":}
+  id=${id%%,*}
+  id=${id%%\}*}
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+done
+printf '{"jsonrpc":"2.0","method":"shutdown"}\n'
+"#;
+
+#[test]
+fn jsonrpc_session_survives_three_round_trips_and_shuts_down_cleanly() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("jsonrpc-peer");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let peer = dir.join("peer.sh");
+    std::fs::write(&peer, JSONRPC_PEER).expect("write peer");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    let mut child = launcher(&["--", "sh", peer.to_str().expect("path")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn launcher");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    for id in 1..=3 {
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\",\"params\":{{}}}}"
+        )
+        .expect("write request");
+        stdin.flush().expect("flush");
+        let line = wait_for_line(&receiver, Duration::from_secs(5), "a JSON-RPC response");
+        let response: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("bad JSON {line:?}: {error}"));
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], id);
+        assert_eq!(response["result"]["ok"], true);
+    }
+
+    // EOF on stdin, exactly as a harness that closes the session would do.
+    drop(stdin);
+    let notification = wait_for_line(
+        &receiver,
+        Duration::from_secs(5),
+        "the shutdown notification",
+    );
+    let notification: serde_json::Value = serde_json::from_str(&notification).expect("valid JSON");
+    assert_eq!(notification["method"], "shutdown");
+
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "clean shutdown must propagate exit 0"
+    );
+    let stderr = {
+        use std::io::Read;
+        let mut buffer = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut buffer)
+            .expect("read stderr");
+        buffer
+    };
+    assert!(
+        !stderr.contains("jsonrpc"),
+        "stderr must stay free of protocol traffic: {stderr:?}"
+    );
+}

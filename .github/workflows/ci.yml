@@ -168,19 +168,24 @@ jobs:
         timeout-minutes: 4
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: Static musl build (launcher + gateway)
-        timeout-minutes: 5
+      - name: Static musl build (CLI, launcher, gateway)
+        timeout-minutes: 6
         run: |
           set -euo pipefail
           cargo build --locked --release --target x86_64-unknown-linux-musl \
-            -p agentjail-launcher -p agentjail-gateway
-          launcher=target/x86_64-unknown-linux-musl/release/agentjail-launcher
-          gateway=target/x86_64-unknown-linux-musl/release/agentjail-gateway
-          file "$launcher" "$gateway"
-          if ldd "$launcher" 2>&1 | grep -q "=>"; then
-            echo "launcher is dynamically linked" >&2
-            exit 1
-          fi
+            -p agentjail -p agentjail-launcher -p agentjail-gateway
+          target=target/x86_64-unknown-linux-musl/release
+          cli="$target/agentjail"
+          launcher="$target/agentjail-launcher"
+          gateway="$target/agentjail-gateway"
+          file "$cli" "$launcher" "$gateway"
+          for binary in "$cli" "$launcher" "$gateway"; do
+            if ldd "$binary" 2>&1 | grep -q "=>"; then
+              echo "$binary is dynamically linked" >&2
+              exit 1
+            fi
+          done
+          "$cli" --version
           AGENTJAIL_ALLOW_ROOT=1 "$launcher" -- sh -c 'exit 7' \
             && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
           "$gateway" --profile profiles/allowlist.toml --check > /dev/null
