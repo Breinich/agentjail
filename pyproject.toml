@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentjail"
+version = "0.1.0"
+description = "Run AI coding agents inside a rootless Podman jail with no host secrets and an enforced egress allowlist."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "agentjail contributors" }]
+keywords = ["sandbox", "podman", "agent", "egress", "security"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Security",
+  "Typing :: Typed",
+]
+# Deliberately empty: the runtime is stdlib only. Profiles are TOML and are read
+# with tomllib, so no third-party parser is required.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.4",
+  "ruff==0.9.6",
+]
+
+[project.scripts]
+agentjail = "agentjail.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Breinich/agentjail"
+Issues = "https://github.com/Breinich/agentjail/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agentjail = ["data/*.json"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PTH", "RUF"]
+ignore = [
+  # Long error strings and schema descriptions are clearer unwrapped.
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["SIM117"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]
