@@ -178,7 +178,15 @@ cargo run -p agentjail -- profile validate profiles/minimal.toml
 cargo run -p agentjail -- profile validate profiles/allowlist.toml
 cargo build --release --target x86_64-unknown-linux-musl \
   -p agentjail-launcher -p agentjail-gateway
+
+# the agent base image (CI only builds it when images/ or Cargo.lock changes)
+podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
 ```
+
+CI is a single job with no matrix: one runner boot, cargo cache, cheapest steps
+first, `pull_request` and manual runs only, and the diagram/image steps gated on
+changed paths. The repository is private, so billed minutes are a design
+constraint (`docs/adopting.md`).
 
 Runtime dependencies: none for the launcher, and no HTTP client anywhere — the
 JSON Schema validator is built without its network resolver. The launcher and

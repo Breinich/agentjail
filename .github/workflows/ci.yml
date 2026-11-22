@@ -1,8 +1,9 @@
 name: ci
 
+# One job, one runner boot: this is a private repository, so every runner minute
+# is billed. There is no matrix, no second job, and no `push` trigger -- a pull
+# request commit would otherwise run the pipeline twice.
 on:
-  push:
-    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
@@ -15,58 +16,81 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental artefacts only bloat the cache we pay to store and restore.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  fmt:
-    name: fmt (rustfmt)
+  ci:
+    name: ci
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          toolchain: "1.100.0"
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+          fetch-depth: 1
 
-  clippy:
-    name: clippy (-D warnings)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (pinned in rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.100.0"
-          components: clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl
 
-  test:
-    name: tests (cargo test)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
         with:
-          toolchain: "1.100.0"
-      - run: cargo test --workspace
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-1.100.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-1.100.0-
+            ${{ runner.os }}-cargo-
 
-  profiles:
-    name: profile schema validation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.100.0"
-      - name: Validate every example profile
+      - name: Which paths changed
+        id: changes
+        run: |
+          set -euo pipefail
+          # Base SHA comes from the event, so no history depth is needed for the
+          # common case. If the fetch or diff fails, treat it as "everything
+          # changed": running a gated step is cheaper than skipping a required
+          # check.
+          changed="__unknown__"
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base" ]; then
+            if git fetch --no-tags --depth=1 origin "$base"; then
+              changed="$(git diff --name-only "$base" HEAD || echo "__unknown__")"
+            fi
+          fi
+          printf '%s\n' "$changed"
+
+          if printf '%s\n' "$changed" | grep -qE '__unknown__|(^|/)docs/diagrams/|\.md$'; then
+            echo "diagrams=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "diagrams=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$changed" | grep -qE '__unknown__|(^|/)images/|(^|/)Cargo\.lock$'; then
+            echo "image=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Cheapest first: a formatting error must not cost a full compile.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Validate example profiles
         run: |
           set -euo pipefail
           for profile in profiles/*.toml; do
             echo "== $profile"
-            cargo run --quiet -p agentjail -- profile validate "$profile"
+            cargo run --locked --quiet -p agentjail -- profile validate "$profile"
           done
-      - name: Gateway accepts the allowlist profile
-        run: cargo run --quiet -p agentjail-gateway -- --profile profiles/allowlist.toml --check
-      - name: A deliberately invalid profile fails non-zero
+          cargo run --locked --quiet -p agentjail-gateway -- --profile profiles/allowlist.toml --check
+
+      - name: A deliberately invalid profile fails
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
@@ -83,10 +107,11 @@ jobs:
           [agent]
           command = "bash"
           TOML
-          if cargo run --quiet -p agentjail -- profile validate "$tmp/broken.toml"; then
+          if cargo run --locked --quiet -p agentjail -- profile validate "$tmp/broken.toml"; then
             echo "expected validation to fail" >&2
             exit 1
           fi
+
       - name: A bridged network is refused by run preflight
         run: |
           set -euo pipefail
@@ -122,7 +147,7 @@ jobs:
           [agent]
           command = "bash"
           TOML
-          AGENTJAIL_PODMAN="$tmp/podman" cargo run --quiet -p agentjail -- run "$tmp/bridged.toml" \
+          AGENTJAIL_PODMAN="$tmp/podman" cargo run --locked --quiet -p agentjail -- run "$tmp/bridged.toml" \
             > "$tmp/out" 2> "$tmp/err" && status=0 || status=$?
           if [ "$status" -ne 1 ]; then
             echo "expected a refusal (exit 1), got $status" >&2
@@ -132,14 +157,39 @@ jobs:
           grep -q "refusing to launch" "$tmp/err"
           grep -q "not internal" "$tmp/err"
 
-  diagrams:
-    name: diagrams (PlantUML, checked in)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: PlantUML syntax gate (-checkonly)
+      - name: cargo build --locked
+        run: cargo build --locked --workspace --all-targets
+
+      - name: cargo test --locked
+        timeout-minutes: 5
+        run: cargo test --locked --workspace
+
+      - name: cargo clippy --locked -D warnings
+        timeout-minutes: 4
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Static musl build (launcher + gateway)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target x86_64-unknown-linux-musl \
+            -p agentjail-launcher -p agentjail-gateway
+          launcher=target/x86_64-unknown-linux-musl/release/agentjail-launcher
+          gateway=target/x86_64-unknown-linux-musl/release/agentjail-gateway
+          file "$launcher" "$gateway"
+          if ldd "$launcher" 2>&1 | grep -q "=>"; then
+            echo "launcher is dynamically linked" >&2
+            exit 1
+          fi
+          AGENTJAIL_ALLOW_ROOT=1 "$launcher" -- sh -c 'exit 7' \
+            && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
+          "$gateway" --profile profiles/allowlist.toml --check > /dev/null
+
+      # The remaining two steps are path-gated: a Rust-only PR must not pay for
+      # a PlantUML image pull or a Node image build.
+      - name: Diagrams (-checkonly, render, drift)
+        if: steps.changes.outputs.diagrams == 'true'
+        timeout-minutes: 4
         run: |
           set -euo pipefail
           image='docker.io/plantuml/plantuml@sha256:2cf2f097652701319e29b9e6a809e68d4ddb06fbeeb696705c097da8fa6d0507'
@@ -147,74 +197,27 @@ jobs:
             echo "::error::PlantUML syntax check failed; fix the file and line reported above"
             exit 1
           fi
-      - name: Render SVG from source
-        run: |
-          set -euo pipefail
-          image='docker.io/plantuml/plantuml@sha256:2cf2f097652701319e29b9e6a809e68d4ddb06fbeeb696705c097da8fa6d0507'
           docker run --rm --user 0:0 -v "$PWD/docs/diagrams:/d" "$image" -tsvg '/d/*.puml'
-      - name: Committed SVGs must match the sources
-        run: |
-          set -euo pipefail
           if ! git diff --exit-code -- docs/diagrams; then
             echo "::error::committed SVGs are stale or were edited by hand; re-render with the pinned image (see docs/adopting.md)"
             exit 1
           fi
 
-  containerfile:
-    name: Containerfile checks (static)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.100.0"
-      - run: cargo test -p agentjail --test containerfile
+      - name: Containerfile checks (static)
+        run: cargo test --locked -p agentjail --test containerfile
 
-  musl:
-    name: static musl build (launcher + gateway)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.100.0"
-          targets: x86_64-unknown-linux-musl
-      - name: Build static binaries
-        run: cargo build --release --target x86_64-unknown-linux-musl -p agentjail-launcher -p agentjail-gateway
-      - name: They are static and they run
+      - name: Base image build (docker; only when images/ or Cargo.lock changed)
+        if: steps.changes.outputs.image == 'true'
+        timeout-minutes: 6
+        continue-on-error: true
         run: |
-          set -euo pipefail
-          file target/x86_64-unknown-linux-musl/release/agentjail-launcher
-          file target/x86_64-unknown-linux-musl/release/agentjail-gateway
-          if ldd target/x86_64-unknown-linux-musl/release/agentjail-launcher 2>&1 | grep -q "=>"; then
-            echo "launcher is dynamically linked" >&2
-            exit 1
-          fi
-          AGENTJAIL_ALLOW_ROOT=1 ./target/x86_64-unknown-linux-musl/release/agentjail-launcher -- sh -c 'exit 7' \
-            && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
-          ./target/x86_64-unknown-linux-musl/release/agentjail-gateway \
-            --profile profiles/allowlist.toml --check > /dev/null
+          docker build -f images/base/Containerfile -t localhost/agentjail-base:ci images/base
+          docker image inspect --format '{{.Id}} {{.Size}}' localhost/agentjail-base:ci
 
-  image-build:
-    # Non-blocking on purpose: a real build depends on the apt and npm mirrors,
-    # which are an external service. A red run here is a signal to investigate,
-    # not a merge blocker; the static Containerfile job above is the blocker.
-    name: Containerfile build (non-blocking)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    needs: containerfile
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install podman
+      - name: Summary
+        if: always()
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends podman
-          podman --version
-          podman info --format '{{.Host.Security.Rootless}}'
-      - name: Build the base image
-        run: |
-          podman build \
-            --tag localhost/agentjail-base:ci \
-            --file images/base/Containerfile \
-            images/base
-          podman image inspect --format '{{.Id}} {{.Size}}' localhost/agentjail-base:ci
+          echo "### ci run" >> "$GITHUB_STEP_SUMMARY"
+          echo "- event: ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- diagrams step: ${{ steps.changes.outputs.diagrams }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- image build step: ${{ steps.changes.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
