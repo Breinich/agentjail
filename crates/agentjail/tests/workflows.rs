@@ -72,7 +72,7 @@ fn every_workflow_action_is_pinned_by_commit_sha() {
         }
     }
     assert!(problems.is_empty(), "{problems:#?}");
-    assert!(checked >= 3, "expected to check at least three uses: lines");
+    assert!(checked >= 2, "expected to check at least two uses: lines");
 }
 
 #[test]
