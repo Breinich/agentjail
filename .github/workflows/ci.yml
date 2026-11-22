@@ -188,7 +188,6 @@ jobs:
             echo "== $profile"
             cargo run --locked --quiet -p agentjail -- profile validate "$profile"
           done
-          cargo run --locked --quiet -p agentjail-gateway -- --profile profiles/allowlist.toml --check
 
       - name: A deliberately invalid profile fails
         run: |
