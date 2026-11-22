@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use agentjail_core::paths;
 use agentjail_core::podman;
@@ -254,11 +255,14 @@ fn run_command(
 
     // Secrets: resolved here by reference, injected from podman's secret store
     // as environment variables. Values never enter the container argv or config.
+    // Store entries are named per run (pid), so two concurrent runs of the same
+    // profile can never prune or overwrite each other's entry.
+    let run_id = std::process::id();
     let plans = if args.no_secrets {
         eprintln!("agentjail: --no-secrets: no secret is injected");
         Vec::new()
     } else {
-        run::plan_secrets(&profile_name, profile, env).map_err(|errors| {
+        run::plan_secrets(&profile_name, run_id, profile, env).map_err(|errors| {
             format!(
                 "refusing to run profile {profile_name:?}: secret resolution failed:\n{}",
                 errors
@@ -270,26 +274,31 @@ fn run_command(
         })?
     };
 
-    if !plans.is_empty() {
-        // Secrets left behind by an interrupted earlier run are pruned on the
-        // next start; a `--rm` container does not clean the secret store.
-        let prefix = run::secret_prefix(&profile_name);
-        if let Ok(existing) = podman::secret_list() {
-            for name in existing.iter().filter(|name| name.starts_with(&prefix)) {
-                let _ = podman::secret_remove(name);
-            }
+    // Backstop: prune entries whose owning run is gone. Never by profile alone.
+    let secret_prefix = run::secret_prefix(&profile_name);
+    if let Ok(existing) = podman::secret_list() {
+        let stale = run::stale_secret_names(&existing, &secret_prefix, run_id, pid_alive);
+        for name in stale {
+            let _ = podman::secret_remove(&name);
         }
-        for plan in &plans {
-            match &plan.action {
-                run::SecretAction::Create { store_name, value } => {
-                    podman::secret_create(store_name, value)?;
-                }
-                run::SecretAction::Existing { store_name } => {
-                    if !podman::secret_exists(store_name) {
-                        return Err(format!(
-                            "refusing to run profile {profile_name:?}: secret store entry                              {store_name:?} does not exist"
-                        ));
-                    }
+    }
+
+    // Cleanup guard: removes the entries this run created on every exit path --
+    // normal, non-zero, signal, and panic (unwinding Drop). The store entry of a
+    // `source = "store"` secret belongs to the user and is never removed.
+    let mut cleanup = SecretCleanup::default();
+    for plan in &plans {
+        match &plan.action {
+            run::SecretAction::Create { store_name, value } => {
+                podman::secret_create(store_name, value)?;
+                cleanup.names.push(store_name.clone());
+            }
+            run::SecretAction::Existing { store_name } => {
+                if !podman::secret_exists(store_name) {
+                    return Err(format!(
+                        "refusing to run profile {profile_name:?}: secret store entry \
+                         {store_name:?} does not exist"
+                    ));
                 }
             }
         }
@@ -318,16 +327,104 @@ fn run_command(
 
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        // exec: stdio, signals and the agent's exit code pass through untouched,
-        // and no shell or wrapper sits between the caller and podman.
-        let error = std::process::Command::new(&binary).args(&argv).exec();
-        Err(format!("cannot exec {}: {error}", binary.display()))
+        if cleanup.names.is_empty() {
+            use std::os::unix::process::CommandExt;
+            // Nothing to clean up: exec, so stdio, signals and the agent's exit
+            // code pass through untouched with no wrapper in the path.
+            let error = std::process::Command::new(&binary).args(&argv).exec();
+            return Err(format!("cannot exec {}: {error}", binary.display()));
+        }
+
+        // Secrets were created, so supervise instead of exec: forward signals,
+        // wait for podman, then let the guard delete the store entries.
+        eprintln!(
+            "agentjail: supervising podman to remove {} secret store entr{} on exit",
+            cleanup.names.len(),
+            if cleanup.names.len() == 1 { "y" } else { "ies" }
+        );
+        supervise(&binary, &argv)
     }
     #[cfg(not(unix))]
     {
         Err("agentjail run needs a unix host".to_string())
     }
+}
+
+/// Store entries this run created; removed whenever the process stops normally.
+#[derive(Default)]
+struct SecretCleanup {
+    names: Vec<String>,
+}
+
+impl Drop for SecretCleanup {
+    fn drop(&mut self) {
+        for name in &self.names {
+            if let Err(error) = podman::secret_remove(name) {
+                eprintln!("agentjail: warning: could not remove secret {name:?}: {error}");
+            }
+        }
+    }
+}
+
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn record_signal(signal: i32) {
+    PENDING_SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+/// Run podman as a child so the secret store can be cleaned up afterwards.
+/// Signals are forwarded; the child's exit code (or 128 + signal) is returned.
+fn supervise(binary: &Path, argv: &[String]) -> Result<u8, String> {
+    use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    use nix::unistd::Pid;
+
+    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGQUIT] {
+        let action = SigAction::new(
+            SigHandler::Handler(record_signal),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        // SAFETY: the handler only stores into an atomic.
+        unsafe { sigaction(signal, &action) }
+            .map_err(|error| format!("cannot install a handler for {signal}: {error}"))?;
+    }
+
+    let mut child = std::process::Command::new(binary)
+        .args(argv)
+        .spawn()
+        .map_err(|error| format!("cannot start {}: {error}", binary.display()))?;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if let Some(code) = status.code() {
+                    return Ok(code as u8);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(signal) = status.signal() {
+                        return Ok((128 + signal) as u8);
+                    }
+                }
+                return Ok(1);
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("cannot wait for podman: {error}")),
+        }
+        let pending = PENDING_SIGNAL.swap(0, Ordering::SeqCst);
+        if pending != 0 {
+            let _ = kill(
+                Pid::from_raw(child.id() as i32),
+                Signal::try_from(pending).unwrap_or(Signal::SIGTERM),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 fn selftest_command(

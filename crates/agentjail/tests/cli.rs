@@ -396,19 +396,38 @@ fn run_injects_a_secret_through_the_store_not_the_argv() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let argv = recorded_argv(&argv_path);
     let joined = argv.join(" ");
+    let secret_arg = argv
+        .iter()
+        .find(|arg| arg.starts_with("source=agentjail-with-secret-"))
+        .unwrap_or_else(|| panic!("no per-run secret in {joined}"));
     assert!(
-        joined.contains(
-            "--secret source=agentjail-with-secret-EXAMPLE_TOKEN,type=env,target=EXAMPLE_TOKEN"
-        ),
-        "{joined}"
+        secret_arg.ends_with(",type=env,target=EXAMPLE_TOKEN"),
+        "{secret_arg}"
+    );
+    let run_id = secret_arg
+        .strip_prefix("source=agentjail-with-secret-")
+        .and_then(|rest| rest.split('-').next())
+        .expect("run id in secret name");
+    assert!(
+        run_id.parse::<u32>().is_ok(),
+        "run id {run_id:?} is not the pid"
     );
     assert!(
         !joined.contains("fake-token-value"),
         "value leaked into argv: {joined}"
     );
-    let stored = std::fs::read_to_string(secrets_dir.join("agentjail-with-secret-EXAMPLE_TOKEN"))
+    let store_name = format!("agentjail-with-secret-{run_id}-EXAMPLE_TOKEN");
+    let stored = std::fs::read_to_string(secrets_dir.join(&store_name))
         .expect("secret written to the store");
     assert_eq!(stored, "fake-token-value");
+    // This run created the entry, so it removes it on exit.
+    let calls = std::fs::read_to_string(log_path).expect("calls log");
+    assert!(
+        calls
+            .lines()
+            .any(|line| line == format!("secret-rm {store_name}")),
+        "store entry was not removed on exit: {calls}"
+    );
 }
 
 #[test]

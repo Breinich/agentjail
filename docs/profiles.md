@@ -67,7 +67,6 @@ cpus = 2
 memory = "2g"
 pids = 512
 nofile = 2048
-disk = "4g"
 
 [resources.tmpfs]
 "/tmp" = "128m"
@@ -122,7 +121,7 @@ Defaulted, each because absence is **strictly restrictive or unambiguous**:
 | `secrets[].delivery` | `"env"` | `file` is valid schema but refused by `run`: secrets are injected as environment variables only. |
 | `secrets[].mode` | `0400` for file delivery only | Not accepted at all for env delivery. |
 | `network.egress[].protocol` | `"tls"` | The inspected protocol; `tcp` (uninspected) must be explicit and is limited to 443. |
-| `resources` | `cpus = 1`, `memory = 1g`, `pids = 256`, `nofile = 1024`, `disk = 2g`, `tmpfs = {}` | Conservative caps, not permissive ones. |
+| `resources` | `cpus = 1`, `memory = 1g`, `pids = 256`, `nofile = 1024`, `tmpfs = {}` | Conservative caps, not permissive ones. |
 | `agent.args` | `[]` | Only the command runs. |
 
 ### `[image]`
@@ -272,13 +271,17 @@ entries when a task actually fails, not pre-emptively.
 | `memory` | string | `1g` | `^[0-9]+[kKmMgG]?$`. |
 | `pids` | integer | `256` | 1–4194304. |
 | `nofile` | integer | `1024` | 64–1048576. |
-| `disk` | string | `2g` | Writable-layer size limit. |
+
 | `tmpfs` | table | `{}` | Absolute in-jail path → size (`"/tmp" = "64m"`). |
 
-Semantic rules: tmpfs keys must be absolute paths, and every size (including
-`tmpfs` values) must match the size pattern. `disk` is enforced through the
-container storage driver's per-container size option; `agentjail doctor`
-reports the storage driver because some drivers (`vfs`) cannot enforce it.
+Semantic rules: tmpfs keys must be absolute paths, and every size must match
+the size pattern; `run` mounts each as a bounded tmpfs.
+
+There is deliberately **no `disk` field**: the rootfs is mounted read-only, so
+the only writable space is this scratch. "Writable scratch" is therefore the
+sum of the tmpfs sizes below, and it is enforced by the mounts themselves. An
+unknown `disk` key is rejected as an unknown property rather than silently
+ignored.
 
 ## `[agent]`
 

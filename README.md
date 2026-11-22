@@ -171,6 +171,19 @@ worse than none.
 - [`images/README.md`](images/README.md) — building the base image and adding a
   runtime.
 
+## Evidence for the run path
+
+**CI does not exercise `run`.** The real-jail tests are `#[ignore]`d because they
+need rootless podman and the locally built image, so a green `ci` means "it
+compiles and the pure parts pass" — it is not evidence about the jail. The
+evidence lives in `crates/agentjail/tests/run_podman.rs` and is reproduced on a
+host with rootless podman and `images/base` built:
+
+```sh
+podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
+cargo test -p agentjail --test run_podman -- --ignored --test-threads=1
+```
+
 ## Development
 
 The toolchain is pinned in `rust-toolchain.toml` (1.100.0, with `clippy`,

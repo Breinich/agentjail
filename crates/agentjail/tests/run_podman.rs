@@ -98,6 +98,24 @@ dns = "none"
     path
 }
 
+fn wait_for_containers(prefix: &str, count: usize, timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let names: Vec<String> = podman_ok(&["ps", "--format", "{{.Names}}"])
+            .lines()
+            .filter(|name| name.starts_with(prefix))
+            .map(str::to_string)
+            .collect();
+        if names.len() >= count {
+            return names;
+        }
+        if Instant::now() > deadline {
+            return names;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn wait_for_container(prefix: &str, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -146,7 +164,7 @@ fn jail_runs_as_uid_10000_without_host_env_paths_or_sockets_and_with_limits() {
         "hardening",
         &network,
         r#"command = "sh"
-args = ["-lc", "echo uid=$(id -u); echo hostvar=$(printenv HOST_SECRET_VAR || echo unset); echo socket=$(ls /run/podman/podman.sock 2>&1); echo hostfile=$(cat PLACEHOLDER 2>&1); echo mem=$(cat /sys/fs/cgroup/memory.max); echo pids=$(cat /sys/fs/cgroup/pids.max); echo nofile=$(ulimit -n); echo home=$HOME; touch $HOME/probe && echo home-writable=yes; echo ok"]"#,
+args = ["-lc", "echo uid=$(id -u); echo hostvar=$(printenv HOST_SECRET_VAR || echo unset); echo socket=$(ls /run/podman/podman.sock 2>&1); echo hostfile=$(cat PLACEHOLDER 2>&1); echo mem=$(cat /sys/fs/cgroup/memory.max); echo pids=$(cat /sys/fs/cgroup/pids.max); echo nofile=$(ulimit -n); echo home=$HOME; echo home-mode=$(stat -c '%a %u' $HOME); touch $HOME/probe && echo home-writable=yes; echo ok"]"#,
     );
     let text = std::fs::read_to_string(&profile_path)
         .expect("read")
@@ -190,6 +208,10 @@ args = ["-lc", "echo uid=$(id -u); echo hostvar=$(printenv HOST_SECRET_VAR || ec
         "nofile limit not enforced: {stdout}"
     );
     assert!(stdout.contains("home=/home/agent"), "{stdout}");
+    assert!(
+        stdout.contains("home-mode=700 10000"),
+        "home is not 0700 owned by the jail uid: {stdout}"
+    );
     assert!(stdout.contains("home-writable=yes"), "{stdout}");
     assert!(stdout.contains("ok"), "{stdout}");
     assert!(
@@ -328,5 +350,112 @@ args = ["-lc", "true"]"#,
     std::fs::write(&profile_path, text).expect("write profile");
     let output = agentjail(&["run", profile_path.to_str().expect("path")], &[]);
     assert_ne!(output.status.code(), Some(0));
+    remove_network(&network);
+}
+
+#[test]
+#[ignore = "requires rootless podman and the local base image"]
+fn concurrent_runs_of_one_profile_keep_their_own_secret_entries() {
+    let dir = tmpdir("concurrent");
+    let network = network_name("concurrent");
+    create_network(&network, true);
+
+    let profile_path = profile(
+        &dir,
+        "concurrent",
+        &network,
+        r#"command = "sh"
+args = ["-lc", "printf 'started\n'; sleep 30"]"#,
+    );
+    let text = std::fs::read_to_string(&profile_path).expect("read").replace(
+        "[agent]",
+        "[[secrets]]\nname = \"example\"\nsource = \"env\"\nref = \"EXAMPLE_TOKEN\"\ntarget = \"EXAMPLE_TOKEN\"\n\n[agent]",
+    );
+    std::fs::write(&profile_path, text).expect("write profile");
+
+    let spawn = |value: &'static str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_agentjail"))
+            .args(["run", profile_path.to_str().expect("path")])
+            .env_remove("AGENTJAIL_PODMAN")
+            .env("EXAMPLE_TOKEN", value)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn agentjail")
+    };
+    let mut first = spawn("fake-value-a");
+    let mut second = spawn("fake-value-b");
+
+    let containers = wait_for_containers("agentjail-concurrent-", 2, Duration::from_secs(20));
+    assert_eq!(
+        containers.len(),
+        2,
+        "expected two concurrent jails: {containers:?}"
+    );
+    let first_name = format!("agentjail-concurrent-{}", first.id());
+    let second_name = format!("agentjail-concurrent-{}", second.id());
+    assert!(containers.contains(&first_name), "{containers:?}");
+    assert!(containers.contains(&second_name), "{containers:?}");
+
+    // Distinct store entries, and both still present while both runs live:
+    // neither run pruned the other's entry.
+    let secrets: Vec<String> = podman_ok(&["secret", "ls", "--format", "{{.Name}}"])
+        .lines()
+        .filter(|name| name.starts_with("agentjail-concurrent-"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(secrets.len(), 2, "expected one entry per run: {secrets:?}");
+    for (container, expected_value) in [
+        (&first_name, "fake-value-a"),
+        (&second_name, "fake-value-b"),
+    ] {
+        let run_id = container
+            .strip_prefix("agentjail-concurrent-")
+            .expect("container name carries the pid");
+        assert!(
+            secrets
+                .iter()
+                .any(|secret| secret == &format!("agentjail-concurrent-{run_id}-EXAMPLE_TOKEN")),
+            "container {container} has no matching entry in {secrets:?}"
+        );
+        // Each jail sees its own value, so neither picked up the other's entry.
+        let value = podman_ok(&["exec", container, "sh", "-lc", "printenv EXAMPLE_TOKEN"]);
+        assert_eq!(
+            value, expected_value,
+            "container {container} saw the wrong value"
+        );
+    }
+
+    // SIGTERM (not SIGKILL): the supervisor forwards it, waits for podman, and
+    // removes the entries on the way out.
+    for child in [&first, &second] {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .expect("send SIGTERM");
+    }
+    for child in [&mut first, &mut second] {
+        let _ = child.wait();
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let leftover: Vec<String> = podman_ok(&["secret", "ls", "--format", "{{.Name}}"])
+            .lines()
+            .filter(|name| name.starts_with("agentjail-concurrent-"))
+            .map(str::to_string)
+            .collect();
+        if leftover.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret entries survived a signal-terminated run: {leftover:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for container in &containers {
+        let _ = podman(&["rm", "-f", container]);
+    }
     remove_network(&network);
 }

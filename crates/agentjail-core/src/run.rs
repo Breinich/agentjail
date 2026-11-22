@@ -24,7 +24,8 @@ pub fn container_name(profile_name: &str, pid: u32) -> String {
     format!("agentjail-{stem}-{pid}")
 }
 
-/// Prefix for the podman secrets of one profile, used to prune leftovers.
+/// Prefix for the podman secrets of one profile. Entries also carry the pid of
+/// the run that created them, so two concurrent runs never collide.
 pub fn secret_prefix(profile_name: &str) -> String {
     let stem: String = profile_name
         .chars()
@@ -56,6 +57,17 @@ pub fn run_blockers(profile: &Profile) -> Result<(), Vec<String>> {
         errors.push(
             "network.name: required for run: agentjail attaches to an existing network and does \
              not create one; name an internal podman network"
+                .to_string(),
+        );
+    }
+    let home_parent = std::path::Path::new(&profile.home)
+        .parent()
+        .and_then(|parent| parent.to_str())
+        .unwrap_or("/");
+    if home_parent == "/" {
+        errors.push(
+            "home: must be a subdirectory such as /home/agent, so the jail can mount \
+             writable scratch for it and give it mode 0700"
                 .to_string(),
         );
     }
@@ -109,10 +121,11 @@ impl SecretPlan {
 /// reference, and a missing reference fails closed naming the reference.
 pub fn plan_secrets(
     profile_name: &str,
+    run_id: u32,
     profile: &Profile,
     host_env: &BTreeMap<String, String>,
 ) -> Result<Vec<SecretPlan>, Vec<String>> {
-    let prefix = secret_prefix(profile_name);
+    let prefix = format!("{}{run_id}-", secret_prefix(profile_name));
     let mut plans = Vec::new();
     let mut errors = Vec::new();
 
@@ -225,36 +238,48 @@ pub fn podman_args(
         args.extend(["--network".into(), network.clone()]);
     }
 
-    // tmpfs: /tmp and /run always exist with hardened flags; profile sizes win.
-    let mut tmpfs = profile.resources.tmpfs.clone();
-    tmpfs
-        .entry("/tmp".to_string())
-        .or_insert_with(|| "64m".to_string());
-    tmpfs
-        .entry("/run".to_string())
-        .or_insert_with(|| "16m".to_string());
-    for (path, size) in &tmpfs {
-        args.extend([
-            "--tmpfs".into(),
-            format!("{path}:rw,noexec,nosuid,nodev,size={size}"),
-        ]);
+    // Bounded writable scratch only: /tmp and /run always, with profile sizes
+    // winning. The rootfs is read-only, so there is no writable layer to limit.
+    let mut scratch: Vec<(String, String, String)> = Vec::new(); // (path, size, extra opts)
+    let tmpfs = &profile.resources.tmpfs;
+    for (path, size) in tmpfs {
+        scratch.push((
+            path.clone(),
+            size.clone(),
+            "noexec,nosuid,nodev".to_string(),
+        ));
     }
-    // The jail's own home is writable and ephemeral: `/` is read-only, so an
-    // agent that writes its config or cache would otherwise fail immediately.
-    if !tmpfs.contains_key(&profile.home) {
-        let home_size = profile
-            .resources
-            .tmpfs
+    for (path, size) in [("/tmp", "64m"), ("/run", "16m")] {
+        if !tmpfs.contains_key(path) {
+            scratch.push((
+                path.to_string(),
+                size.to_string(),
+                "noexec,nosuid,nodev".to_string(),
+            ));
+        }
+    }
+    // The jail's own home is a 0700 directory inside writable scratch; the
+    // entrypoint creates it as the jail uid. Mounting its parent (not the home
+    // itself) is what allows ownership to be the agent's.
+    let home = std::path::Path::new(&profile.home);
+    let home_parent = home.parent().and_then(|p| p.to_str()).unwrap_or("/");
+    let home_is_mounted = profile
+        .mounts
+        .iter()
+        .any(|mount| mount.target == profile.home);
+    if !home_is_mounted && home_parent != "/" && !tmpfs.contains_key(home_parent) {
+        let size = tmpfs
             .get(&profile.home)
             .cloned()
             .unwrap_or_else(|| "256m".to_string());
-        args.extend([
-            "--tmpfs".into(),
-            format!(
-                "{}:rw,nosuid,nodev,size={home_size},mode=1777",
-                profile.home
-            ),
-        ]);
+        scratch.push((
+            home_parent.to_string(),
+            size,
+            "nosuid,nodev,mode=1777".to_string(),
+        ));
+    }
+    for (path, size, opts) in scratch {
+        args.extend(["--tmpfs".into(), format!("{path}:rw,{opts},size={size}")]);
     }
 
     // Mounts, exactly as declared. No implicit host paths.
@@ -343,6 +368,38 @@ pub fn describe_mount(mount: &Mount) -> String {
     )
 }
 
+/// Store entries left behind by runs that no longer exist.
+///
+/// Names are `agentjail-<profile>-<pid>-<target>`; only entries whose pid is
+/// neither the current process nor alive are returned, so a prune can never
+/// delete the entries of a concurrent run of the same profile.
+pub fn stale_secret_names(
+    names: &[String],
+    prefix: &str,
+    current_pid: u32,
+    alive: impl Fn(u32) -> bool,
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for name in names {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some((pid_text, target)) = rest.split_once('-') else {
+            continue;
+        };
+        if target.is_empty() {
+            continue;
+        }
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        if pid != current_pid && !alive(pid) {
+            stale.push(name.clone());
+        }
+    }
+    stale
+}
+
 /// Whether `secrets` came from a `Secret` with `source = store` (used in tests).
 pub fn is_store_backed(secret: &Secret) -> bool {
     matches!(secret.source, SecretSource::Store)
@@ -421,7 +478,7 @@ args = ["-lc", "echo {workdir}"]
             "--network agentjail-test",
             "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m",
             "--tmpfs /run:rw,noexec,nosuid,nodev,size=16m",
-            "--tmpfs /home/agent:rw,nosuid,nodev,size=256m,mode=1777",
+            "--tmpfs /home:rw,nosuid,nodev,mode=1777,size=256m",
             "--env HOME=/home/agent",
             "--env TERM=xterm-256color",
             "--env LANG=C.UTF-8",
@@ -525,12 +582,12 @@ args = ["-lc", "echo {workdir}"]
         );
         let profile = parse_and_validate(&text).expect("valid");
         let env = BTreeMap::from([("EXAMPLE_TOKEN".to_string(), "fake-value".to_string())]);
-        let plans = plan_secrets("test", &profile, &env).expect("plans");
+        let plans = plan_secrets("test", 42, &profile, &env).expect("plans");
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].env_target, "EXAMPLE_TOKEN");
         assert_eq!(
             plans[0].podman_arg(),
-            "source=agentjail-test-EXAMPLE_TOKEN,type=env,target=EXAMPLE_TOKEN"
+            "source=agentjail-test-42-EXAMPLE_TOKEN,type=env,target=EXAMPLE_TOKEN"
         );
         match &plans[0].action {
             SecretAction::Create { value, .. } => assert_eq!(value, "fake-value"),
@@ -544,7 +601,7 @@ args = ["-lc", "echo {workdir}"]
             "{PROFILE}\n[[secrets]]\nsource = \"env\"\nref = \"MISSING_TOKEN\"\ntarget = \"EXAMPLE_TOKEN\"\n"
         );
         let profile = parse_and_validate(&text).expect("valid");
-        let errors = plan_secrets("test", &profile, &BTreeMap::new()).expect_err("must fail");
+        let errors = plan_secrets("test", 42, &profile, &BTreeMap::new()).expect_err("must fail");
         assert!(errors[0].contains("MISSING_TOKEN"), "{errors:#?}");
     }
 
@@ -554,7 +611,7 @@ args = ["-lc", "echo {workdir}"]
             "{PROFILE}\n[[secrets]]\nsource = \"store\"\nref = \"existing-store-entry\"\ntarget = \"EXAMPLE_TOKEN\"\n"
         );
         let profile = parse_and_validate(&text).expect("valid");
-        let plans = plan_secrets("test", &profile, &BTreeMap::new()).expect("plans");
+        let plans = plan_secrets("test", 42, &profile, &BTreeMap::new()).expect("plans");
         assert!(matches!(plans[0].action, SecretAction::Existing { .. }));
         assert!(plans[0]
             .podman_arg()
@@ -566,6 +623,20 @@ args = ["-lc", "echo {workdir}"]
         let profile = profile();
         let argv = expand_agent_args(&profile.agent, "/work", "/home/agent");
         assert_eq!(argv, vec!["bash", "-lc", "echo /work"]);
+    }
+
+    #[test]
+    fn stale_secret_names_only_cover_dead_runs_of_the_same_profile() {
+        let prefix = secret_prefix("profile");
+        let names = vec![
+            format!("{prefix}100-TOKEN"),
+            format!("{prefix}200-TOKEN"),
+            "other-300-TOKEN".to_string(),
+            format!("{prefix}abc-TOKEN"),
+        ];
+        let stale = stale_secret_names(&names, &prefix, 200, |_| false);
+        assert_eq!(stale, vec![format!("{prefix}100-TOKEN")]);
+        assert!(stale_secret_names(&names, &prefix, 200, |_| true).is_empty());
     }
 
     #[test]

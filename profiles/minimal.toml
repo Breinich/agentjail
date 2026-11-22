@@ -30,7 +30,6 @@ cpus = 1
 memory = "1g"
 pids = 256
 nofile = 1024
-disk = "2g"
 
 [resources.tmpfs]
 "/tmp" = "64m"

@@ -420,11 +420,6 @@
             "type": "string",
             "pattern": "^[0-9]+[kKmMgG]?$"
           }
-        },
-        "disk": {
-          "type": "string",
-          "pattern": "^[0-9]+[kKmMgG]?$",
-          "description": "Size limit for the jail's writable layer, e.g. 4g. Enforced with the storage driver's per-container size option when the driver supports it; doctor reports when it cannot be."
         }
       }
     },

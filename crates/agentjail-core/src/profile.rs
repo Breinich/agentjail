@@ -30,7 +30,6 @@ pub const DEFAULT_CPUS: f64 = 1.0;
 pub const DEFAULT_MEMORY: &str = "1g";
 pub const DEFAULT_PIDS: u32 = 256;
 pub const DEFAULT_NOFILE: u64 = 1024;
-pub const DEFAULT_DISK: &str = "2g";
 
 /// Keys that would smuggle an actual credential into a profile.
 const INLINE_SECRET_KEYS: [&str; 8] = [
@@ -213,8 +212,6 @@ pub struct Resources {
     pub pids: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nofile: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disk: Option<String>,
     /// Absolute in-jail path -> size, e.g. `"/tmp" = "64m"`.
     #[serde(default)]
     pub tmpfs: BTreeMap<String, String>,
@@ -235,10 +232,6 @@ impl Resources {
 
     pub fn effective_nofile(&self) -> u64 {
         self.nofile.unwrap_or(DEFAULT_NOFILE)
-    }
-
-    pub fn effective_disk(&self) -> &str {
-        self.disk.as_deref().unwrap_or(DEFAULT_DISK)
     }
 }
 
@@ -355,7 +348,6 @@ impl Profile {
                 "memory": self.resources.effective_memory(),
                 "pids": self.resources.effective_pids(),
                 "nofile": self.resources.effective_nofile(),
-                "disk": self.resources.effective_disk(),
                 "tmpfs": self.resources.tmpfs,
             },
             "agent": { "command": self.agent.command, "args": self.agent.args },
@@ -814,16 +806,11 @@ fn resource_errors(resources: &Resources) -> Vec<String> {
             errors.push("resources.cpus: must be greater than zero".to_string());
         }
     }
-    for (field, value) in [
-        ("memory", resources.memory.as_deref()),
-        ("disk", resources.disk.as_deref()),
-    ] {
-        if let Some(size) = value {
-            if !is_size(size) {
-                errors.push(format!(
-                    "resources.{field}: {size:?} is not a size such as 512m or 4g"
-                ));
-            }
+    if let Some(memory) = resources.memory.as_deref() {
+        if !is_size(memory) {
+            errors.push(format!(
+                "resources.memory: {memory:?} is not a size such as 512m or 4g"
+            ));
         }
     }
     if let Some(pids) = resources.pids {
@@ -1326,7 +1313,7 @@ args = ["-lc", "true"]
     fn bad_resource_sizes_are_rejected() {
         let text = MINIMAL.replace(
             "[agent]",
-            "[resources]\nmemory = \"two gigs\"\ndisk = \"4G\"\nnofile = 1\n\n[agent]",
+            "[resources]\nmemory = \"two gigs\"\nnofile = 1\n\n[agent]",
         );
         let found = errors(&text);
         let joined = found.join("\n");
@@ -1341,7 +1328,6 @@ args = ["-lc", "true"]
         assert_eq!(profile.resources.effective_memory(), "1g");
         assert_eq!(profile.resources.effective_pids(), 256);
         assert_eq!(profile.resources.effective_nofile(), 1024);
-        assert_eq!(profile.resources.effective_disk(), "2g");
         assert!(profile.resources.tmpfs.is_empty());
     }
 

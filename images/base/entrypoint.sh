@@ -13,6 +13,13 @@ fi
 : "${HOME:=/home/agent}"
 export HOME
 
+# The jail mounts writable scratch one level above HOME; create HOME itself as a
+# 0700 directory owned by this uid. A single-uid container does not need 1777 on
+# the home, and a second user in the image must not inherit a writable one.
+if ! install -d -m 0700 "$HOME" 2>/dev/null; then
+    echo "agentjail: warning: cannot create $HOME with mode 0700" >&2
+fi
+
 if [ "$#" -eq 0 ]; then
     set -- bash -l
 fi
