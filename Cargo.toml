@@ -22,6 +22,4 @@ nix = { version = "0.32", features = ["signal", "process"] }
 [profile.release]
 lto = "thin"
 strip = "symbols"
-# The launcher and gateway are copied into jails; a static, small binary is the
-# point, so abort rather than unwind on panic.
-panic = "abort"
+# Unwind (default) so Drop-based secret cleanup runs if the CLI panics.

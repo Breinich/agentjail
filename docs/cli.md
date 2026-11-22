@@ -13,6 +13,44 @@ bind-mounted into a jail built from any base, including `scratch`.
 
 ## `agentjail run <profile> -- <agent command…>`
 
+Implemented for `network.mode = "none"` (no egress). The build path:
+
+- **preflight, every start**: `network.name` is required; the named network is
+  inspected and verified against the single-route invariant with the same code
+  path `doctor` uses. A bridged network is refused before anything is created.
+- **argv**: `podman run --rm --interactive --pull=never --read-only
+  --userns=keep-id:uid=10000,gid=10000 --cap-drop=ALL
+  --security-opt=no-new-privileges`, the profile's `--pids-limit`, `--memory`,
+  `--cpus`, `--ulimit nofile` and `--tmpfs /tmp,/run` (sized from the profile,
+  `noexec,nosuid,nodev`), exactly the declared bind mounts (`ro`/`rw`, `Z` when
+  SELinux is enforcing), an **environment allowlist** (`HOME`, `TERM`, profile
+  literals; no host environment), `--workdir`, the digest-pinned image, and the
+  agent command. There is no `-t`, no host home, no runtime socket, and no
+  implicit mount.
+- **secrets**: references are resolved before start (an unset or unreadable
+  reference fails closed, naming the reference and never a value), then written
+  to podman's secret store and passed as `--secret source=…,type=env,target=…`,
+  so the value is an env var at start and never appears in the container's
+  `Env` list. `--no-secrets` injects none.
+  - Entries are named **per run** (`agentjail-<profile>-<pid>-<target>`), so two
+    concurrent runs of the same profile never share or prune each other's entry.
+  - **Guarantee**: entries this run created are removed when `agentjail` exits —
+    normal exit, non-zero exit, forwarded signal, or panic. A `SIGKILL` of
+    `agentjail` (or a host crash) cannot be caught: those entries remain until
+    the next run of the same profile prunes dead-pid entries as a backstop. A
+    `source = "store"` entry belongs to the user and is never removed.
+- **exec vs supervise**: with no secrets to clean up, `agentjail` calls
+  `exec(podman …)`, so stdio, signals, and the exit code pass through with no
+  wrapper. When it created secret-store entries it supervises podman instead:
+  it forwards SIGINT/SIGTERM/SIGQUIT, waits for podman, removes the entries, and
+  exits with the same code (or 128 + signal).
+- **home**: the rootfs is read-only, so `run` mounts writable scratch at the
+  parent of `home` and the image entrypoint creates `$HOME` with **mode 0700**
+  owned by the jail uid. `home` must be a subdirectory (for example
+  `/home/agent`), not directly under `/`.
+- `network.mode = "allowlist"` is refused at validation and at run: the gateway
+  is the next increment, and the message says so.
+
 ### Transport (a requirement, not a nicety)
 
 The agent runs with **pipes, not a TTY**:

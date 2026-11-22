@@ -188,7 +188,8 @@ command = "bash"
         let defs = &document["$defs"];
         assert_eq!(defs["network"]["required"].as_array().unwrap().len(), 2);
         assert_eq!(defs["secret"]["additionalProperties"], false);
-        assert!(defs["resources"]["properties"]["disk"].is_object());
+        // No disk knob: the rootfs is read-only, only bounded tmpfs is writable.
+        assert!(defs["resources"]["properties"].get("disk").is_none());
         assert!(defs["resources"]["properties"]["tmpfs"].is_object());
     }
 

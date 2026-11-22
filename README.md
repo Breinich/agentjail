@@ -82,13 +82,18 @@ cargo run -p agentjail -- doctor
 cargo run -p agentjail -- doctor --network podman        # refusal: not internal
 ```
 
-Launching and self-testing are wired up but **not implemented yet** — the
-commands validate their input, run the preflight that exists, and exit `3`:
+`run` works for the default posture, no egress. It attaches to the internal
+network named in the profile, verifies that network on every start, and `exec`s
+podman so stdio, signals and the exit code pass through:
 
 ```sh
-cargo run -p agentjail -- run profiles/minimal.toml -- bash -l   # exit 3
-cargo run -p agentjail -- selftest profiles/minimal.toml         # exit 3
+podman network create --internal agentjail-minimal
+cargo run -p agentjail -- run profiles/minimal.toml -- bash -lc 'id -u'
+podman network rm agentjail-minimal
 ```
+
+`network.mode = "allowlist"` profiles are refused until the egress gateway
+lands: the error says so. The selftest is still a stub (exit `3`).
 
 The gateway parses and prints its allowlist but does not proxy yet:
 
@@ -141,7 +146,8 @@ Increment 1 is the scaffolding PR. Spell it out plainly:
 | `doctor`, including the outside network-invariant check (`--network NAME`) | **implemented** |
 | CLI wiring, exit codes, help text, launcher/selftest contracts | **implemented** |
 | `agentjail-launcher`: pipes, SIGINT/SIGTERM/SIGQUIT + resize forwarding, exit codes, root refusal, 3-turn JSON-RPC over pipes | **implemented** and tested |
-| `run` (container launch, secret injection, inside network check, cleanup) | **not implemented** (exit 3) |
+| `run` with `network.mode = "none"` (hardened podman argv, secret-store injection, outside network check, `exec` passthrough) | **implemented** |
+| `run` with `network.mode = "allowlist"` (needs the gateway) | **refused at validation** (clear error) |
 | `selftest` (negative set + positive control) | **not implemented** (exit 3) |
 | Gateway proxy (DNS pinning, CONNECT allowlist) | **not implemented** — allowlist parsing only (exit 3) |
 | Base image (`images/base/Containerfile`) | written; not published |
@@ -164,6 +170,19 @@ worse than none.
 - [`docs/adopting.md`](docs/adopting.md) — adoption path (stub in this increment).
 - [`images/README.md`](images/README.md) — building the base image and adding a
   runtime.
+
+## Evidence for the run path
+
+**CI does not exercise `run`.** The real-jail tests are `#[ignore]`d because they
+need rootless podman and the locally built image, so a green `ci` means "it
+compiles and the pure parts pass" — it is not evidence about the jail. The
+evidence lives in `crates/agentjail/tests/run_podman.rs` and is reproduced on a
+host with rootless podman and `images/base` built:
+
+```sh
+podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
+cargo test -p agentjail --test run_podman -- --ignored --test-threads=1
+```
 
 ## Development
 

@@ -138,7 +138,7 @@ than half-implemented.
 - **The agent's own supply chain** installing a malicious package that talks to
   an allowlisted destination.
 - **Availability attacks inside the declared limits.** The agent may burn its
-  whole CPU quota, disk budget, and egress allowance.
+  whole CPU quota, writable-scratch budget, and egress allowance.
 
 ## Residual risks we accept, and what we do about them
 
@@ -211,13 +211,39 @@ remedy: copy the runtime into the image, or into a normal directory that is
 itself a bind mount. Treating such a mount as "mostly working" would be worse
 than refusing it.
 
-### The writable layer and tmpfs are only as good as the storage driver
+### The run path currently has no egress at all
 
-`resources.disk` and `resources.tmpfs` are enforced through the runtime's
-per-container size options. On a storage driver that cannot enforce a size
-(e.g. `vfs`), the limit is advisory. `agentjail doctor` reports the storage
-driver so this is visible, and the selftest is expected to fail a disk-limit
-check rather than silently pass it when enforcement is unavailable.
+`network.mode = "allowlist"` is refused by `profile validate` and `run` until the
+egress gateway lands; only `mode = "none"` runs. This is the safe direction, but
+it means there is no allowlist to bypass because there is no egress at all, and
+no positive control has been demonstrated yet. Do not read the gateway design in
+this document as implemented.
+
+### Secret-store durability
+
+A secret this run created lives in podman's secret store between container start
+and `agentjail` exit, and `agentjail` removes it on every exit it can observe
+(normal, non-zero, forwarded signal, panic). A `SIGKILL` of `agentjail` or a host
+crash cannot be observed: the entry then remains until the next run of the same
+profile prunes dead-pid entries. Entries are per run
+(`agentjail-<profile>-<pid>-<target>`) so concurrent runs of one profile never
+share, overwrite, or prune each other; a `source = "store"` entry is the user's
+and is never removed. The value is never written to the image, a bind mount, or
+the container `Env` list.
+
+### "Disk limit" is scratch only
+
+There is no writable layer to limit: the rootfs is read-only and the profile has
+no `disk` field. The only writable space is the tmpfs scratch (`/tmp`, `/run`,
+the home parent), bounded by the sizes in `resources.tmpfs`. An agent cannot
+write more than the sum of those mounts, but that sum — not a single "disk"
+number — is the real budget.
+
+### File-delivery secrets are unsupported
+
+`secrets[].delivery = "file"` is valid schema but refused by `run`: secrets are
+injected as environment variables only, never as files, so there is no file path
+inside the jail that can accidentally outlive the process.
 
 ### Secrets in the process environment are visible to the agent
 

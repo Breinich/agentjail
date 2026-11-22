@@ -40,23 +40,27 @@ fn example_profiles_all_validate() {
         );
         checked += 1;
     }
-    assert!(checked >= 2, "expected at least two example profiles");
+    assert!(checked >= 1, "expected at least one example profile");
 }
 
 #[test]
-fn example_profiles_cover_both_network_modes() {
-    let mut modes = Vec::new();
+fn example_profiles_are_runnable_in_this_increment() {
+    // Allowlist profiles are valid TOML but refused by `profile validate` and
+    // `run` until the egress gateway exists, so no example ships with it.
     for entry in std::fs::read_dir(repo_root().join("profiles")).expect("profiles dir") {
         let path = entry.expect("entry").path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
         }
-        let text = read(&path);
-        let profile = parse_and_validate(&text).expect("valid profile");
-        modes.push(profile.network.mode);
+        let profile = parse_and_validate(&read(&path)).expect("valid profile");
+        assert_eq!(profile.network.mode, NetworkMode::None);
+        assert!(
+            profile.network.name.is_some(),
+            "{}: run requires an existing internal network",
+            path.display()
+        );
+        agentjail_core::run::run_blockers(&profile).expect("runnable");
     }
-    assert!(modes.contains(&NetworkMode::None));
-    assert!(modes.contains(&NetworkMode::Allowlist));
 }
 
 #[test]
@@ -91,7 +95,6 @@ fn documented_paths_exist() {
         "images/base/entrypoint.sh",
         "schema/profile.schema.json",
         "profiles/minimal.toml",
-        "profiles/allowlist.toml",
     ] {
         let path = repo_root().join(relative);
         assert!(path.is_file(), "missing documented file: {relative}");

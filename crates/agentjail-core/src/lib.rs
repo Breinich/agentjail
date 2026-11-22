@@ -10,6 +10,7 @@ pub mod network;
 pub mod paths;
 pub mod podman;
 pub mod profile;
+pub mod run;
 pub mod schema;
 
 pub use profile::{

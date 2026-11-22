@@ -188,7 +188,6 @@ jobs:
             echo "== $profile"
             cargo run --locked --quiet -p agentjail -- profile validate "$profile"
           done
-          cargo run --locked --quiet -p agentjail-gateway -- --profile profiles/allowlist.toml --check
 
       - name: A deliberately invalid profile fails
         run: |
@@ -278,7 +277,7 @@ jobs:
           "$cli" --version
           AGENTJAIL_ALLOW_ROOT=1 "$launcher" -- sh -c 'exit 7' \
             && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
-          "$gateway" --profile profiles/allowlist.toml --check > /dev/null
+          "$gateway" --version
 
       # The remaining two checks are path-gated: a Rust-only PR must not pay for
       # a PlantUML image pull or an image build.
