@@ -1,10 +1,22 @@
 name: ci
 
-# One job, one runner boot: this is a private repository, so every runner minute
-# is billed. There is no matrix, no second job, and no `push` trigger -- a pull
-# request commit would otherwise run the pipeline twice.
+# One job, one runner boot: this repository is private, so every runner minute
+# and every cache byte is billed. No matrix, no `push` trigger (a pull request
+# commit would otherwise run twice), and the event path allowlist below keeps
+# documentation-only changes from starting a build at all while still checking
+# diagram changes.
 on:
   pull_request:
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "schema/**"
+      - "profiles/**"
+      - "images/**"
+      - "docs/diagrams/**"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
@@ -16,14 +28,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Incremental artefacts only bloat the cache we pay to store and restore.
+  # Incremental artefacts only cost cache space we no longer pay for.
   CARGO_INCREMENTAL: "0"
 
 jobs:
   ci:
     name: ci
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -31,31 +43,44 @@ jobs:
           fetch-depth: 1
 
       # No third-party toolchain action: this repository's Actions policy allows
-      # only GitHub-owned and verified actions (allowed_actions: selected), and a
-      # pinned third-party action is still rejected. The runner's preinstalled
-      # rustup reads rust-toolchain.toml, which pins the channel, clippy,
-      # rustfmt, and the musl target, so the toolchain is installed from the file
-      # and nowhere else.
+      # only GitHub-owned and verified actions, and a pinned third-party action
+      # was rejected at startup. rust-toolchain.toml is the single source of the
+      # pinned channel, components, and target; the runner image's own rustup
+      # installs exactly that. The component/target checks fail loudly instead of
+      # surfacing on the first cargo call.
       - name: Rust toolchain (preinstalled rustup + rust-toolchain.toml)
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          rustup show active-toolchain
+          rustup --version
+          rustup show
+          rustup component list --installed
+          installed="$(rustup component list --installed)"
+          for component in clippy rustfmt; do
+            if ! printf '%s\n' "$installed" | grep -q "^${component}-"; then
+              echo "missing rustup component: $component" >&2
+              exit 1
+            fi
+          done
+          if ! rustup target list --installed | grep -qx x86_64-unknown-linux-musl; then
+            echo "missing rustup target: x86_64-unknown-linux-musl" >&2
+            exit 1
+          fi
           cargo --version
-          cargo fmt --version
           cargo clippy --version
+          cargo fmt --version
 
-      - name: Cache cargo registry and target
+      # Registry only: a ~380 MB target/ cache costs more to save and restore on
+      # a fresh runner than it saves, and the account was carrying one per ref.
+      - name: Cache cargo registry and git
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-1.100.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-1.100.0-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
 
       - name: Which paths changed
         id: changes
@@ -72,7 +97,8 @@ jobs:
               changed="$(git diff --name-only "$base" HEAD || echo "__unknown__")"
             fi
           fi
-          printf '%s\n' "$changed"
+          printf '%s\n' "$changed" > changed-files.txt
+          cat changed-files.txt
 
           if printf '%s\n' "$changed" | grep -qE '__unknown__|(^|/)docs/diagrams/|\.md$'; then
             echo "diagrams=true" >> "$GITHUB_OUTPUT"
@@ -85,9 +111,17 @@ jobs:
             echo "image=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Cheapest first: a formatting error must not cost a full compile.
+      # Cheapest first: a formatting error must not cost a compile.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
+      - name: cargo clippy --locked -D warnings
+        timeout-minutes: 8
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: cargo test --locked
+        timeout-minutes: 8
+        run: cargo test --locked --workspace
 
       - name: Validate example profiles
         run: |
@@ -165,23 +199,13 @@ jobs:
           grep -q "refusing to launch" "$tmp/err"
           grep -q "not internal" "$tmp/err"
 
-      - name: cargo build --locked
-        run: cargo build --locked --workspace --all-targets
-
-      - name: cargo test --locked
-        timeout-minutes: 5
-        run: cargo test --locked --workspace
-
-      - name: cargo clippy --locked -D warnings
-        timeout-minutes: 4
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: Static musl build (CLI, launcher, gateway)
-        timeout-minutes: 6
+      # One release build for the whole workspace, for one target. No per-binary
+      # invocations and no matrix.
+      - name: Static musl build (whole workspace)
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          cargo build --locked --release --target x86_64-unknown-linux-musl \
-            -p agentjail -p agentjail-launcher -p agentjail-gateway
+          cargo build --locked --release --target x86_64-unknown-linux-musl --workspace
           target=target/x86_64-unknown-linux-musl/release
           cli="$target/agentjail"
           launcher="$target/agentjail-launcher"
@@ -198,8 +222,8 @@ jobs:
             && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
           "$gateway" --profile profiles/allowlist.toml --check > /dev/null
 
-      # The remaining two steps are path-gated: a Rust-only PR must not pay for
-      # a PlantUML image pull or a Node image build.
+      # The remaining two checks are path-gated: a Rust-only PR must not pay for
+      # a PlantUML image pull or an image build.
       - name: Diagrams (-checkonly, render, drift)
         if: steps.changes.outputs.diagrams == 'true'
         timeout-minutes: 4
@@ -227,10 +251,26 @@ jobs:
           docker build -f images/base/Containerfile -t localhost/agentjail-base:ci images/base
           docker image inspect --format '{{.Id}} {{.Size}}' localhost/agentjail-base:ci
 
+      # No uploads on success; only a failing run leaves an artefact behind.
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            changed-files.txt
+            target/x86_64-unknown-linux-musl/release/agentjail
+            target/x86_64-unknown-linux-musl/release/agentjail-launcher
+            target/x86_64-unknown-linux-musl/release/agentjail-gateway
+            docs/diagrams/*.svg
+
       - name: Summary
         if: always()
         run: |
           echo "### ci run" >> "$GITHUB_STEP_SUMMARY"
           echo "- event: ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- changed files: $(wc -l < changed-files.txt 2>/dev/null || echo 0)" >> "$GITHUB_STEP_SUMMARY"
           echo "- diagrams step: ${{ steps.changes.outputs.diagrams }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- image build step: ${{ steps.changes.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"

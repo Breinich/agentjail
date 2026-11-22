@@ -118,4 +118,16 @@ fn triggers_stay_as_the_owner_decided() {
         !triggers.contains("push:"),
         "no speculative push trigger: {triggers}"
     );
+    // A paths allowlist, not a denylist: documentation-only changes must not
+    // start a build, but a diagram change must still reach the check.
+    assert!(
+        triggers.contains("paths:"),
+        "expected a paths allowlist: {triggers}"
+    );
+    assert!(triggers.contains("docs/diagrams/**"), "{triggers}");
+    assert!(triggers.contains("**/*.rs"), "{triggers}");
+    assert!(
+        !triggers.contains("**/*.md"),
+        "Markdown-only changes must not start CI: {triggers}"
+    );
 }
