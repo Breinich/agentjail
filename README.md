@@ -3,27 +3,10 @@
 Run an AI coding agent — any agent — inside a rootless Podman jail with no host
 secrets, no host network, its own home, and an enforced egress allowlist.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant H as Host harness
-    participant C as agentjail CLI
-    participant P as podman
-    participant L as agentjail-launcher (jail PID 1)
-    participant A as agent process
+![agentjail: one jail, one route out](docs/diagrams/deployment.svg)
 
-    H->>C: run <profile> -- <agent command>
-    C->>C: validate profile (typed structs + JSON Schema)
-    C->>P: inspect the target network
-    P-->>C: internal flag, subnet metadata
-    C->>C: verify the single-route invariant; refuse on failure
-    C->>P: create the jail (not implemented yet)
-    P->>L: start with stdin and stdout as pipes
-    L->>A: exec the agent in its own process group
-    A-->>L: exit code (or death by signal N)
-    L-->>C: the same exit code, or 128 + N
-    C-->>H: the same exit code; stderr kept separate
-```
+The diagram source is `docs/diagrams/deployment.puml`; the SVG is rendered by CI
+from the pinned PlantUML image (`docs/adopting.md`).
 
 An agent is a process. agentjail does not know or care whether that process is
 pi, Claude Code, Codex, OpenCode, or something you wrote — it takes a command

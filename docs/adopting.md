@@ -39,21 +39,31 @@ about.
 
 ## Diagrams in this repository
 
-Diagrams are **UML-shaped Mermaid**: `sequenceDiagram` for interactions,
-`stateDiagram-v2` for lifecycle, `classDiagram`/`erDiagram` if a data model
-appears. Mermaid `flowchart`/`graph` is not used for architecture or behaviour:
-that syntax is not UML and it accepts relationships that mean nothing.
+Diagrams are **PlantUML**, because they must be real UML — a deployment view of
+the jail, network, gateway, and trust boundary, plus sequence and state
+diagrams for behaviour. The `.puml` sources live in `docs/diagrams/`, their
+rendered `.svg` files are committed next to them, and Markdown embeds the SVG.
 
-GitHub renders Mermaid natively, so it is the only diagram language a reader
-sees without plugins. A deployment/component view of the jail, network, gateway,
-and trust boundary is a **UML deployment diagram**, which Mermaid cannot express
-faithfully; that one is deliberately not drawn yet. If it is added, it becomes
-PlantUML source rendered by CI to a committed SVG with a drift check — a
-decision for a later PR, not tooling to pre-build now.
+Why not the classic GitHub PlantUML proxy service
+(`https://www.plantuml.com/plantuml/proxy?src=...`): this repository is private, and
+the proxy fetches `raw.githubusercontent.com` **unauthenticated**, so it cannot
+read these files at all; even when public, it makes every README view depend on
+a third party and always renders the latest commit, not the one being read. A
+render hop on every read is the wrong default for a repository about isolation.
 
-Checkability: `crates/agentjail/tests/diagrams.rs` fails the build when a
-Mermaid block uses a forbidden type (`flowchart`, `graph`) or an unknown diagram
-type. That is a type-level lint, not a full syntax check. Full validation needs
-`@mermaid-js/mermaid-cli`, which downloads Puppeteer/Chromium (hundreds of
-megabytes, minutes of CI time); the trade-off is flagged in the PR that
-introduced this policy rather than hidden in a job.
+CI (job `diagrams`, read-only `contents: read`) pulls the official PlantUML
+image **by digest** (`docker.io/plantuml/plantuml@sha256:2cf2f097…`, version
+1.2026.10), runs `-checkonly` so a syntax error fails the build, renders with
+`-tsvg`, and then fails if `git diff --exit-code docs/diagrams` reports any
+change — which also catches a stale or hand-edited SVG. It never commits.
+
+Re-render locally with the same command:
+
+```sh
+podman run --rm --user 0:0 -v "$PWD/docs/diagrams":/d \
+  docker.io/plantuml/plantuml@sha256:2cf2f097652701319e29b9e6a809e68d4ddb06fbeeb696705c097da8fa6d0507 \
+  -tsvg /d/*.puml
+```
+
+`--user 0:0` is only needed for rootless podman, where the image's default user
+cannot otherwise write into the bind mount.

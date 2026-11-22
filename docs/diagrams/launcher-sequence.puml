@@ -1,0 +1,27 @@
+@startuml launcher-sequence
+' UML sequence diagram: the launcher transport contract.
+' Source of record for docs/diagrams/launcher-sequence.svg. Do not edit the SVG.
+title Launcher contract: pipes, signals, exit code
+
+participant "host harness" as H
+participant "agentjail" as C
+participant "agentjail-launcher\n(jail PID 1)" as L
+participant "agent process group" as A
+
+H -> C : stdin (JSON-RPC frames)
+C -> L : stdin pipe
+L -> A : inherited fd 0
+A --> L : stdout (JSON-RPC frames)
+L --> C : stdout pipe
+C --> H : stdout
+A --> L : stderr (separate stream, never merged)
+L --> C : stderr pipe
+C --> H : stderr
+H -> C : SIGTERM
+C -> L : SIGTERM
+L -> A : SIGTERM to -pgid
+A --> L : exit code 42
+L --> C : exit code 42
+C --> H : exit code 42
+note over L, A : no TTY anywhere in this path
+@enduml

@@ -84,22 +84,10 @@ the outside half of the single-route invariant as exercised by
 
 ## Trust boundaries
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as agent process<br/>(untrusted)
-    participant G as gateway
-    participant D as allowlisted destination
-    participant H as host<br/>(credentials, files, socket)
+![Trust boundaries: jail, internal network, gateway, allowlisted destination](diagrams/deployment.svg)
 
-    A->>G: CONNECT api.example.com:443
-    G->>G: match against the allowlist
-    G->>D: forward, only for a listed host:port
-    D-->>G: response
-    G-->>A: response
-    A-xH: raw IP, bridge, or runtime socket
-    Note over A,H: no route, no peer, no socket<br/>the refusal happens outside the agent
-```
+Solid relationships are the only permitted paths; the dashed dependency is the
+one the design forbids and the environment must make impossible.
 
 ## The single-route invariant
 

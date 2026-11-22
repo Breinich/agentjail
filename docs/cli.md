@@ -31,39 +31,9 @@ pipes/SIGTERM/exit-code/resize path decides whether adoption is possible at all.
 The later acceptance test is a 3+ turn JSON-RPC session over stdio inside the
 jail.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant H as Host harness
-    participant C as agentjail
-    participant L as agentjail-launcher (PID 1)
-    participant A as agent process group
+![Launcher contract: pipes, signals, exit code](diagrams/launcher-sequence.svg)
 
-    H->>C: stdin (JSON-RPC frames)
-    C->>L: stdin pipe
-    L->>A: inherited fd 0
-    A-->>L: stdout (JSON-RPC frames)
-    L-->>C: stdout pipe
-    C-->>H: stdout
-    A--)L: stderr (separate stream, never merged)
-    H->>C: SIGTERM
-    C->>L: SIGTERM forwarded
-    L->>A: SIGTERM to the process group (-pgid)
-    A-->>L: exit code 42
-    L-->>C: exit code 42
-    C-->>H: exit code 42
-```
-
-```mermaid
-stateDiagram-v2
-    [*] --> Validated: profile parses and validates
-    Validated --> Refused: single-route invariant fails
-    Validated --> NetworkReady: internal network verified
-    NetworkReady --> Running: container starts, agent exec'd
-    Running --> Reaped: agent exits or dies from signal
-    Reaped --> [*]: container removed, exit code returned
-    Refused --> [*]: exit 1, nothing started
-```
+![run: validate, verify, exec, reap](diagrams/run-lifecycle.svg)
 
 ### Signals and exit codes
 

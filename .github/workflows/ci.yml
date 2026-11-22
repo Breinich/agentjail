@@ -132,6 +132,34 @@ jobs:
           grep -q "refusing to launch" "$tmp/err"
           grep -q "not internal" "$tmp/err"
 
+  diagrams:
+    name: diagrams (PlantUML, checked in)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: PlantUML syntax gate (-checkonly)
+        run: |
+          set -euo pipefail
+          image='docker.io/plantuml/plantuml@sha256:2cf2f097652701319e29b9e6a809e68d4ddb06fbeeb696705c097da8fa6d0507'
+          if ! docker run --rm -v "$PWD/docs/diagrams:/d" "$image" -checkonly '/d/*.puml'; then
+            echo "::error::PlantUML syntax check failed; fix the file and line reported above"
+            exit 1
+          fi
+      - name: Render SVG from source
+        run: |
+          set -euo pipefail
+          image='docker.io/plantuml/plantuml@sha256:2cf2f097652701319e29b9e6a809e68d4ddb06fbeeb696705c097da8fa6d0507'
+          docker run --rm --user 0:0 -v "$PWD/docs/diagrams:/d" "$image" -tsvg '/d/*.puml'
+      - name: Committed SVGs must match the sources
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- docs/diagrams; then
+            echo "::error::committed SVGs are stale or were edited by hand; re-render with the pinned image (see docs/adopting.md)"
+            exit 1
+          fi
+
   containerfile:
     name: Containerfile checks (static)
     runs-on: ubuntu-latest
