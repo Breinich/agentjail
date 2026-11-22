@@ -116,10 +116,10 @@ Defaulted, each because absence is **strictly restrictive or unambiguous**:
 | `env` | `{}` | No extra environment. |
 | `secrets` | `[]` | No credentials. |
 | `network.egress` | `[]` | In `mode = "none"` there is nothing to reach; in `mode = "allowlist"` an empty list is a validation error. |
-| `network.name` | — (launcher creates a dedicated internal network) | The launcher must create and verify it before starting anything. |
+| `network.name` | none | **Required by `run`**: agentjail attaches to an existing internal network and does not create one. Verified on every start. |
 | `mounts[].read_only` | `true` | Writable access must be requested. |
 | `mounts[].required` | `true` | A missing path fails the launch instead of silently shrinking the jail. |
-| `secrets[].delivery` | `"env"` | The narrower delivery; file delivery must be explicit. |
+| `secrets[].delivery` | `"env"` | `file` is valid schema but refused by `run`: secrets are injected as environment variables only. |
 | `secrets[].mode` | `0400` for file delivery only | Not accepted at all for env delivery. |
 | `network.egress[].protocol` | `"tls"` | The inspected protocol; `tcp` (uninspected) must be explicit and is limited to 443. |
 | `resources` | `cpus = 1`, `memory = 1g`, `pids = 256`, `nofile = 1024`, `disk = 2g`, `tmpfs = {}` | Conservative caps, not permissive ones. |
@@ -243,8 +243,8 @@ isolated network.
 | `mode` | `dns` | Meaning |
 | --- | --- | --- |
 | `none` (safe posture) | `none` | Internal network, no route out, no resolver. `egress` must be empty. |
-| `allowlist` | `gateway` | The gateway answers DNS for allowlisted names only and is the only route out. |
-| `allowlist` | `pinned` | No recursive resolver; static entries only. The gateway is still the only route out. |
+| `allowlist` | `gateway` | **Refused by `run` in this increment** (egress gateway not implemented); schema and validation still describe it. |
+| `allowlist` | `pinned` | **Refused by `run` in this increment** (egress gateway not implemented). |
 
 #### `[[network.egress]]`
 

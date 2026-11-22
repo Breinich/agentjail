@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use agentjail_core::paths;
 use agentjail_core::podman;
 use agentjail_core::profile::{self, Profile};
+use agentjail_core::run;
 use clap::{ArgAction, Parser, Subcommand};
 
 const EXIT_OK: u8 = 0;
@@ -182,6 +183,18 @@ fn validate_command(
     cwd: &Path,
 ) -> Result<u8, String> {
     let loaded = load_profile(reference, extra_dirs, env, cwd)?;
+    if let Err(errors) = run::validation_blockers(&loaded.profile) {
+        return Err(format!(
+            "profile {} is not runnable in this increment ({} error(s)):\n{}",
+            loaded.path.display(),
+            errors.len(),
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
     println!("OK {}", loaded.path.display());
     println!("   image: {}", loaded.profile.image_ref());
     println!("   {}", loaded.profile.summary());
@@ -215,44 +228,106 @@ fn run_command(
 ) -> Result<u8, String> {
     let loaded = load_profile(&args.profile, extra_dirs, env, cwd)?;
     let profile = &loaded.profile;
+    let profile_name = loaded.profile_name();
+
+    run::run_blockers(profile).map_err(|errors| {
+        format!(
+            "refusing to run profile {profile_name:?}:\n{}",
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })?;
+
+    // Single-route invariant, outside half: verified on every start, not once
+    // per profile install, because networks change under you.
+    let posture = preflight_network(profile)?;
+    eprintln!("agentjail: preflight OK: {}", posture.describe());
+
     let command = if args.agent_command.is_empty() {
         profile.agent_argv()
     } else {
         args.agent_command.clone()
     };
 
-    // Single-route invariant, outside half: verified on every start, not once
-    // per profile install, because networks change under you. A refusal is an
-    // error with a clear message -- never a warning, never start-then-kill.
-    let network_note = preflight_network(profile)?;
-
-    let secrets_note = if args.no_secrets {
-        "all secrets suppressed (--no-secrets)".to_string()
+    // Secrets: resolved here by reference, injected from podman's secret store
+    // as environment variables. Values never enter the container argv or config.
+    let plans = if args.no_secrets {
+        eprintln!("agentjail: --no-secrets: no secret is injected");
+        Vec::new()
     } else {
-        format!(
-            "{} secret reference(s) would be injected",
-            profile.secrets.len()
-        )
+        run::plan_secrets(&profile_name, profile, env).map_err(|errors| {
+            format!(
+                "refusing to run profile {profile_name:?}: secret resolution failed:\n{}",
+                errors
+                    .iter()
+                    .map(|error| format!("  - {error}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })?
     };
 
-    eprintln!("agentjail: not implemented: container launch is not implemented in this increment");
-    eprintln!(
-        "profile {:?} validated: {}",
-        loaded.profile_name(),
-        profile.summary()
-    );
-    eprintln!("{network_note}");
-    eprintln!(
-        "would exec {} inside {}",
-        command.join(" "),
-        profile.image_ref()
-    );
-    eprintln!("{secrets_note}");
-    eprintln!(
-        "The launcher contract (pipes not TTY, signal and resize forwarding, exit-code propagation, \
-         no orphaned containers) is documented in docs/cli.md."
-    );
-    Ok(EXIT_NOT_IMPLEMENTED)
+    if !plans.is_empty() {
+        // Secrets left behind by an interrupted earlier run are pruned on the
+        // next start; a `--rm` container does not clean the secret store.
+        let prefix = run::secret_prefix(&profile_name);
+        if let Ok(existing) = podman::secret_list() {
+            for name in existing.iter().filter(|name| name.starts_with(&prefix)) {
+                let _ = podman::secret_remove(name);
+            }
+        }
+        for plan in &plans {
+            match &plan.action {
+                run::SecretAction::Create { store_name, value } => {
+                    podman::secret_create(store_name, value)?;
+                }
+                run::SecretAction::Existing { store_name } => {
+                    if !podman::secret_exists(store_name) {
+                        return Err(format!(
+                            "refusing to run profile {profile_name:?}: secret store entry                              {store_name:?} does not exist"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let context = run::RunContext {
+        container_name: run::container_name(&profile_name, std::process::id()),
+        selinux: Path::new("/sys/fs/selinux/enforce").exists(),
+        term: env.get("TERM").cloned(),
+    };
+    let argv = run::podman_args(profile, &context, &plans, &command).map_err(|errors| {
+        format!(
+            "refusing to run profile {profile_name:?}:\n{}",
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })?;
+
+    let binary = podman::binary().ok_or_else(|| {
+        "podman is not installed or not on PATH: nothing can be launched".to_string()
+    })?;
+    eprintln!("agentjail: exec {} {}", binary.display(), argv.join(" "));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec: stdio, signals and the agent's exit code pass through untouched,
+        // and no shell or wrapper sits between the caller and podman.
+        let error = std::process::Command::new(&binary).args(&argv).exec();
+        Err(format!("cannot exec {}: {error}", binary.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        Err("agentjail run needs a unix host".to_string())
+    }
 }
 
 fn selftest_command(
@@ -263,7 +338,7 @@ fn selftest_command(
 ) -> Result<u8, String> {
     let loaded = load_profile(reference, extra_dirs, env, cwd)?;
     let profile = &loaded.profile;
-    let network_note = preflight_network(profile)?;
+    let posture = preflight_network(profile)?;
 
     eprintln!("agentjail: not implemented: selftest is not implemented in this increment");
     eprintln!(
@@ -271,7 +346,7 @@ fn selftest_command(
         loaded.profile_name(),
         profile.summary()
     );
-    eprintln!("{network_note}");
+    eprintln!("preflight OK: {}", posture.describe());
     eprintln!(
         "Planned negative set: raw IP:port unreachable; no second route, interface, or peer can be \
          added from inside; a non-internal network is refused with a clear message; host secrets \
@@ -288,24 +363,20 @@ fn selftest_command(
 /// network, the launcher will create a dedicated internal one and must verify
 /// it the same way before starting anything -- that creation path is not
 /// implemented yet, so this returns the honest state instead of a claim.
-fn preflight_network(profile: &Profile) -> Result<String, String> {
-    match &profile.network.name {
-        Some(name) => match podman::verify_network(name) {
-            Ok(posture) => Ok(format!(
-                "preflight: single-route invariant OK (outside check): {}",
-                posture.describe()
-            )),
-            Err(error) => Err(format!(
-                "refusing to launch: the network named by this profile does not satisfy the \
-                 single-route invariant.\n  {error}"
-            )),
-        },
-        None => Ok(
-            "preflight: no network.name set; the launcher must create a dedicated internal network \
-             and verify it (outside and inside) before starting anything -- not implemented yet"
+fn preflight_network(profile: &Profile) -> Result<agentjail_core::network::NetworkPosture, String> {
+    let Some(name) = &profile.network.name else {
+        return Err(
+            "refusing to launch: network.name is required; agentjail attaches to an existing \
+             internal network and does not create one"
                 .to_string(),
-        ),
-    }
+        );
+    };
+    podman::verify_network(name).map_err(|error| {
+        format!(
+            "refusing to launch: the network named by this profile does not satisfy the \
+             single-route invariant.\n  {error}"
+        )
+    })
 }
 
 struct LoadedProfile {

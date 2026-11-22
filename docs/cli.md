@@ -13,6 +13,32 @@ bind-mounted into a jail built from any base, including `scratch`.
 
 ## `agentjail run <profile> -- <agent command…>`
 
+Implemented for `network.mode = "none"` (no egress). The build path:
+
+- **preflight, every start**: `network.name` is required; the named network is
+  inspected and verified against the single-route invariant with the same code
+  path `doctor` uses. A bridged network is refused before anything is created.
+- **argv**: `podman run --rm --interactive --pull=never --read-only
+  --userns=keep-id:uid=10000,gid=10000 --cap-drop=ALL
+  --security-opt=no-new-privileges`, the profile's `--pids-limit`, `--memory`,
+  `--cpus`, `--ulimit nofile` and `--tmpfs /tmp,/run` (sized from the profile,
+  `noexec,nosuid,nodev`), exactly the declared bind mounts (`ro`/`rw`, `Z` when
+  SELinux is enforcing), an **environment allowlist** (`HOME`, `TERM`, profile
+  literals; no host environment), `--workdir`, the digest-pinned image, and the
+  agent command. There is no `-t`, no host home, no runtime socket, and no
+  implicit mount.
+- **secrets**: references are resolved before start (an unset or unreadable
+  reference fails closed, naming the reference and never a value), then written
+  to podman's secret store with `podman secret create` and passed as
+  `--secret source=…,type=env,target=…`, so the value is an env var at start and
+  never appears in the container's `Env` list. `--no-secrets` injects none.
+  The store entry outlives a `--rm` container; the next run of the same profile
+  prunes `agentjail-<profile>-*` entries before creating fresh ones.
+- **exec**: `agentjail` calls `exec(podman …)`, so stdin/stdout/stderr, signals,
+  and the exit code are the caller's directly. No shell wrapper.
+- `network.mode = "allowlist"` is refused at validation and at run: the gateway
+  is the next increment, and the message says so.
+
 ### Transport (a requirement, not a nicety)
 
 The agent runs with **pipes, not a TTY**:

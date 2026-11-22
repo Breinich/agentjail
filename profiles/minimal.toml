@@ -17,6 +17,8 @@ name = "localhost/agentjail-base:1"
 digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 [network]
+# run attaches to this existing internal network; it does not create one.
+name = "agentjail-minimal"
 mode = "none"
 # "none" means no resolver is set up in the jail at all -- podman rejects DNS
 # options together with an isolated network, so there is nothing to inherit.

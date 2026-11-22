@@ -136,6 +136,72 @@ pub fn verify_network(name: &str) -> Result<crate::network::NetworkPosture, Stri
     crate::network::verify_inspect_json(&raw)
 }
 
+/// Create (or replace) a podman secret from a value passed on stdin, so the
+/// value never appears in an argv that `ps` could show.
+pub fn secret_create(name: &str, value: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let binary = binary().ok_or_else(|| "podman is not installed or not on PATH".to_string())?;
+    let mut child = Command::new(&binary)
+        .args(["secret", "create", "--replace", name, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot run {binary:?}: {error}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "podman secret create has no stdin".to_string())?;
+        stdin
+            .write_all(value.as_bytes())
+            .map_err(|error| format!("cannot write secret {name:?} to podman: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for podman secret create: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "podman secret create {name:?} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Names of the secrets currently in the podman secret store.
+pub fn secret_list() -> Result<Vec<String>, String> {
+    let raw = podman_stdout(&["secret", "ls", "--format", "{{.Name}}"])?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether a secret exists in the podman secret store.
+pub fn secret_exists(name: &str) -> bool {
+    podman_stdout(&["secret", "inspect", name]).is_ok()
+}
+
+/// Remove a secret from the podman secret store, ignoring "not found".
+pub fn secret_remove(name: &str) -> Result<(), String> {
+    let output = podman(&["secret", "rm", name])?;
+    if output.success() || output.stderr.contains("no such secret") {
+        Ok(())
+    } else {
+        Err(format!(
+            "podman secret rm {name:?} failed ({}): {}",
+            output.code,
+            output.stderr.trim()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

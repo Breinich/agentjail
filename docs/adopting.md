@@ -25,10 +25,13 @@ were.
 
 ## What is not ready
 
-- `run` and `selftest` exit with code 3 (not implemented).
+- `run` works only with `network.mode = "none"`; allowlist profiles are refused
+  until the gateway exists.
+- `selftest` exits with code 3 (not implemented).
 - The gateway parses an allowlist but does not proxy or resolve anything yet.
-- The inside half of the single-route check needs the run path.
-- There is no secret injection and no resource enforcement yet.
+- The inside half of the single-route check is not implemented.
+- Secrets are injected by reference through podman's secret store (env vars
+  only); the store entry is pruned on the next run, not at exit.
 - The base image is not built or published by CI.
 - There is no published crate; build from a checkout with the pinned toolchain
   (`cargo build --release`), or use the static musl binaries built in CI.
