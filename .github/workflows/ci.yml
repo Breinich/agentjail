@@ -295,6 +295,15 @@ jobs:
           echo "podman install: $((installed - started))s"
           podman --version
 
+          # Rootless podman needs subordinate id ranges for the build/run user;
+          # the Debian package does not create them for an existing user.
+          if ! grep -q "^$(id -un):" /etc/subuid 2>/dev/null; then
+            sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+            podman system migrate
+          fi
+          podman info --format '{{.Host.Security.Rootless}}' | grep -qx true \
+            || { echo "rootless podman is not usable on this runner" >&2; exit 1; }
+
           # The jail for the proofs is the image images/base is built from: already
           # pinned by digest there, has bash (/dev/tcp) and node (the target
           # server), and is pulled rather than built, so the proofs do not pay for
