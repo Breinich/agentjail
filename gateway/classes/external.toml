@@ -1,0 +1,28 @@
+# Egress class `external`: public registries, package mirrors, and documentation
+# a coding agent legitimately fetches from. Nothing that resolves to the LAN.
+
+class = "external"
+
+listen = "0.0.0.0:3128"
+dns = "0.0.0.0:53"
+dns_policy = "allowlist"
+
+audit_log = "-"
+dns_log = "-"
+
+allow = [
+  "github.com:443",
+  "api.github.com:443",
+  "codeload.github.com:443",
+  "objects.githubusercontent.com:443",
+  "raw.githubusercontent.com:443",
+  "codeberg.org:443",
+  "crates.io:443",
+  "static.crates.io:443",
+  "index.crates.io:443",
+  "registry.npmjs.org:443",
+  "pypi.org:443",
+  "files.pythonhosted.org:443",
+  "*.debian.org:443",
+  "docs.rs:443",
+]

@@ -1,0 +1,32 @@
+# Egress class `model`: the LLM APIs a coding agent talks to.
+#
+# This file is the whole policy for the class. The gateway reads it once at
+# start; nothing here is mutated at runtime, and `agentjail run` refuses a
+# profile whose network.egress is not a subset of it.
+#
+# The class is identified by the internal podman network the jail joins, not by
+# a rule inside a shared proxy: the agent cannot change its network membership
+# from inside the jail.
+
+class = "model"
+
+# CONNECT listener, inside the class network only.
+listen = "0.0.0.0:3128"
+# DNS listener (UDP). The jail is started with --dns <this gateway's address>.
+dns = "0.0.0.0:53"
+# allowlist: answer allowlisted names (pinned to 127.0.0.1), NXDOMAIN the rest.
+dns_policy = "allowlist"
+
+# Both `-` streams: audit on stdout, DNS on stderr, so the two never mix.
+audit_log = "-"
+dns_log = "-"
+
+# `host` means port 443. `*.suffix` covers subdomains only, never the apex.
+allow = [
+  "api.anthropic.com:443",
+  "console.anthropic.com:443",
+  "statsig.anthropic.com:443",
+  "api.openai.com:443",
+  "openrouter.ai:443",
+  "generativelanguage.googleapis.com:443",
+]
