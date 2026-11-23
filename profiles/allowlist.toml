@@ -1,0 +1,30 @@
+# A jail that may reach exactly one destination, through the `model` egress
+# class: the class's committed allowlist (gateway/classes/model.toml) is the
+# control, this list is what the profile actually asks for and must be a subset.
+#
+#   agentjail run profiles/allowlist.toml -- bash -l
+#
+# The class network, the gateway container and the proxy environment are created
+# and removed per run. A raw IP:port, or any destination not in the class, fails
+# closed; that is the design, not a defect (see docs/egress-classes.md).
+version = 1
+description = "One allowlisted destination, through the model egress class."
+workdir = "/work"
+home = "/home/agent"
+
+[image]
+name = "localhost/agentjail-base:1"
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[network]
+class = "model"
+mode = "allowlist"
+dns = "gateway"
+
+[[network.egress]]
+host = "api.anthropic.com"
+port = 443
+
+[agent]
+command = "bash"
+args = ["-l"]

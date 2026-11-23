@@ -536,7 +536,11 @@ args = ["-lc", "printf 'started\n'; sleep 60"]
     let mut distinct = networks.clone();
     distinct.sort();
     distinct.dedup();
-    assert_eq!(distinct.len(), 4, "the four runs share a network: {networks:?}");
+    assert_eq!(
+        distinct.len(),
+        4,
+        "the four runs share a network: {networks:?}"
+    );
 
     for child in &mut children {
         nix::sys::signal::kill(

@@ -48,8 +48,19 @@ Implemented for `network.mode = "none"` (no egress). The build path:
   parent of `home` and the image entrypoint creates `$HOME` with **mode 0700**
   owned by the jail uid. `home` must be a subdirectory (for example
   `/home/agent`), not directly under `/`.
-- `network.mode = "allowlist"` is refused at validation and at run: the gateway
-  is the next increment, and the message says so.
+- **allowlist (`network.mode = "allowlist"`, `network.class = "…"`)**: before the
+  jail exists, `run` creates the per-run internal network
+  `agentjail-<profile>-<pid>-<class>`, verifies it with the same invariant as
+  above, starts that class's gateway container on it (`--cap-drop=ALL
+  --cap-add=NET_BIND_SERVICE`, read-only, the committed class config mounted
+  read-only), and reads its address back. The jail then gets `--network <class
+  network> --dns <gateway> --dns-search .` and `HTTPS_PROXY` / `ALL_PROXY` (and
+  the lowercase spellings) pointing at the gateway. The jail has no other route
+  and no other resolver; see `docs/egress-classes.md`. The profile's `egress`
+  must be a subset of its class allowlist, and the difference is refused before
+  anything is created. Both the network and the gateway are removed on every exit
+  path by the same `Drop` guard that removes secret entries; a `SIGKILL` leaves
+  them for the next run of the same profile to prune by dead pid.
 
 ### Transport (a requirement, not a nicety)
 
@@ -118,7 +129,7 @@ Verification happens from both sides and is fail-closed:
 | Side | What is checked | Where |
 | --- | --- | --- |
 | Outside | the network's metadata: `internal: true`, a subnet, no upstream route | implemented: `agentjail_core::network::verify_inspect_json`, used by `doctor --network` and by `run` preflight |
-| Inside | the only reachable peer is the gateway; no other peer, interface, or route exists | designed and specified below; **not implemented** (needs the run path) |
+| Inside | the only reachable peer is the gateway; a raw `IP:port` and a direct dial fail | implemented for allowlist profiles: `scripts/prove-egress-classes.sh` (proofs 2 and 3) asserts it from inside a real jail on every PR |
 
 Both run on **every start** — networks change under you — and both share one
 implementation of the outside check. `run` refuses a network that fails, with
@@ -132,10 +143,10 @@ satisfy the single-route invariant.
   Refusing to launch.
 ```
 
-There is no "warning and continue" mode and no start-then-kill. A profile can
-name an existing network (`network.name`); if it names a bridged one, `run`
-refuses. When nothing is named, the launcher must create a dedicated internal
-network and verify it the same way before starting anything.
+There is no "warning and continue" mode and no start-then-kill. A `mode = "none"`
+profile names an existing network (`network.name`); if it names a bridged one,
+`run` refuses. An allowlist profile names no network: `run` creates a dedicated
+internal one and verifies it the same way before starting anything.
 
 ## `agentjail selftest <profile>`
 
@@ -178,19 +189,30 @@ turns a fast refusal into a slow timeout is visible.
 
 ## `agentjail-gateway`
 
-Implemented today: load the profile through the typed model, require
-`network.mode = "allowlist"`, and print the exact allowlist and DNS strategy
-(`--check`, exit 0). **Not implemented:** the listener, CONNECT handling, and
-DNS pinning — the binary says so and exits 3.
+One instance per egress class, driven entirely by one committed class config:
 
-The intent, documented so the implementation cannot drift: one process, DNS
-answers only for allowlisted names, CONNECT only for allowlisted `host:port`,
-no wildcards, no suffix matching, no dynamic widening at runtime, logs record
-destination and verdict but never payload.
+```sh
+agentjail-gateway --config gateway/classes/model.toml --jail-id <profile>-<pid>
+agentjail-gateway --config gateway/classes/model.toml --check   # print, start nothing
+```
 
-## In this increment
+- **DNS (UDP)**: `A` answers `127.0.0.1` for names the class may reach, NXDOMAIN
+  for everything else. Loopback is deliberate — a jail that resolves and then
+  dials directly reaches itself and fails closed.
+- **CONNECT (TCP)**: relays only `host:port` pairs on the allowlist; exact host or
+  `*.suffix`, port part of the match. A raw `IP:port` is refused even if listed.
+  Non-CONNECT methods are refused.
+- **Logging**: one audit line per connection (including denials) on a stream
+  separate from the DNS log, with the class, the jail id, the destination, the
+  decision, and the bytes.
 
-`run` and `selftest` validate the profile, run the outside network preflight
-when the profile names a network, print the resolved plan, and exit `3`. They
-do not start containers, do not touch the host, and do not pretend to have
-tested anything.
+Full detail, including the audit line format and the residual weaknesses:
+`docs/egress-classes.md`. The proofs in `scripts/prove-egress-classes.sh` run on
+every PR.
+
+## Status of `selftest`
+
+`selftest` validates the profile, runs the outside network preflight, prints the
+negative set it will run, and exits `3` (not implemented). The egress-class
+proofs it will absorb live in `scripts/prove-egress-classes.sh` today, and run on
+every PR.
