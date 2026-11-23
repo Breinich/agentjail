@@ -459,3 +459,125 @@ args = ["-lc", "printf 'started\n'; sleep 30"]"#,
     }
     remove_network(&network);
 }
+
+/// Four concurrent runs of one allowlist profile: four distinct class networks,
+/// four gateways, all cleaned up. `#[ignore]`d because it needs rootless podman,
+/// the base image, the gateway image, and about a minute of wall clock; the same
+/// ground is covered without podman by the fake-podman tests, and the lifecycle
+/// cases run in ci via scripts/prove-egress-classes.sh.
+///
+/// ```sh
+/// cargo test -p agentjail --test run_podman -- --ignored --test-threads=1
+/// ```
+#[test]
+#[ignore = "requires rootless podman, the base and gateway images, ~1 min"]
+fn four_way_concurrent_runs_create_distinct_networks_and_clean_all_of_them() {
+    let dir = tmpdir("fourway");
+    let digest = image_digest();
+    let profile_path = dir.join("fourway.toml");
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"version = 1
+workdir = "/work"
+home = "/home/agent"
+
+[image]
+name = "localhost/agentjail-base:1"
+digest = "{digest}"
+
+[network]
+class = "model"
+mode = "allowlist"
+dns = "gateway"
+
+[[network.egress]]
+host = "api.anthropic.com"
+port = 443
+
+[agent]
+command = "sh"
+args = ["-lc", "printf 'started\n'; sleep 60"]
+"#
+        ),
+    )
+    .expect("write profile");
+
+    let class_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../gateway/classes");
+    let spawn = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_agentjail"))
+            .args(["run", profile_path.to_str().expect("path")])
+            .env_remove("AGENTJAIL_PODMAN")
+            .env("AGENTJAIL_CLASS_DIR", &class_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn agentjail")
+    };
+    let mut children: Vec<std::process::Child> = (0..4).map(|_| spawn()).collect();
+
+    let prefix = "agentjail-fourway-";
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let networks = loop {
+        let networks: Vec<String> = podman_ok(&["network", "ls", "--format", "{{.Name}}"])
+            .lines()
+            .filter(|name| name.starts_with(prefix) && name.ends_with("-model"))
+            .map(str::to_string)
+            .collect();
+        if networks.len() >= 4 {
+            break networks;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected four class networks, saw {networks:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let mut distinct = networks.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 4, "the four runs share a network: {networks:?}");
+
+    for child in &mut children {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .expect("send SIGTERM");
+    }
+    let mut stderr = String::new();
+    for child in &mut children {
+        let output = child.stderr.take().map(|mut pipe| {
+            use std::io::Read;
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            text
+        });
+        if let Some(text) = output {
+            stderr.push_str(&text);
+        }
+        let _ = child.wait();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left: Vec<String> = podman_ok(&["network", "ls", "--format", "{{.Name}}"])
+            .lines()
+            .filter(|name| name.starts_with(prefix))
+            .map(str::to_string)
+            .collect();
+        let containers: Vec<String> = podman_ok(&["ps", "-a", "--format", "{{.Names}}"])
+            .lines()
+            .filter(|name| name.starts_with(prefix))
+            .map(str::to_string)
+            .collect();
+        if left.is_empty() && containers.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a signal-terminated run left {left:?} {containers:?}; stderr:\n{stderr}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}

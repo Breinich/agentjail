@@ -68,7 +68,7 @@ jobs:
             while IFS= read -r path; do
               [ -n "$path" ] || continue
               case "$path" in
-                *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|rust-toolchain.toml|schema/*|profiles/*|images/*|docs/diagrams/*|.github/workflows/*)
+                *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|rust-toolchain.toml|schema/*|profiles/*|images/*|gateway/*|scripts/*|docs/diagrams/*|.github/workflows/*)
                   relevant=true
                   ;;
               esac
@@ -278,6 +278,41 @@ jobs:
           AGENTJAIL_ALLOW_ROOT=1 "$launcher" -- sh -c 'exit 7' \
             && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
           "$gateway" --version
+
+      # The egress class proofs, in the normal job rather than behind #[ignore]:
+      # evidence that has to be remembered never exists. podman is installed
+      # here because the claims are about real networks and a real gateway
+      # container, and that is the only way to check them. Measured cost is
+      # printed for the report; the proofs are not trimmed to fit a clock.
+      - name: Egress class proofs (podman)
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman >/dev/null
+          installed=$(date +%s)
+          echo "podman install: $((installed - started))s"
+          podman --version
+
+          # The jail for the proofs is the image images/base is built from: already
+          # pinned by digest there, has bash (/dev/tcp) and node (the target
+          # server), and is pulled rather than built, so the proofs do not pay for
+          # the 448 MB base image build.
+          jail='docker.io/library/node:24-bookworm-slim@sha256:0e2646ab57e77b7a384a0cb59b6815b182c77e1f9c3ba36bd8435bd9c4e6680e'
+          podman pull -q "$jail" >/dev/null
+          pulled=$(date +%s)
+          echo "jail image pull: $((pulled - installed))s"
+
+          # The static musl build above produced the binaries; the gateway image
+          # only COPYs them and the committed class configs.
+          scripts/build-gateway-image.sh
+          built=$(date +%s)
+          echo "gateway image build: $((built - pulled))s"
+
+          scripts/prove-egress-classes.sh
+          echo "proofs: $(( $(date +%s) - built ))s"
+          echo "total with podman setup: $(( $(date +%s) - started ))s"
 
       # The remaining two checks are path-gated: a Rust-only PR must not pay for
       # a PlantUML image pull or an image build.
