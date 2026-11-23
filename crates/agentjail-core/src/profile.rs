@@ -180,8 +180,11 @@ pub enum DnsStrategy {
     /// No resolver at all (required with `mode = "none"`).
     None,
     /// Every answer comes from the gateway, which only resolves allowlisted names.
+    /// The only value accepted with `mode = "allowlist"`.
     Gateway,
-    /// Static entries only; no recursive resolver.
+    /// Reserved: static entries only, no recursive resolver. Parses and is
+    /// refused by validation until it is implemented, because a knob that
+    /// validates and does nothing is a claim without enforcement.
     Pinned,
 }
 
@@ -785,11 +788,21 @@ fn network_errors(network: &Network) -> Vec<String> {
                     "network.egress: mode \"allowlist\" needs at least one destination".to_string(),
                 );
             }
-            if network.dns == DnsStrategy::None {
-                errors.push(
-                    "network.dns: mode \"allowlist\" needs dns = \"gateway\" or \"pinned\""
+            match network.dns {
+                DnsStrategy::Gateway => {}
+                DnsStrategy::None => errors.push(
+                    "network.dns: mode \"allowlist\" needs dns = \"gateway\"; the class gateway \
+                     is the jail's resolver"
                         .to_string(),
-                );
+                ),
+                // Reserved in the schema, refused here: a value that validates and
+                // then does nothing is worse than one that is refused (the same
+                // reason `resources.disk` was removed).
+                DnsStrategy::Pinned => errors.push(
+                    "network.dns: \"pinned\" is not implemented yet; the launcher always starts \
+                     the class gateway as the resolver, so use dns = \"gateway\""
+                        .to_string(),
+                ),
             }
         }
     }
@@ -1274,6 +1287,18 @@ args = ["-lc", "true"]
                 .any(|error| error.contains("mode \"none\" means no egress")),
             "{found:#?}"
         );
+    }
+
+    #[test]
+    fn pinned_dns_is_refused_as_not_implemented() {
+        // It parses and it is in the schema, but nothing honours it, so it is
+        // refused rather than silently ignored.
+        let text = allowlist().replace("dns = \"gateway\"", "dns = \"pinned\"");
+        assert_error(&text, "\"pinned\" is not implemented yet");
+        let text = allowlist().replace("dns = \"gateway\"", "dns = \"none\"");
+        assert_error(&text, "needs dns = \"gateway\"");
+        // The only accepted resolver for an allowlist profile is the gateway.
+        assert!(parse_and_validate(&allowlist()).is_ok());
     }
 
     #[test]

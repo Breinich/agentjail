@@ -351,7 +351,7 @@
             "gateway",
             "pinned"
           ],
-          "description": "DNS strategy. none: no resolver. gateway: DNS is answered and pinned by the egress gateway. pinned: static entries only, no recursive resolver. Required with no default so it can never be unset by accident: an inherited host search domain can silently resolve internal names and defeat an allowlist. When the jail has a resolver (allowlist mode), the launcher additionally passes --dns-search . so host search domains cannot leak in; with dns=none there is no resolver at all (see docs/threat-model.md)."
+          "description": "DNS strategy. Required with no default so it can never be unset by accident: an inherited host search domain can silently resolve internal names and defeat an allowlist. none: no resolver (only with mode=\"none\"). gateway: the class gateway is the resolver and answers only allowlisted names, pinned to loopback. pinned is reserved and refused by validation until it is implemented: the launcher always starts the class gateway as the resolver. With a resolver the launcher additionally passes --dns-search . so host search domains cannot leak in (see docs/threat-model.md)."
         },
         "egress": {
           "type": "array",

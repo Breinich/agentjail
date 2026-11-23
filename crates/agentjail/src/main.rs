@@ -561,17 +561,16 @@ fn start_class_side(
     let (config_path, config) = resolve_class(profile, env, cwd)?
         .ok_or_else(|| "class side requested for a profile with no egress class".to_string())?;
 
-    let image = env
+    // Resolve the tag to an image ID now, and start the container by that ID.
+    // The tag is what an operator builds; the ID is what runs, so a retag between
+    // here and `podman run` cannot swap the process the jail talks to.
+    let image_ref = env
         .get("AGENTJAIL_GATEWAY_IMAGE")
         .filter(|value| !value.is_empty())
         .cloned()
         .unwrap_or_else(|| "localhost/agentjail-gateway:1".to_string());
-    if !podman::image_exists(&image) {
-        return Err(format!(
-            "gateway image {image:?} is not present; build it with \
-             scripts/build-gateway-image.sh (or set AGENTJAIL_GATEWAY_IMAGE)"
-        ));
-    }
+    let image_id = podman::image_id(&image_ref)?;
+    eprintln!("agentjail: gateway image {image_ref:?} is {image_id} (pinned by ID)");
     let egress_network = egress_network(env)?;
 
     // Backstop for SIGKILL and host crashes: remove only what is provably dead,
@@ -590,7 +589,7 @@ fn start_class_side(
     let container = lifecycle::gateway_name(profile_name, run_id);
     let argv = run::gateway_args(&run::GatewayContext {
         container_name: container.clone(),
-        image,
+        image_id,
         class_config: config_path.to_string_lossy().into_owned(),
         network: network.clone(),
         egress_network,

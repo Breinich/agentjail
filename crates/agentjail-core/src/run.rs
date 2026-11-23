@@ -371,7 +371,9 @@ pub const CONTAINER_CLASS_CONFIG: &str = "/etc/agentjail/class.toml";
 /// Everything one gateway container needs to be started.
 pub struct GatewayContext {
     pub container_name: String,
-    pub image: String,
+    /// The gateway image **by ID** (`sha256:…`), never by tag: the tag is a name
+    /// and this process is the jail's only route out.
+    pub image_id: String,
     /// Host path of the committed class config, bind-mounted read-only.
     pub class_config: String,
     /// The per-run internal network the jail and the gateway share.
@@ -409,7 +411,7 @@ pub fn gateway_args(context: &GatewayContext) -> Vec<String> {
             context.class_config
         ),
     ]);
-    args.push(context.image.clone());
+    args.push(context.image_id.clone());
     args.extend([
         "--config".into(),
         CONTAINER_CLASS_CONFIG.to_string(),

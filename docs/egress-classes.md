@@ -164,6 +164,33 @@ build it. The class config is bind-mounted read-only from the checkout (or from
 `AGENTJAIL_CLASS_DIR`), so what runs is what is committed, not a copy baked into
 an image that may be older than the file.
 
+### The image is pinned by ID, not by tag
+
+A tag is a name. `localhost/agentjail-gateway:1` means "whatever carries that
+name right now", and that process is the jail's only route out. So `run`
+resolves it once and starts the container **by image ID**:
+
+```text
+agentjail: gateway image "localhost/agentjail-gateway:1" is sha256:5f78f0df…: (pinned by ID)
+```
+
+- Resolution is `podman image inspect --format '{{.Id}}' <reference>`; the answer
+  must be `sha256:` plus 64 hex characters, or the run is refused.
+- The container argv carries that ID, so a retag between the check and the start
+  cannot substitute a different binary.
+- An absent image, an empty answer, a tag as the answer, or anything that is not
+  an ID is refused **before** a network or a container exists, and the message
+  says how to build the image.
+
+What this does not do: it does not attest that the image was built from the
+commit you think it was. It fixes *which* image runs once resolution happens;
+provenance of the local image store is trusted input, like the profile. To check
+by hand:
+
+```sh
+podman image inspect --format '{{.Id}}' localhost/agentjail-gateway:1
+```
+
 ## Proving it
 
 `scripts/prove-egress-classes.sh` runs in the normal `ci` job. It needs podman,
@@ -192,13 +219,18 @@ jail. Each proof prints the line it asserted:
 - **`protocol = "http"` and `"tcp"` in a profile do not do anything yet.** The
   proxy implements `CONNECT` only; a plain-HTTP destination or a raw TCP relay is
   refused at the proxy (`405`). Only TLS on an allowlisted `host:port` works today.
+- **`dns = "pinned"` is refused by validation**, not silently ignored: the
+  launcher always starts the class gateway as the resolver, so a profile that asks
+  for static entries only is told "not implemented yet" instead of getting
+  something else.
 - **Rate and size:** there is no connection cap and no byte limit per jail
   (comment: `shortcut:` in `proxy.rs`). The pids and memory limits in the profile
   are the only brakers.
-- **The gateway image tag is not pinned by digest** in the run path: it is
-  `localhost/agentjail-gateway:1`, built from this checkout. A stale image with an
-  old binary is possible; the class config is not stale because it is mounted.
-  Rebuild after pulling.
+- **The gateway image is pinned by ID, not attested.** `run` resolves the tag and
+  starts the container by that ID, so the process is fixed at resolution time; it
+  does not prove the ID was built from this commit. A stale local image is still
+  possible — rebuild with `scripts/build-gateway-image.sh` after pulling. The
+  class config cannot be stale: it is mounted from the checkout.
 - **The gateway container's outbound leg** defaults to podman's own network
   (`podman`, else `bridge`) or `AGENTJAIL_EGRESS_NETWORK`. It is the gateway, not
   the jail, that is dual-homed.

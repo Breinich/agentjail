@@ -230,7 +230,7 @@ needs.
 | `name` | no | Attach to this existing podman network instead of creating one (`mode = "none"` only; refused with `allowlist`). Verified against the single-route invariant on **every** start; `run` refuses a network that is not internal. Pattern: `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`. |
 | `class` | with `allowlist` | Egress class: `model`, `external`, or `internal`. It names the internal network the jail joins, and therefore which committed allowlist (`gateway/classes/<class>.toml`) applies. The agent cannot change it from inside. Refused with `mode = "none"`. |
 | `mode` | yes | `none` or `allowlist`. |
-| `dns` | yes | `none`, `gateway`, or `pinned`. |
+| `dns` | yes | `none`, `gateway`, or `pinned`. `pinned` parses and is **refused by validation as not implemented**; `gateway` is the only accepted resolver with `mode = "allowlist"`. |
 | `egress` | no | Array of destinations; required non-empty when `mode = "allowlist"`. |
 
 `dns` has **no default**: leaving it out is an error, not a silent choice. An
@@ -245,7 +245,7 @@ isolated network.
 | --- | --- | --- |
 | `none` (safe posture) | `none` | Internal network, no route out, no resolver. `egress` must be empty. |
 | `allowlist` | `gateway` | Joined to the per-run class network; the class gateway is the only peer, the resolver, and the proxy. `egress` must be a subset of the class allowlist. |
-| `allowlist` | `pinned` | Accepted by the schema; the launcher still starts the class gateway as the resolver, so `gateway` is what to use today. |
+| `allowlist` | `pinned` | **Refused by validation** ("not implemented yet"): the launcher always starts the class gateway as the resolver, so this value would be a knob with no enforcement behind it. |
 
 #### `[[network.egress]]`
 

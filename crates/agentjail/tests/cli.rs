@@ -98,10 +98,15 @@ case "$1" in
     ;;
   image)
     case "$2" in
-      exists)
-        if [ -n "${AGENTJAIL_TEST_IMAGE_MISSING:-}" ]; then exit 1; fi
-        exit 0
+      inspect)
+        # `--format {{.Id}} <reference>`: the ID this reference means right now.
+        if [ -n "${AGENTJAIL_TEST_IMAGE_MISSING:-}" ]; then
+          echo "Error: localhost/agentjail-gateway:1: image not known" >&2
+          exit 125
+        fi
+        echo "${AGENTJAIL_TEST_IMAGE_ID:-sha256:5f78f0dfcc526190811f735720e01b3acfa401a40eb3406801a3e5a8b25d9783}"
         ;;
+      exists) exit 0 ;;
       *) exit 1 ;;
     esac
     ;;
@@ -707,6 +712,15 @@ fn allowlist_run_creates_the_class_network_and_gateway_and_then_removes_both() {
         gateway.contains("gateway/classes/model.toml"),
         "the committed class config is what is mounted: {gateway}"
     );
+    // The image is the resolved ID, not the tag: a tag is a name.
+    assert!(
+        gateway.contains("sha256:5f78f0dfcc526190811f735720e01b3acfa401a40eb3406801a3e5a8b25d9783"),
+        "the gateway must run by pinned image ID: {gateway}"
+    );
+    assert!(
+        !gateway.contains("localhost/agentjail-gateway:test"),
+        "the gateway must not be started by tag: {gateway}"
+    );
 
     // The jail: joined to the class network, with the gateway as resolver and
     // proxy, and no host search domain.
@@ -780,4 +794,41 @@ fn a_missing_gateway_image_fails_before_anything_is_created() {
             .contains("network-create"),
         "nothing is created for a run that cannot start"
     );
+}
+
+/// A tag that resolves to something which is not an image ID is a name with no
+/// thing behind it: refused before any network or container exists.
+#[test]
+fn a_gateway_image_that_does_not_resolve_to_an_id_is_refused() {
+    for bad in [
+        "localhost/agentjail-gateway:test",
+        "sha256:abc",
+        "00000000000000000000000000000000000000000000000000000000000000001",
+    ] {
+        let dir = tmpdir("allowlist-bad-image");
+        let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+        let podman = fake_podman(&dir);
+        let log = dir.join("podman.log");
+        let output = run_with_env(
+            &["run", path.to_str().unwrap()],
+            &dir,
+            Some(&podman),
+            &[
+                ("AGENTJAIL_TEST_LOG", log.to_str().unwrap()),
+                ("AGENTJAIL_TEST_IMAGE_ID", bad),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{bad}: {}", stderr(&output));
+        let err = stderr(&output);
+        assert!(
+            err.contains("not an image ID") || err.contains("is absent"),
+            "{bad}: {err}"
+        );
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("network-create"),
+            "{bad}: a refuseable run created a network"
+        );
+    }
 }

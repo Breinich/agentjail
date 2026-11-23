@@ -234,9 +234,47 @@ pub fn container_ip(container: &str, network: &str) -> Result<String, String> {
     podman_stdout(&["container", "inspect", "--format", &format, container])
 }
 
-/// Whether an image is present locally.
-pub fn image_exists(image: &str) -> bool {
-    podman_stdout(&["image", "exists", image]).is_ok()
+/// Resolve an image reference (usually a tag) to the image ID it currently
+/// means, and refuse anything that is not an ID.
+///
+/// A tag is a name, not a thing: whatever carries
+/// `localhost/agentjail-gateway:1` when the run starts is the process the jail
+/// talks to. Resolving once, then starting the container by ID, means a retag
+/// between the check and the start cannot substitute a different binary.
+pub fn image_id(reference: &str) -> Result<String, String> {
+    let raw = podman_stdout(&["image", "inspect", "--format", "{{.Id}}", reference]).map_err(
+        |error| {
+            format!(
+                "gateway image {reference:?} is not present ({error}); build it with \
+                 scripts/build-gateway-image.sh (or set AGENTJAIL_GATEWAY_IMAGE)"
+            )
+        },
+    )?;
+    pin_image_reference(&raw).map_err(|error| format!("gateway image {reference:?}: {error}"))
+}
+
+/// Accept only a real image ID: `sha256:` plus 64 hex characters, or the 64 hex
+/// characters podman also prints. An empty answer, a tag, or anything else is
+/// refused, because "some image" is not a pin.
+pub fn pin_image_reference(resolved: &str) -> Result<String, String> {
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "the image is absent (no ID was reported), so there is nothing to run".to_string(),
+        );
+    }
+    let has_prefix = trimmed
+        .strip_prefix("sha256:")
+        .map(str::to_string)
+        .unwrap_or_else(|| trimmed.to_string());
+    if has_prefix.len() == 64 && has_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(format!("sha256:{}", has_prefix.to_ascii_lowercase()))
+    } else {
+        Err(format!(
+            "{trimmed:?} is not an image ID (expected sha256:<64 hex>); \
+             a tag is a name, and this process is the jail's only route out"
+        ))
+    }
 }
 
 /// Create (or replace) a podman secret from a value passed on stdin, so the
@@ -308,6 +346,37 @@ pub fn secret_remove(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_real_image_id_is_accepted_as_a_pin() {
+        let hex = "5f78f0dfcc526190811f735720e01b3acfa401a40eb3406801a3e5a8b25d9783";
+        assert_eq!(
+            pin_image_reference(hex).expect("bare hex"),
+            format!("sha256:{hex}")
+        );
+        assert_eq!(
+            pin_image_reference(&format!("sha256:{hex}\n")).expect("prefixed"),
+            format!("sha256:{hex}")
+        );
+        assert_eq!(
+            pin_image_reference(&format!("sha256:{}", hex.to_uppercase())).expect("case folded"),
+            format!("sha256:{hex}")
+        );
+        for bad in [
+            "",
+            "   ",
+            "localhost/agentjail-gateway:1",
+            "sha256:abc",
+            &format!("{hex}ff"),
+            "sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let error = pin_image_reference(bad).expect_err(bad);
+            assert!(
+                error.contains("absent") || error.contains("not an image ID"),
+                "{bad}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn missing_path_var_means_not_found() {
