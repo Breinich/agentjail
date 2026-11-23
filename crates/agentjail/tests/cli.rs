@@ -33,11 +33,12 @@ name = "localhost/agentjail-base:1"
 digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 [network]
+class = "model"
 mode = "allowlist"
 dns = "gateway"
 
 [[network.egress]]
-host = "api.example.com"
+host = "api.anthropic.com"
 port = 443
 
 [[secrets]]
@@ -69,22 +70,52 @@ case "$1" in
     ;;
   network)
     case "$2" in
+      ls)
+        echo "podman"
+        cat "${AGENTJAIL_TEST_NETWORKS:-/dev/null}"
+        ;;
+      create)
+        echo "network-create $5" >> "$log"
+        ;;
       inspect)
         case "$3" in
-          internal-ok)
-            echo '[{"name":"internal-ok","driver":"bridge","internal":true,"ipv6_enabled":false,"subnets":[{"subnet":"10.89.0.0/24","gateway":"10.89.0.1"}]}]'
-            ;;
           bridged)
             echo '[{"name":"bridged","driver":"bridge","internal":false,"subnets":[{"subnet":"10.88.0.0/16","gateway":"10.88.0.1"}]}]'
             ;;
           *)
-            echo "network $3 not found" >&2
-            exit 1
+            echo '[{"name":"'"$3"'","driver":"bridge","internal":true,"ipv6_enabled":false,"subnets":[{"subnet":"10.89.0.0/24","gateway":"10.89.0.1"}]}]'
             ;;
         esac
         ;;
-      *) echo "unsupported" >&2; exit 1 ;;
+      rm)
+        echo "network-rm $4" >> "$log"
+        ;;
+      *)
+        echo "unsupported network $2" >&2
+        exit 1
+        ;;
     esac
+    ;;
+  image)
+    case "$2" in
+      exists)
+        if [ -n "${AGENTJAIL_TEST_IMAGE_MISSING:-}" ]; then exit 1; fi
+        exit 0
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  container)
+    case "$2" in
+      inspect) echo "${AGENTJAIL_TEST_GATEWAY_IP:-10.89.0.2}" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  ps)
+    cat "${AGENTJAIL_TEST_CONTAINERS:-/dev/null}"
+    ;;
+  rm)
+    echo "container-rm $3" >> "$log"
     ;;
   secret)
     case "$2" in
@@ -100,8 +131,17 @@ case "$1" in
     esac
     ;;
   run)
-    printf '%s\n' "$@" > "${AGENTJAIL_TEST_ARGV:-argv.txt}"
-    exit "${AGENTJAIL_TEST_EXIT:-0}"
+    case " $* " in
+      *" --detach "*)
+        printf '%s\n' "$@" > "${AGENTJAIL_TEST_GATEWAY_ARGV:-gateway-argv.txt}"
+        echo "gateway-started" >> "$log"
+        ;;
+      *)
+        printf '%s\n' "$@" > "${AGENTJAIL_TEST_ARGV:-argv.txt}"
+        echo "jail-started" >> "$log"
+        exit "${AGENTJAIL_TEST_EXIT:-0}"
+        ;;
+    esac
     ;;
   *)
     echo "unexpected: $*" >&2
@@ -452,14 +492,40 @@ fn run_fails_closed_when_a_secret_reference_is_missing() {
 }
 
 #[test]
-fn profile_validate_refuses_allowlist_until_the_gateway_exists() {
+fn profile_validate_accepts_an_allowlist_profile_and_names_its_class() {
     let dir = tmpdir("validate-allowlist");
     let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
     let output = run(&["profile", "validate", path.to_str().unwrap()], &dir, None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("egress class \"model\""), "{out}");
+    assert!(out.contains("deny by default"), "{out}");
+}
+
+#[test]
+fn a_destination_outside_the_profile_class_is_a_validation_error() {
+    let dir = tmpdir("validate-outside");
+    let text = ALLOWLIST.replace("api.anthropic.com", "api.example.com");
+    let path = write_profile(&dir, "outside.toml", &text);
+    let output = run(&["profile", "validate", path.to_str().unwrap()], &dir, None);
     assert_eq!(output.status.code(), Some(1));
     let err = stderr(&output);
-    assert!(err.contains("egress gateway"), "{err}");
-    assert!(err.contains("not implemented"), "{err}");
+    assert!(err.contains("api.example.com:443"), "{err}");
+    assert!(err.contains("egress class \"model\""), "{err}");
+}
+
+#[test]
+fn an_allowlist_profile_without_a_class_is_refused() {
+    let dir = tmpdir("validate-no-class");
+    let text = ALLOWLIST.replace("class = \"model\"\n", "");
+    let path = write_profile(&dir, "no-class.toml", &text);
+    let output = run(&["profile", "validate", path.to_str().unwrap()], &dir, None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("network.class"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -556,4 +622,162 @@ fn selftest_help_documents_the_negative_set() {
     assert!(help.contains("podman/docker socket"), "{help}");
     assert!(help.contains("two concurrent jails"), "{help}");
     assert!(help.contains("writable-layer size"), "{help}");
+}
+
+/// The class side of an allowlist run, driven end to end against a fake podman:
+/// what is created, what the jail is told, and what is removed on the way out.
+#[test]
+fn allowlist_run_creates_the_class_network_and_gateway_and_then_removes_both() {
+    let dir = tmpdir("allowlist-run");
+    let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+    let podman = fake_podman(&dir);
+    let log = dir.join("podman.log");
+    let gateway_argv = dir.join("gateway-argv.txt");
+    let argv_path = dir.join("argv.txt");
+
+    let output = run_with_env(
+        &["run", path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[
+            ("AGENTJAIL_TEST_LOG", log.to_str().unwrap()),
+            (
+                "AGENTJAIL_TEST_GATEWAY_ARGV",
+                gateway_argv.to_str().unwrap(),
+            ),
+            ("AGENTJAIL_TEST_ARGV", argv_path.to_str().unwrap()),
+            (
+                "AGENTJAIL_GATEWAY_IMAGE",
+                "localhost/agentjail-gateway:test",
+            ),
+            ("EXAMPLE_FORGE_TOKEN", "fake-token-value"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let events: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let network = events
+        .iter()
+        .find_map(|event| event.strip_prefix("network-create "))
+        .expect("a class network was created")
+        .to_string();
+    assert!(
+        network.starts_with("agentjail-allowlist-") && network.ends_with("-model"),
+        "class network is named after the profile, the pid and the class: {network}"
+    );
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some(format!("network-rm {network}").as_str()),
+        "the network is removed last: {events:?}"
+    );
+    assert!(
+        events.contains(&format!(
+            "container-rm {}",
+            network.replace("-model", "-gateway")
+        )),
+        "the gateway is removed before the network: {events:?}"
+    );
+
+    // The gateway: on the class network and its own outbound leg, one capability,
+    // the committed class config, and the run id as the jail id.
+    let gateway = recorded_argv(&gateway_argv).join(" ");
+    for expected in [
+        "--detach",
+        "--cap-drop=ALL",
+        "--cap-add=NET_BIND_SERVICE",
+        "--read-only",
+        "--pull=never",
+        "--config /etc/agentjail/class.toml",
+        "--jail-id allowlist-",
+    ] {
+        assert!(
+            gateway.contains(expected),
+            "missing {expected:?} in {gateway}"
+        );
+    }
+    assert!(
+        gateway.contains(&format!("--network {network} --network podman")),
+        "the gateway must be dual-homed: {gateway}"
+    );
+    assert!(
+        gateway.contains("gateway/classes/model.toml"),
+        "the committed class config is what is mounted: {gateway}"
+    );
+
+    // The jail: joined to the class network, with the gateway as resolver and
+    // proxy, and no host search domain.
+    let jail = recorded_argv(&argv_path).join(" ");
+    for expected in [
+        format!("--network {network}"),
+        "--dns 10.89.0.2".to_string(),
+        "--dns-search .".to_string(),
+        "--env HTTPS_PROXY=http://10.89.0.2:3128".to_string(),
+        "--env ALL_PROXY=http://10.89.0.2:3128".to_string(),
+    ] {
+        assert!(jail.contains(&expected), "missing {expected:?} in {jail}");
+    }
+    assert!(
+        !jail.contains("--network podman"),
+        "the jail must not have the gateway's outbound leg: {jail}"
+    );
+}
+
+#[test]
+fn a_failed_run_removes_the_class_network_and_gateway_too() {
+    let dir = tmpdir("allowlist-fail");
+    let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+    let podman = fake_podman(&dir);
+    let log = dir.join("podman.log");
+    let output = run_with_env(
+        &["run", path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[
+            ("AGENTJAIL_TEST_LOG", log.to_str().unwrap()),
+            ("AGENTJAIL_TEST_EXIT", "7"),
+            ("EXAMPLE_FORGE_TOKEN", "fake-token-value"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the agent's code is passed through"
+    );
+    let events = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(events.contains("network-create"), "{events}");
+    assert!(events.contains("container-rm"), "{events}");
+    assert!(events.contains("network-rm"), "{events}");
+}
+
+#[test]
+fn a_missing_gateway_image_fails_before_anything_is_created() {
+    let dir = tmpdir("allowlist-no-image");
+    let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+    let podman = fake_podman(&dir);
+    let log = dir.join("podman.log");
+    let output = run_with_env(
+        &["run", path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[
+            ("AGENTJAIL_TEST_LOG", log.to_str().unwrap()),
+            ("AGENTJAIL_TEST_IMAGE_MISSING", "1"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("build-gateway-image.sh"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("network-create"),
+        "nothing is created for a run that cannot start"
+    );
 }

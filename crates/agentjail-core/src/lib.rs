@@ -7,6 +7,7 @@
 
 pub mod class;
 pub mod doctor;
+pub mod lifecycle;
 pub mod network;
 pub mod paths;
 pub mod podman;

@@ -1,8 +1,10 @@
-//! Thin, read-only wrappers around the podman CLI.
+//! Thin wrappers around the podman CLI.
 //!
 //! Everything here is optional in the sense that a missing podman must never
 //! panic: the caller gets an error and decides. No command is ever run through a
-//! shell, and nothing here mutates host state.
+//! shell. The mutating calls (network/container create and remove) exist only for
+//! the per-run lifecycle in `agentjail run`, which owns what it creates and
+//! removes it on every exit path.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -134,6 +136,107 @@ pub fn network_inspect(name: &str) -> Result<String, String> {
 pub fn verify_network(name: &str) -> Result<crate::network::NetworkPosture, String> {
     let raw = network_inspect(name)?;
     crate::network::verify_inspect_json(&raw)
+}
+
+/// Names of the podman networks that exist.
+pub fn network_list() -> Result<Vec<String>, String> {
+    let raw = podman_stdout(&["network", "ls", "--format", "{{.Name}}"])?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Create an internal network: no route out, so the only way off it is a peer
+/// that has one (the class gateway).
+///
+/// `--disable-dns` matters twice. Podman otherwise installs its own resolver
+/// (aardvark) as the network's nameserver, which shadows the gateway the jail is
+/// told to use, and on an internal network that resolver has nowhere to forward
+/// to. With it off, `--dns <gateway>` is the jail's only resolver.
+pub fn network_create(name: &str) -> Result<(), String> {
+    let output = podman(&["network", "create", "--internal", "--disable-dns", name])?;
+    if output.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "podman network create --internal --disable-dns {name:?} failed ({}): {}",
+        output.code,
+        output.stderr.trim()
+    ))
+}
+
+/// Remove a network, ignoring one that is already gone.
+pub fn network_remove(name: &str) -> Result<(), String> {
+    let output = podman(&["network", "rm", "-f", name])?;
+    if output.success()
+        || output.stderr.contains("no such network")
+        || output.stderr.contains("not found")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "podman network rm -f {name:?} failed ({}): {}",
+            output.code,
+            output.stderr.trim()
+        ))
+    }
+}
+
+/// Names of containers that exist, running or not.
+pub fn container_list() -> Result<Vec<String>, String> {
+    let raw = podman_stdout(&["ps", "-a", "--format", "{{.Names}}"])?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Start a detached container from a ready argv (see `run::gateway_args`).
+pub fn container_start(args: &[String]) -> Result<(), String> {
+    let output = podman(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    if output.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "podman {} failed ({}): {}",
+        args.join(" "),
+        output.code,
+        output.stderr.trim()
+    ))
+}
+
+/// Remove a container, ignoring one that is already gone.
+pub fn container_remove(name: &str) -> Result<(), String> {
+    let output = podman(&["rm", "-f", name])?;
+    if output.success()
+        || output.stderr.contains("no such container")
+        || output.stderr.contains("not found")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "podman rm -f {name:?} failed ({}): {}",
+            output.code,
+            output.stderr.trim()
+        ))
+    }
+}
+
+/// The address a container has on one of its networks. Empty until the container
+/// is running, so the caller polls.
+pub fn container_ip(container: &str, network: &str) -> Result<String, String> {
+    let format = format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}");
+    podman_stdout(&["container", "inspect", "--format", &format, container])
+}
+
+/// Whether an image is present locally.
+pub fn image_exists(image: &str) -> bool {
+    podman_stdout(&["image", "exists", image]).is_ok()
 }
 
 /// Create (or replace) a podman secret from a value passed on stdin, so the

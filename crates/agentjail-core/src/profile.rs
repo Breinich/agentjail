@@ -152,6 +152,11 @@ pub struct Network {
     /// refuses a network that is not internal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Egress class, required with `mode = "allowlist"`. It names the internal
+    /// network the jail joins and therefore which committed allowlist applies;
+    /// the agent cannot change it from inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
     pub mode: NetworkMode,
     /// Required with no default: an inherited host search domain can silently
     /// resolve internal names and defeat the allowlist.
@@ -263,7 +268,8 @@ impl Profile {
         let egress = match self.network.mode {
             NetworkMode::None => "no egress".to_string(),
             NetworkMode::Allowlist => format!(
-                "{} allowlisted destination(s), dns={}",
+                "egress class {:?}, {} allowlisted destination(s), dns={}",
+                self.network.class.as_deref().unwrap_or("unset"),
                 self.network.egress.len(),
                 self.network.dns.as_str()
             ),
@@ -339,6 +345,7 @@ impl Profile {
             "secrets": secrets,
             "network": {
                 "name": self.network.name,
+                "class": self.network.class,
                 "mode": self.network.mode.as_str(),
                 "dns": self.network.dns.as_str(),
                 "egress": egress,
@@ -539,6 +546,7 @@ fn partial_semantic_errors(value: &toml::Value) -> Vec<String> {
         &section::<Vec<Secret>>(value, "secrets").unwrap_or_default(),
         &section::<Network>(value, "network").unwrap_or(Network {
             name: None,
+            class: None,
             mode: NetworkMode::None,
             dns: DnsStrategy::None,
             egress: Vec::new(),
@@ -735,6 +743,11 @@ fn network_errors(network: &Network) -> Vec<String> {
 
     match network.mode {
         NetworkMode::None => {
+            if let Some(class) = &network.class {
+                errors.push(format!(
+                    "network.class: {class:?} needs mode = \"allowlist\"; mode \"none\" has no route out"
+                ));
+            }
             if !network.egress.is_empty() {
                 errors.push(format!(
                     "network.egress: mode \"none\" means no egress; {} destination(s) are declared but would never be reachable",
@@ -748,6 +761,25 @@ fn network_errors(network: &Network) -> Vec<String> {
             }
         }
         NetworkMode::Allowlist => {
+            match network.class.as_deref() {
+                None => errors.push(
+                    "network.class: required with mode \"allowlist\"; it names which egress class \
+                     (and therefore which committed allowlist) the jail joins"
+                        .to_string(),
+                ),
+                Some(class) if !crate::class::CLASSES.contains(&class) => errors.push(format!(
+                    "network.class: {class:?} is not an egress class this build ships ({})",
+                    crate::class::CLASSES.join(", ")
+                )),
+                Some(_) => {}
+            }
+            if network.name.is_some() {
+                errors.push(
+                    "network.name: mode \"allowlist\" does not take a network name; the per-run \
+                     class network is created for you and removed when the run ends"
+                        .to_string(),
+                );
+            }
             if network.egress.is_empty() {
                 errors.push(
                     "network.egress: mode \"allowlist\" needs at least one destination".to_string(),
@@ -1017,11 +1049,12 @@ name = "localhost/agentjail-base:1"
 digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 [network]
+class = "model"
 mode = "allowlist"
 dns = "gateway"
 
 [[network.egress]]
-host = "api.example.com"
+host = "api.anthropic.com"
 port = 443
 
 [agent]
@@ -1202,14 +1235,14 @@ args = ["-lc", "true"]
 
     #[test]
     fn wildcard_egress_is_rejected() {
-        let text = allowlist().replace("api.example.com", "*.example.com");
+        let text = allowlist().replace("api.anthropic.com", "*.example.com");
         assert_error(&text, "wildcards are not allowed");
     }
 
     #[test]
     fn egress_with_scheme_is_rejected() {
         let text = allowlist().replace(
-            "host = \"api.example.com\"",
+            "host = \"api.anthropic.com\"",
             "host = \"https://api.example.com\"",
         );
         assert_error(&text, "bare DNS name");
@@ -1219,7 +1252,7 @@ args = ["-lc", "true"]
     fn duplicate_egress_is_rejected() {
         let text = allowlist().replace(
             "[agent]",
-            "[[network.egress]]\nhost = \"api.example.com\"\nport = 443\n\n[agent]",
+            "[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n\n[agent]",
         );
         assert_error(&text, "duplicate destination");
     }
@@ -1246,7 +1279,7 @@ args = ["-lc", "true"]
     #[test]
     fn allowlist_without_destination_is_rejected() {
         let text = allowlist().replace(
-            "[[network.egress]]\nhost = \"api.example.com\"\nport = 443\n",
+            "[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n",
             "",
         );
         assert_error(&text, "needs at least one destination");

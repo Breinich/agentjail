@@ -6,7 +6,8 @@
 //! class name below is what appears in the audit log; the network name is the
 //! identity the agent cannot change from inside.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -34,6 +35,71 @@ impl AllowEntry {
             None => host == self.host,
         }
     }
+}
+
+/// Environment override for the directory holding `<class>.toml`.
+pub const CLASS_DIR_ENV: &str = "AGENTJAIL_CLASS_DIR";
+
+/// Where to look for class configs, in order: the override, the checked-out
+/// repository, then the one next to the installed binary.
+pub fn config_search_dirs(env: &BTreeMap<String, String>, cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = env.get(CLASS_DIR_ENV).filter(|value| !value.is_empty()) {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs.push(cwd.join("gateway").join("classes"));
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(Path::to_path_buf);
+        while let Some(current) = dir {
+            let candidate = current.join("gateway").join("classes");
+            if !dirs.contains(&candidate) {
+                dirs.push(candidate);
+            }
+            dir = current.parent().map(Path::to_path_buf);
+        }
+    }
+    dirs
+}
+
+/// Load the committed config for one class. A missing file is an error that
+/// names every directory searched: a class without its policy file is not a
+/// class.
+pub fn load(class: &str, dirs: &[PathBuf]) -> Result<(PathBuf, ClassConfig), String> {
+    let mut searched = Vec::new();
+    for dir in dirs {
+        let candidate = dir.join(format!("{class}.toml"));
+        searched.push(candidate.display().to_string());
+        if !candidate.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&candidate).map_err(|error| {
+            format!("cannot read class config {}: {error}", candidate.display())
+        })?;
+        let config = ClassConfig::parse(&text).map_err(|errors| {
+            format!(
+                "class config {} is invalid:\n{}",
+                candidate.display(),
+                errors
+                    .iter()
+                    .map(|error| format!("  - {error}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })?;
+        if config.class != class {
+            return Err(format!(
+                "class config {} declares class {:?}, but it was loaded for class {class:?}",
+                candidate.display(),
+                config.class
+            ));
+        }
+        return Ok((candidate, config));
+    }
+    Err(format!(
+        "no class config for {class:?}; searched:\n  {}\nset {} to point at the gateway/classes directory",
+        searched.join("\n  "),
+        CLASS_DIR_ENV
+    ))
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

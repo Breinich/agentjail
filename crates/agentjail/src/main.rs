@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use agentjail_core::class::{self, ClassConfig, PROXY_PORT};
+use agentjail_core::lifecycle;
 use agentjail_core::paths;
 use agentjail_core::podman;
-use agentjail_core::profile::{self, Profile};
+use agentjail_core::profile::{self, NetworkMode, Profile};
 use agentjail_core::run;
 use clap::{ArgAction, Parser, Subcommand};
 
@@ -184,9 +186,9 @@ fn validate_command(
     cwd: &Path,
 ) -> Result<u8, String> {
     let loaded = load_profile(reference, extra_dirs, env, cwd)?;
-    if let Err(errors) = run::validation_blockers(&loaded.profile) {
+    if let Err(errors) = run::run_blockers(&loaded.profile) {
         return Err(format!(
-            "profile {} is not runnable in this increment ({} error(s)):\n{}",
+            "profile {} is not runnable ({} error(s)):\n{}",
             loaded.path.display(),
             errors.len(),
             errors
@@ -199,6 +201,14 @@ fn validate_command(
     println!("OK {}", loaded.path.display());
     println!("   image: {}", loaded.profile.image_ref());
     println!("   {}", loaded.profile.summary());
+    if let Some((path, class)) = resolve_class(&loaded.profile, env, cwd)? {
+        println!(
+            "   egress class {:?} from {}: {} allowlisted destination(s), deny by default",
+            class.class,
+            path.display(),
+            class.allow.len()
+        );
+    }
     Ok(EXIT_OK)
 }
 
@@ -242,10 +252,33 @@ fn run_command(
         )
     })?;
 
-    // Single-route invariant, outside half: verified on every start, not once
-    // per profile install, because networks change under you.
-    let posture = preflight_network(profile)?;
-    eprintln!("agentjail: preflight OK: {}", posture.describe());
+    let run_id = std::process::id();
+    let mut cleanup = RunCleanup::default();
+    let mut context = run::RunContext {
+        container_name: run::container_name(&profile_name, run_id),
+        network: String::new(),
+        gateway_ip: None,
+        selinux: Path::new("/sys/fs/selinux/enforce").exists(),
+        term: env.get("TERM").cloned(),
+    };
+
+    match profile.network.mode {
+        // Single-route invariant, outside half: verified on every start, not once
+        // per profile install, because networks change under you.
+        NetworkMode::None => {
+            let posture = preflight_network(profile)?;
+            eprintln!("agentjail: preflight OK: {}", posture.describe());
+            context.network = posture.name;
+        }
+        // The class side creates the network, so the guard owns it from the
+        // moment it exists; the invariant is verified on the network it created.
+        NetworkMode::Allowlist => {
+            let (network, gateway_ip) =
+                start_class_side(profile, &profile_name, run_id, env, cwd, &mut cleanup)?;
+            context.network = network;
+            context.gateway_ip = Some(gateway_ip);
+        }
+    }
 
     let command = if args.agent_command.is_empty() {
         profile.agent_argv()
@@ -257,7 +290,6 @@ fn run_command(
     // as environment variables. Values never enter the container argv or config.
     // Store entries are named per run (pid), so two concurrent runs of the same
     // profile can never prune or overwrite each other's entry.
-    let run_id = std::process::id();
     let plans = if args.no_secrets {
         eprintln!("agentjail: --no-secrets: no secret is injected");
         Vec::new()
@@ -283,15 +315,15 @@ fn run_command(
         }
     }
 
-    // Cleanup guard: removes the entries this run created on every exit path --
-    // normal, non-zero, signal, and panic (unwinding Drop). The store entry of a
+    // Cleanup guard: removes what this run created -- secret store entries, the
+    // gateway container, the class network -- on every exit path: normal,
+    // non-zero, signal, and panic (unwinding Drop). The store entry of a
     // `source = "store"` secret belongs to the user and is never removed.
-    let mut cleanup = SecretCleanup::default();
     for plan in &plans {
         match &plan.action {
             run::SecretAction::Create { store_name, value } => {
                 podman::secret_create(store_name, value)?;
-                cleanup.names.push(store_name.clone());
+                cleanup.secrets.push(store_name.clone());
             }
             run::SecretAction::Existing { store_name } => {
                 if !podman::secret_exists(store_name) {
@@ -304,11 +336,6 @@ fn run_command(
         }
     }
 
-    let context = run::RunContext {
-        container_name: run::container_name(&profile_name, std::process::id()),
-        selinux: Path::new("/sys/fs/selinux/enforce").exists(),
-        term: env.get("TERM").cloned(),
-    };
     let argv = run::podman_args(profile, &context, &plans, &command).map_err(|errors| {
         format!(
             "refusing to run profile {profile_name:?}:\n{}",
@@ -327,7 +354,7 @@ fn run_command(
 
     #[cfg(unix)]
     {
-        if cleanup.names.is_empty() {
+        if cleanup.is_empty() {
             use std::os::unix::process::CommandExt;
             // Nothing to clean up: exec, so stdio, signals and the agent's exit
             // code pass through untouched with no wrapper in the path.
@@ -335,12 +362,11 @@ fn run_command(
             return Err(format!("cannot exec {}: {error}", binary.display()));
         }
 
-        // Secrets were created, so supervise instead of exec: forward signals,
-        // wait for podman, then let the guard delete the store entries.
+        // This run owns resources, so supervise instead of exec: forward signals,
+        // wait for podman, then let the guard remove them.
         eprintln!(
-            "agentjail: supervising podman to remove {} secret store entr{} on exit",
-            cleanup.names.len(),
-            if cleanup.names.len() == 1 { "y" } else { "ies" }
+            "agentjail: supervising podman to clean up on exit: {}",
+            cleanup.describe()
         );
         supervise(&binary, &argv)
     }
@@ -350,17 +376,55 @@ fn run_command(
     }
 }
 
-/// Store entries this run created; removed whenever the process stops normally.
+/// Everything this run created, removed whenever the process stops: normal
+/// exit, non-zero exit, forwarded signal, or panic. Container before network,
+/// because a network cannot be removed while a peer is attached to it.
 #[derive(Default)]
-struct SecretCleanup {
-    names: Vec<String>,
+struct RunCleanup {
+    secrets: Vec<String>,
+    container: Option<String>,
+    network: Option<String>,
 }
 
-impl Drop for SecretCleanup {
+impl RunCleanup {
+    fn is_empty(&self) -> bool {
+        self.secrets.is_empty() && self.container.is_none() && self.network.is_none()
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.secrets.is_empty() {
+            parts.push(format!(
+                "{} secret store entr{}",
+                self.secrets.len(),
+                if self.secrets.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+        if let Some(container) = &self.container {
+            parts.push(format!("gateway container {container:?}"));
+        }
+        if let Some(network) = &self.network {
+            parts.push(format!("network {network:?}"));
+        }
+        parts.join(", ")
+    }
+}
+
+impl Drop for RunCleanup {
     fn drop(&mut self) {
-        for name in &self.names {
+        for name in &self.secrets {
             if let Err(error) = podman::secret_remove(name) {
                 eprintln!("agentjail: warning: could not remove secret {name:?}: {error}");
+            }
+        }
+        if let Some(container) = &self.container {
+            if let Err(error) = podman::container_remove(container) {
+                eprintln!("agentjail: warning: could not remove gateway {container:?}: {error}");
+            }
+        }
+        if let Some(network) = &self.network {
+            if let Err(error) = podman::network_remove(network) {
+                eprintln!("agentjail: warning: could not remove network {network:?}: {error}");
             }
         }
     }
@@ -452,6 +516,152 @@ fn selftest_command(
          control: one allowlisted destination answers. See docs/cli.md."
     );
     Ok(EXIT_NOT_IMPLEMENTED)
+}
+
+/// The class config this profile names, if it has one, with the classes it asks
+/// for checked against it. `None` for `mode = "none"`.
+fn resolve_class(
+    profile: &Profile,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<(PathBuf, ClassConfig)>, String> {
+    if profile.network.mode != NetworkMode::Allowlist {
+        return Ok(None);
+    }
+    let Some(class) = profile.network.class.as_deref() else {
+        return Err(
+            "profile names no egress class; profile validation should have refused it".to_string(),
+        );
+    };
+    let (path, config) = class::load(class, &class::config_search_dirs(env, cwd))?;
+    let outside = run::egress_outside_class(profile, &config);
+    if !outside.is_empty() {
+        return Err(format!(
+            "refusing to run: the profile asks for destinations its egress class does not permit\n{}",
+            outside
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    Ok(Some((path, config)))
+}
+
+/// Everything the class side needs before the jail exists: the class network,
+/// the class gateway on it, and the gateway's address.
+fn start_class_side(
+    profile: &Profile,
+    profile_name: &str,
+    run_id: u32,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    cleanup: &mut RunCleanup,
+) -> Result<(String, String), String> {
+    let (config_path, config) = resolve_class(profile, env, cwd)?
+        .ok_or_else(|| "class side requested for a profile with no egress class".to_string())?;
+
+    let image = env
+        .get("AGENTJAIL_GATEWAY_IMAGE")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "localhost/agentjail-gateway:1".to_string());
+    if !podman::image_exists(&image) {
+        return Err(format!(
+            "gateway image {image:?} is not present; build it with \
+             scripts/build-gateway-image.sh (or set AGENTJAIL_GATEWAY_IMAGE)"
+        ));
+    }
+    let egress_network = egress_network(env)?;
+
+    // Backstop for SIGKILL and host crashes: remove only what is provably dead,
+    // i.e. resources of this profile whose owning pid is gone.
+    prune_dead_resources(profile_name, run_id);
+
+    let network = lifecycle::network_name(profile_name, run_id, &config.class);
+    podman::network_create(&network)?;
+    cleanup.network = Some(network.clone());
+
+    // The invariant, now on the network this run created rather than one it was
+    // told about: internal, has a subnet, or nothing starts.
+    let posture = podman::verify_network(&network)?;
+    eprintln!("agentjail: preflight OK: {}", posture.describe());
+
+    let container = lifecycle::gateway_name(profile_name, run_id);
+    let argv = run::gateway_args(&run::GatewayContext {
+        container_name: container.clone(),
+        image,
+        class_config: config_path.to_string_lossy().into_owned(),
+        network: network.clone(),
+        egress_network,
+        jail_id: format!("{profile_name}-{run_id}"),
+        selinux: Path::new("/sys/fs/selinux/enforce").exists(),
+    });
+    podman::container_start(&argv)?;
+    cleanup.container = Some(container.clone());
+
+    let gateway_ip = wait_for_ip(&container, &network)?;
+    eprintln!(
+        "agentjail: egress class {:?}: gateway {container} at {gateway_ip}:{PROXY_PORT} on {network}, \
+         {} allowlisted destination(s), audit on its own stream",
+        config.class,
+        config.allow.len()
+    );
+    Ok((network, gateway_ip))
+}
+
+/// The network the gateway uses for its own outbound leg. Never the jail's.
+fn egress_network(env: &BTreeMap<String, String>) -> Result<String, String> {
+    if let Some(name) = env
+        .get("AGENTJAIL_EGRESS_NETWORK")
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(name.clone());
+    }
+    let names = podman::network_list()?;
+    for candidate in ["podman", "bridge"] {
+        if names.iter().any(|name| name == candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+    Err(
+        "no default podman network to give the gateway its outbound leg; set \
+         AGENTJAIL_EGRESS_NETWORK"
+            .to_string(),
+    )
+}
+
+/// Remove resources of this profile whose run is gone. Never by profile alone.
+fn prune_dead_resources(profile_name: &str, run_id: u32) {
+    if let Ok(names) = podman::container_list() {
+        for name in lifecycle::stale_names(&names, profile_name, run_id, pid_alive) {
+            let _ = podman::container_remove(&name);
+        }
+    }
+    if let Ok(names) = podman::network_list() {
+        for name in lifecycle::stale_names(&names, profile_name, run_id, pid_alive) {
+            let _ = podman::network_remove(&name);
+        }
+    }
+}
+
+/// The gateway's address is read from podman once it is running; an address
+/// that never appears fails the run before the jail starts.
+fn wait_for_ip(container: &str, network: &str) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match podman::container_ip(container, network) {
+            Ok(address) if !address.is_empty() => return Ok(address),
+            Ok(_) | Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "gateway {container:?} has no address on {network:?} after 15s; the class network \
+                 is empty of peers and the run is refused"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// The outside half of the single-route invariant, shared with `doctor`.

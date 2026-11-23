@@ -329,6 +329,15 @@
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
           "description": "Attach to this existing podman network instead of creating one. The single-route invariant is verified from outside (this network's metadata) and from inside (inside the jail) on every start; run refuses a network that is not internal. Omit to let the launcher create a dedicated internal network."
         },
+        "class": {
+          "type": "string",
+          "enum": [
+            "model",
+            "external",
+            "internal"
+          ],
+          "description": "Egress class, required with mode=\"allowlist\". The class is the internal podman network the jail joins; each class has its own committed allowlist, DNS policy and log stream (gateway/classes/<class>.toml). The agent cannot change its network membership from inside the jail."
+        },
         "mode": {
           "enum": [
             "none",
@@ -352,7 +361,26 @@
           },
           "default": []
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "const": "allowlist"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "class"
+            ]
+          }
+        }
+      ]
     },
     "egress": {
       "type": "object",
