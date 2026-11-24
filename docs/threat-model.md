@@ -76,11 +76,11 @@ For the jailed process, and assuming a correct rootless Podman installation:
    fd 0/1 can run inside the jail without a wrapper.
 
 The negative tests for 1–7, the single-route negatives, and the positive control
-for 4 are the `agentjail selftest` contract in `docs/cli.md`. Until that is
-implemented, these are **design guarantees, not verified ones**, with two
-exceptions that do work today: the entity/format validation of a profile, and
-the outside half of the single-route invariant as exercised by
-`doctor --network` and by `run` preflight (see Status in the README).
+for 4 are the `agentjail selftest` contract in `docs/cli.md`. Both modes now run
+in the normal `ci` job: `--baseline` proves each negative is real without a jail,
+and the jailed mode proves the jail denies it. That is evidence for the listed
+cases, not a proof of the whole design; the table below says where each case is
+weaker than its headline.
 
 ## Trust boundaries
 
@@ -103,7 +103,7 @@ is verified, never assumed, and it fails closed:
 | Side | Evidence | Status |
 | --- | --- | --- |
 | Outside | the target network's own metadata: `internal: true`, at least one subnet, and no upstream route or gateway exposed off that network (`podman network inspect`) | **implemented** (`crates/agentjail-core/src/network.rs`) |
-| Inside | from within the jail: the only reachable peer is the gateway, and no other peer, interface, or route can be added (no `NET_ADMIN`) | **asserted on every PR** by `scripts/prove-egress-classes.sh` (proofs 2 and 3, from a real jail). It is **not yet a `selftest` case**: the capability exists, what is missing is the test inside `agentjail selftest`, which is still the exit-3 stub. |
+| Inside | from within the jail: the only reachable peer is the gateway, and no other peer, interface, or route can be added (no `NET_ADMIN`) | **asserted on every PR** by the jailed `agentjail selftest` (`raw-ip`, `network-control`, `net-admin`) and by `scripts/prove-egress-classes.sh` (proofs 2 and 3) from a real jail. |
 
 Rules that go with it:
 
@@ -115,8 +115,9 @@ Rules that go with it:
   or an empty subnet list is a refusal with a clear message — never "assume
   internal", never "warn and continue", never start-then-kill.
 - A profile may name an existing network (`network.name`). If that network is
-  not internal, `run` refuses before anything is created; the refusal is a
-  selftest case, not an aspiration.
+  not internal, `run` refuses before anything is created. That refusal is
+  covered by `crates/agentjail/tests/cli.rs` and the `ci` refusal step, not by
+  the selftest cases.
 
 The inside half is now implemented for allowlist profiles, and asserted on every
 PR: the jail is joined to a per-run internal network whose only peer is that
@@ -229,15 +230,34 @@ A second, unlisted host was denied with no fatal effect on the session. Profiles
 should be written to that standard: add a destination when a task actually
 fails, not because an agent might want it.
 
+### What each selftest case demonstrates, and what it does not
+
+The same probe runs as a plain host process (`--baseline`) and inside a real jail
+(`selftest`); the assertion functions are shared. Baseline is not a second
+implementation: it is the proof that a negative can fail at all.
+
+| Case | Guarantee demonstrated | What the case does not cover |
+| --- | --- | --- |
+| `host-secret` | a host-only file and a host-only environment variable are unreachable inside the jail | it does not enumerate every host path, keychain, D-Bus credential or `secrets[]` source; profile mounts and secrets are deliberately not replayed |
+| `outside-allowlist` | a destination outside the class allowlist is refused by the proxy and cannot be dialled directly | the destination is a local fixture; the committed class configs are not exercised |
+| `raw-ip` | a raw `IP:port` is refused through CONNECT and unreachable by direct dial | it does not test every route form (IPv6, link-local, broadcast) |
+| `network-control` | adding a route, creating an interface and attaching a veth peer all fail in the jail's namespace | the baseline creates a fresh user+net namespace first, because an unprivileged host process has no `NET_ADMIN` in the init namespace; it is a demonstration of the hazard, not a claim that every host process can do netlink |
+| `jail-isolation` | two concurrent jails do not share a home marker file or a unix socket, and each sees only its own injected id | the credential part is only "own id present, peer id absent"; it does not partition or enumerate a shared credential store. It also does not test two jails on the same network or a hostile cross-jail network |
+| `resource-limits` | memory (`128m`), pids (`64`) and nofile (`128`) are enforced, shown by allocation, fork and open failures | the limits are the selftest's generated values, not the supplied profile's numbers; tmpfs size and cgroup v1 hosts are not covered |
+| `net-admin` | `CAP_NET_ADMIN` is absent from the jailed process's effective set | a capability bit is not proof that every netlink operation is denied; `network-control` is the behavioural half |
+| `positive-control` | one allowlisted destination answers through CONNECT and the audit stream records `decision=allow` | the fixture answers a short plaintext line, not TLS; it does not test a real provider or a long-lived connection |
+
+Two cases are printed as `SKIPPED-BASELINE` rather than omitted: `jail-isolation`
+(no jail means no second jail) and `positive-control` (no proxy without a jail).
+The output names them and the reason, so the list cannot quietly shrink.
+
 ### `--network=none` failures must be fast negatives, not timeouts
 
-The planned selftest asserts "no egress by default" against a jail with no
-network. That path fails quickly and cleanly at connect time rather than
-hanging, so the negative is cheap and does not need a long timeout; the
-expected signature (a connection error within seconds, no hang) is recorded
-alongside the test. The selftest criterion is stricter than "it failed": each
-negative must **fail against the pre-jail baseline and pass inside the jail, in
-the same file**, so a test that cannot distinguish the two is a bug in the test.
+The raw-IP and outside-allowlist cases use bounded connect timeouts (1.5-2 s) so
+a failed negative is a refusal, not a hang. A denied CONNECT is a fast `403`; a
+direct dial from the jail has no route and fails immediately. A regression that
+turns a fast refusal into a slow timeout shows up as a longer case, not as a
+different verdict.
 
 ### FUSE-backed mounts cannot be part of the boundary
 

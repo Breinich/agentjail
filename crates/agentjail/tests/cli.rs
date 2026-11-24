@@ -534,16 +534,65 @@ fn an_allowlist_profile_without_a_class_is_refused() {
 }
 
 #[test]
-fn selftest_is_stubbed_and_names_the_network_negatives() {
-    let dir = tmpdir("selftest");
-    let path = write_profile(&dir, "minimal.toml", MINIMAL);
-    let podman = fake_podman(&dir);
-    let output = run(&["selftest", path.to_str().unwrap()], &dir, Some(&podman));
-    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
-    let err = stderr(&output);
-    assert!(err.contains("raw IP:port"), "{err}");
-    assert!(err.contains("second route"), "{err}");
-    assert!(err.contains("Positive control"), "{err}");
+fn selftest_baseline_proves_every_negative_holds_without_a_jail() {
+    let dir = tmpdir("selftest-baseline");
+    let output = run(&["selftest", "--baseline", "--json"], &dir, None);
+    let document: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json");
+    let cases = document["cases"].as_array().expect("cases");
+    let verdict = |name: &str| {
+        cases
+            .iter()
+            .find(|case| case["case"] == name)
+            .unwrap_or_else(|| panic!("missing case {name}"))["verdict"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let observed = |name: &str| {
+        cases
+            .iter()
+            .find(|case| case["case"] == name)
+            .unwrap_or_else(|| panic!("missing case {name}"))["observed"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    for case in [
+        "host-secret",
+        "outside-allowlist",
+        "raw-ip",
+        "resource-limits",
+    ] {
+        assert_eq!(verdict(case), "EXPECTED", "{case}: {}", stdout(&output));
+    }
+    // The network-control baseline needs an unprivileged user+network namespace.
+    // Some hosts (Ubuntu 24.04 with AppArmor) block that; the CI selftest step
+    // lifts the runner restriction, but `cargo test` must not require root.
+    for case in ["network-control", "net-admin"] {
+        let verdict = verdict(case);
+        let observed = observed(case);
+        assert!(
+            verdict == "EXPECTED" || (verdict == "FAIL" && observed.contains("unavailable:")),
+            "{case}: {verdict} {observed}"
+        );
+    }
+    // These cannot be meaningful without a jail and must say so, not disappear.
+    assert_eq!(verdict("jail-isolation"), "SKIPPED-BASELINE");
+    assert_eq!(verdict("positive-control"), "SKIPPED-BASELINE");
+    // If the baseline was fully usable, the exit code must be 0. If only the
+    // namespace-dependent cases were unavailable, the failure must name exactly
+    // those cases, never hide behind a generic error.
+    match output.status.code() {
+        Some(0) => assert_eq!(document["ok"], true),
+        Some(1) => {
+            let err = stderr(&output);
+            assert!(
+                err.contains("network-control") && err.contains("net-admin"),
+                "{err}"
+            );
+        }
+        other => panic!("unexpected exit {other:?}: {}", stderr(&output)),
+    }
 }
 
 #[test]
@@ -624,9 +673,10 @@ fn selftest_help_documents_the_negative_set() {
     assert_eq!(output.status.code(), Some(0));
     let help = stdout(&output);
     assert!(help.contains("raw IP:port"), "{help}");
-    assert!(help.contains("podman/docker socket"), "{help}");
-    assert!(help.contains("two concurrent jails"), "{help}");
-    assert!(help.contains("writable-layer size"), "{help}");
+    assert!(help.contains("two-jail isolation"), "{help}");
+    assert!(help.contains("NET_ADMIN"), "{help}");
+    assert!(help.contains("positive control"), "{help}");
+    assert!(help.contains("SKIPPED-BASELINE"), "{help}");
 }
 
 /// The class side of an allowlist run, driven end to end against a fake podman:

@@ -101,7 +101,6 @@ jail, network, or tmpfs is orphaned.
 | Profile invalid or missing | `1` |
 | Single-route invariant fails | `1`, with a refusal message, before anything starts |
 | Usage error | `2` |
-| Not implemented yet (increment 1) | `3` |
 
 `--no-secrets` launches without resolving any `secrets[]` entry; the jail runs
 with the profile's literal environment only.
@@ -148,44 +147,101 @@ profile names an existing network (`network.name`); if it names a bridged one,
 `run` refuses. An allowlist profile names no network: `run` creates a dedicated
 internal one and verifies it the same way before starting anything.
 
-## `agentjail selftest <profile>`
+## `agentjail selftest [profile]`
 
 The selftest is the acceptance evidence: it attacks its own jail and asserts
-what held. Every check runs **twice in the same test file** — once against the
-pre-jail baseline and once inside the jail — and must fail on the baseline and
-pass in the jail. A check that cannot tell the two apart is a bug in the check,
-not a pass.
+what held. It has **one harness and two executors**, and the assertion functions
+are the same in both:
 
-### Negative set (must be denied)
+| Mode | Where the probe runs | What it must show |
+| --- | --- | --- |
+| `agentjail selftest --baseline` | a plain host process; no podman, no jail | every negative **holds** (the hazard is real), or the assertion is weak |
+| `agentjail selftest` | inside a real jail created by the `run` path | every negative is **denied**, and the positive control answers |
 
-| Check | Denial expected |
-| --- | --- |
-| Raw IP:port | A direct connection to an external address fails: DNS pinning buys nothing if the agent can packet-to-IP. |
-| Second route/peer | Adding a route, bringing up an interface, or attaching a peer from inside fails (no `NET_ADMIN`, no ability to change the jail's own network). |
-| Bridged network | `run` handed a profile naming a non-internal network refuses with a clear message. |
-| Gateway-only | From inside, the only reachable peer is the gateway. |
-| Host credentials | A host-only credential file is unreadable and a host environment variable is absent. |
-| Host filesystem | No host path is writable by default; only declared mounts exist. |
-| Unlisted destinations | No unlisted destination connects and no unlisted name resolves. A denied destination fails fast with a connection error, not a timeout. |
-| Container control | No podman or Docker socket, and no host control socket, is reachable from inside. |
-| Escape | No `/proc/1/root`, no host `/proc`, no `CAP_SYS_ADMIN`, no new mount inside. |
-| Concurrent jails | Two jails on distinct networks and homes cannot see each other's files, sockets, or credentials. |
-| Resource limits | CPU, memory, pids, open files, tmpfs size, and writable-layer size are each enforced, not merely declared. |
+The probe is the hidden `agentjail __probe` subcommand, run from a copy of the
+same binary bind-mounted read-only into the jail. That is deliberate: if the two
+modes were separate implementations, a jailed pass would prove only that the
+second implementation works. The binary must be runnable inside the jail image;
+CI uses the static musl build, and a supplied profile's image must be compatible
+with the host binary otherwise.
 
-### Positive control (must succeed)
+The optional profile selects the **image, workdir and home**. The selftest
+generates its own profile with fixed limits (`128m` memory, `64` pids, `128`
+open files), its own internal network and class gateway, and its own agent
+command. It does **not** carry the supplied profile's mounts, secrets, `env`,
+egress list or resource numbers into the jail. Those are exercised by
+`run`/`profile` tests and by `scripts/prove-egress-classes.sh`; the selftest is
+about the jail posture, not about replaying one user profile.
 
-Exactly one call to **one allowlisted destination** succeeds and returns a
-well-formed response. If the positive control fails, a negative that also failed
-proves nothing.
+### Exit semantics
 
-### Timing
+`--baseline` exits `0` when every negative case correctly **held** without a
+jail (the host secret was readable, the destination was reachable, network
+changes succeeded, the limits were not enforced, `NET_ADMIN` was available). It
+exits non-zero and **names** any negative that was already denied without a
+jail: that is a weak or fake assertion, not a pass. A case that cannot run in
+baseline mode is printed as `SKIPPED-BASELINE` with the reason and is not
+counted as a pass.
 
-A `mode = "none"` jail is expected to fail at connect time with an immediate
-connection error (no hang, no long timeout). Observed on the development host
-while writing this increment: `curl` exits 6 with `Could not resolve host:
-api.github.com` in well under a second, because an isolated network has no
-resolver. The expected signature is recorded with the test so a regression that
-turns a fast refusal into a slow timeout is visible.
+Jailed mode exits `0` when every negative was denied **and** the positive
+control answered through the proxy with its audit line. It exits non-zero and
+names the case that did not.
+
+A setup failure (missing podman, missing gateway or target image, a failed
+`agentjail run`) is reported as a failure of the jailed cases with the setup
+error in `observed`; it is never silently skipped.
+
+Per case, both modes print:
+
+```text
+case=<name> mode=<baseline|jailed> expected="…" observed="…" verdict=<EXPECTED|PASS|FAIL|SKIPPED-BASELINE>
+```
+
+`--json` prints `{mode, ok, cases:[{case, mode, expected, observed, verdict}],
+failing_cases}`.
+
+### Cases
+
+| Case | Baseline | Jailed | What it proves |
+| --- | --- | --- | --- |
+| `host-secret` | a host file and a host environment variable are readable | both are unreachable (`ENOENT`, env absent) | no ambient host credentials and no host environment by default |
+| `outside-allowlist` | a destination outside the allowlist is reachable | direct dial fails and the proxy returns `403` | the allowlist is enforced by the network, not by an environment variable |
+| `raw-ip` | a raw `IP:port` is reachable | direct dial fails and CONNECT to an IP literal is refused | DNS pinning cannot be bypassed by packet-to-IP |
+| `network-control` | a plain process can add a route, create an interface and attach a veth peer | all three fail with `EPERM` | the jail cannot alter its own network namespace (no `NET_ADMIN`) |
+| `jail-isolation` | `SKIPPED-BASELINE`: no jail exists, so there are not two | two concurrent jails cannot see each other's marker files or unix socket; each sees only its own injected id | jails do not share homes, sockets or injected environment |
+| `resource-limits` | the configured memory, pids and nofile limits are **not** enforced | nofile opens fail at `128`, child fork fails at `64`, a 256 MiB allocation is OOM-killed (`signal:9`) | the limits are enforced by the runtime, not merely printed in the profile |
+| `net-admin` | `CAP_NET_ADMIN` is available | `CAP_NET_ADMIN` is absent (`CapEff`) | the capability that would let the agent change the network is dropped |
+| `positive-control` | `SKIPPED-BASELINE`: no proxy or gateway audit stream exists | one allowlisted destination answers through the proxy and `decision=allow` appears on the audit stream | a negative that failed proves nothing unless a permitted call still works |
+
+`network-control` in baseline mode creates a fresh user and network namespace
+first. An ordinary unprivileged host process has no `NET_ADMIN` in the init
+namespace, so without that step the baseline would fail for the wrong reason
+("the host user was unprivileged"), not because the jail is absent. The jailed
+probe does **not** get that step: it attempts the same netlink operations in the
+jail's own namespace. On a host that blocks unprivileged user namespaces
+(Ubuntu 24.04's AppArmor restriction, for example) baseline `network-control`
+reports the namespace as unavailable and fails honestly; the CI step lifts that
+runner restriction first.
+
+`jail-isolation`'s credential part is the weakest of the eight: it proves each
+jail sees only its own injected `PEER_ID` and not the other's, not that a shared
+credential store is partitioned in every failure mode. `docs/threat-model.md`
+says so beside the guarantee.
+
+### What the selftest does not cover
+
+- It is not a kernel-escape test: it does not try `CAP_SYS_ADMIN`, mount
+  escapes, `/proc/1/root`, or container-runtime bugs.
+- It does not test the gateway's own outbound leg, a real external destination,
+  or the committed class allowlists; the fixture destination is a local
+  container and the class config is generated for the run.
+- It does not replay the supplied profile's mounts, secrets, `env` or egress
+  list.
+- It does not test concurrent-session transport, signals, or resize; those
+  belong to the launcher tests.
+- The positive control is one TLS-less `CONNECT` to a fixture that answers
+  immediately; it is evidence that the proxy path works, not a production
+  destination test.
 
 ## `agentjail-gateway`
 
@@ -210,9 +266,3 @@ Full detail, including the audit line format and the residual weaknesses:
 `docs/egress-classes.md`. The proofs in `scripts/prove-egress-classes.sh` run on
 every PR.
 
-## Status of `selftest`
-
-`selftest` validates the profile, runs the outside network preflight, prints the
-negative set it will run, and exits `3` (not implemented). The egress-class
-proofs it will absorb live in `scripts/prove-egress-classes.sh` today, and run on
-every PR.

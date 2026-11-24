@@ -279,6 +279,29 @@ jobs:
             && { echo "expected exit 7" >&2; exit 1; } || test "$?" -eq 7
           "$gateway" --version
 
+      # The baseline half of the selftest: the same probes as a plain host
+      # process, no podman and no jail. It must exit 0, which means every
+      # negative actually held without a jail; a negative that was already
+      # denied here is a weak assertion and fails this step.
+      - name: Selftest baseline (no podman, no jail)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor.
+          # The baseline deliberately creates one to show the no-jail hazard;
+          # this is not a jail and not a proof shortcut. On hosts without the
+          # knob the command is a no-op.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          fi
+          started=$(date +%s)
+          target/x86_64-unknown-linux-musl/release/agentjail selftest --baseline \
+            | tee selftest-baseline.txt
+          echo "selftest baseline: $(( $(date +%s) - started ))s"
+
       # The egress class proofs, in the normal job rather than behind #[ignore]:
       # evidence that has to be remembered never exists. podman is installed
       # here because the claims are about real networks and a real gateway
@@ -323,6 +346,19 @@ jobs:
           echo "proofs: $(( $(date +%s) - built ))s"
           echo "total with podman setup: $(( $(date +%s) - started ))s"
 
+      # The jailed half, immediately after the proofs: it reuses the podman
+      # install, the pulled node image and the gateway image built there. Like
+      # the baseline step it is unconditional; a conditional proof step is how
+      # the PR that broke egress skips its own evidence.
+      - name: Selftest jailed (podman)
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          target/x86_64-unknown-linux-musl/release/agentjail selftest \
+            | tee selftest-jailed.txt
+          echo "selftest jailed: $(( $(date +%s) - started ))s"
+
       # The remaining two checks are path-gated: a Rust-only PR must not pay for
       # a PlantUML image pull or an image build.
       - name: Diagrams (-checkonly, render, drift)
@@ -362,6 +398,8 @@ jobs:
           if-no-files-found: ignore
           path: |
             changed-files.txt
+            selftest-baseline.txt
+            selftest-jailed.txt
             target/x86_64-unknown-linux-musl/release/agentjail
             target/x86_64-unknown-linux-musl/release/agentjail-launcher
             target/x86_64-unknown-linux-musl/release/agentjail-gateway

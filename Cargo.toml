@@ -17,6 +17,7 @@ toml = "1"
 # No default features: the validator must not carry an HTTP resolver.
 jsonschema = { version = "0.62", default-features = false }
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 nix = { version = "0.32", features = ["signal", "process"] }
 
 [profile.release]
