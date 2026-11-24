@@ -17,6 +17,7 @@
 //! env, secret, or egress lists; read-only mounts; conservative resource caps).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,11 @@ const INLINE_SECRET_KEYS: [&str; 8] = [
 /// Path prefixes that are FUSE-backed; crun refuses to bind-mount them.
 const FUSE_PATH_PREFIXES: [&str; 3] = ["/tmp/.mount_", "/run/user/", "/dev/fuse"];
 
+/// The jail's own runtime surface. Mounting over one of these, or binding the
+/// host's copy in, replaces what the jail's namespaces provide: the host's
+/// processes, devices, kernel state, or the jail root itself.
+const JAIL_RUNTIME_PATHS: [&str; 5] = ["/", "/proc", "/sys", "/dev", "/run"];
+
 fn default_true() -> bool {
     true
 }
@@ -57,7 +63,11 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub image: Image,
+    /// Normalised by deserialisation (see `normalize_path`), so validation,
+    /// `profile show`, and the podman argv all see this exact string.
+    #[serde(deserialize_with = "normalized_path")]
     pub workdir: String,
+    #[serde(deserialize_with = "normalized_path")]
     pub home: String,
     #[serde(default)]
     pub mounts: Vec<Mount>,
@@ -83,7 +93,9 @@ pub struct Image {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
+    #[serde(deserialize_with = "normalized_path")]
     pub source: String,
+    #[serde(deserialize_with = "normalized_path")]
     pub target: String,
     /// Defaults to `true`: writable mounts must be requested explicitly.
     #[serde(default = "default_true")]
@@ -417,6 +429,50 @@ impl SecretDelivery {
 // Parsing and validation
 // ---------------------------------------------------------------------------
 
+/// Lexically normalise a path: collapse `.`, `..`, repeated `/`, and a trailing
+/// `/`, without consulting the filesystem.
+///
+/// Deliberately not `std::fs::canonicalize`: a mount source may not exist on the
+/// host, and neither side of a mount is resolved the way the host would resolve
+/// it. `..` above the root is a no-op, so every traversal spelling of `/proc`
+/// (`/proc/`, `//proc`, `/work/../proc`) collapses to the one string that
+/// validation and the podman argv both see.
+pub fn normalize_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(parts.last(), Some(last) if *last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            Component::Normal(name) => parts.push(name.to_str().unwrap_or_default()),
+            Component::Prefix(_) => {}
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// `deserialize_with` for the path fields: the normalised form is the only form
+/// that exists after parsing, so no caller can hold a validated string and pass
+/// the raw one to podman.
+fn normalized_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(normalize_path(&raw))
+}
+
 /// Parse and fully validate a profile document.
 ///
 /// On failure every problem found is returned, each prefixed with the path of
@@ -538,12 +594,13 @@ fn partial_semantic_errors(value: &toml::Value) -> Vec<String> {
         .get("version")
         .and_then(toml::Value::as_integer)
         .and_then(|version| u32::try_from(version).ok());
-    let text = |key: &str| value.get(key).and_then(toml::Value::as_str).unwrap_or("");
+    let text =
+        |key: &str| normalize_path(value.get(key).and_then(toml::Value::as_str).unwrap_or(""));
 
     semantic_errors(
         version,
-        text("workdir"),
-        text("home"),
+        &text("workdir"),
+        &text("home"),
         &section::<Vec<Mount>>(value, "mounts").unwrap_or_default(),
         &section::<BTreeMap<String, EnvValue>>(value, "env").unwrap_or_default(),
         &section::<Vec<Secret>>(value, "secrets").unwrap_or_default(),
@@ -597,12 +654,33 @@ fn mount_errors(mounts: &[Mount], home: &str) -> Vec<String> {
                 mount.target
             ));
         }
-        if matches!(
-            mount.target.as_str(),
-            "/" | "/proc" | "/sys" | "/dev" | "/run"
-        ) {
+        // Both sides reach podman's --mount option parser, where ',' and '='
+        // separate options. Podman refusing a duplicate destination is an
+        // accident, not a defence: the next option key may not be harmless.
+        for (field, value) in [("target", &mount.target), ("source", &mount.source)] {
+            if value.contains(',') || value.contains('=') {
+                errors.push(format!(
+                    "mounts[{index}].{field}: {value:?} contains ',' or '=', which podman reads as --mount option syntax; a path must be only a path"
+                ));
+            }
+        }
+        if JAIL_RUNTIME_PATHS.contains(&mount.target.as_str()) {
             errors.push(format!(
                 "mounts[{index}].target: refusing to mount over {:?}; it is part of the jail's own runtime surface",
+                mount.target
+            ));
+        }
+        if JAIL_RUNTIME_PATHS.contains(&mount.source.as_str()) {
+            errors.push(format!(
+                "mounts[{index}].source: refusing to bind the host's {:?} into the jail; it is the host's own runtime surface (processes, devices, kernel state), not a data path",
+                mount.source
+            ));
+        }
+        // The root counts as a component, so "/work" is a target (2) and "/"
+        // alone is not (1).
+        if Path::new(&mount.target).components().count() < 2 {
+            errors.push(format!(
+                "mounts[{index}].target: {:?} is the jail root, which cannot be replaced by a mount; pick a directory such as \"/work/data\"",
                 mount.target
             ));
         }
@@ -1192,6 +1270,141 @@ args = ["-lc", "true"]
                 format!("{MINIMAL}\n[[mounts]]\nsource = \"/srv/a\"\ntarget = \"{target}\"\n");
             assert_error(&text, "refusing to mount over");
         }
+    }
+
+    #[test]
+    fn normalisation_is_lexical_only() {
+        for (raw, expected) in [
+            ("/proc/", "/proc"),
+            ("//proc", "/proc"),
+            ("/work/../proc", "/proc"),
+            ("/work/./sub//", "/work/sub"),
+            ("/home/agent/../agent", "/home/agent"),
+            ("/home/agent/../..", "/"),
+            ("/", "/"),
+            ("", ""),
+            ("rel/../x", "x"),
+            ("../x", "../x"),
+            (
+                "/work/x,bind-propagation=shared",
+                "/work/x,bind-propagation=shared",
+            ),
+        ] {
+            assert_eq!(normalize_path(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn path_fields_are_normalised_once_at_parse_time() {
+        let text = format!(
+            "{}\n[[mounts]]\nsource = \"/srv/src/../src/project/\"\ntarget = \"/work/./sub/\"\n",
+            MINIMAL
+                .replace("workdir = \"/work\"", "workdir = \"/work/./..//work/\"")
+                .replace("home = \"/home/agent\"", "home = \"/home/agent/\"")
+        );
+        let profile = parse_and_validate(&text).expect("valid");
+        assert_eq!(profile.workdir, "/work");
+        assert_eq!(profile.home, "/home/agent");
+        assert_eq!(profile.mounts[0].source, "/srv/src/project");
+        assert_eq!(profile.mounts[0].target, "/work/sub");
+        // The same string, everywhere: `profile show` and the validator agree.
+        let shown = profile.effective_json();
+        assert_eq!(shown["workdir"], "/work");
+        assert_eq!(shown["mounts"][0]["target"], "/work/sub");
+    }
+
+    #[test]
+    fn every_spelling_of_a_runtime_path_target_is_refused() {
+        for target in [
+            "/proc/",
+            "//proc",
+            "/work/../proc",
+            "/dev/",
+            "/sys/",
+            "/run/",
+            "/home/agent/../..",
+        ] {
+            let text =
+                format!("{MINIMAL}\n[[mounts]]\nsource = \"/srv/a\"\ntarget = \"{target}\"\n");
+            assert_error(&text, "refusing to mount over");
+        }
+    }
+
+    #[test]
+    fn a_mount_target_that_normalises_onto_home_is_refused() {
+        for target in ["/home/agent/", "/home/../home/agent", "/work/../home/agent"] {
+            let text =
+                format!("{MINIMAL}\n[[mounts]]\nsource = \"/srv/a\"\ntarget = \"{target}\"\n");
+            assert_error(&text, "is the jail home");
+        }
+    }
+
+    #[test]
+    fn a_target_with_one_component_is_refused() {
+        let text = format!("{MINIMAL}\n[[mounts]]\nsource = \"/srv/a\"\ntarget = \"/\"\n");
+        let found = errors(&text);
+        assert!(
+            found.iter().any(|error| error.contains("is the jail root")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn podman_option_syntax_in_a_mount_path_is_refused() {
+        for (source, target) in [
+            ("/srv/a", "/work/x,bind-propagation=shared"),
+            ("/srv/a", "/work/x=y"),
+            ("/srv/a,bind-propagation=shared", "/work/x"),
+            ("/srv/a=b", "/work/x"),
+        ] {
+            let text =
+                format!("{MINIMAL}\n[[mounts]]\nsource = \"{source}\"\ntarget = \"{target}\"\n");
+            assert_error(&text, "podman reads as --mount option syntax");
+        }
+    }
+
+    #[test]
+    fn binding_the_hosts_runtime_surface_in_as_a_source_is_refused() {
+        for source in ["/dev", "/dev/", "/proc/", "/work/../proc", "/sys", "/run/"] {
+            let text =
+                format!("{MINIMAL}\n[[mounts]]\nsource = \"{source}\"\ntarget = \"/work/data\"\n");
+            assert_error(&text, "refusing to bind the host's");
+        }
+    }
+
+    #[test]
+    fn ordinary_targets_and_sources_stay_valid() {
+        for (source, target) in [
+            ("/srv/src/project", "/work"),
+            ("/srv/src/project/", "/work/sub"),
+            ("/srv/src/.tools", "/home/agent/.tools"),
+            ("/srv/src/.tools", "/run/tools"),
+            ("/srv/src/project", "/srv/data"),
+        ] {
+            let text =
+                format!("{MINIMAL}\n[[mounts]]\nsource = \"{source}\"\ntarget = \"{target}\"\n");
+            let profile = parse_and_validate(&text)
+                .unwrap_or_else(|errors| panic!("{source} -> {target}: {errors:#?}"));
+            assert_eq!(profile.mounts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn duplicate_targets_are_caught_after_normalisation() {
+        let text = format!(
+            "{MINIMAL}\n[[mounts]]\nsource = \"/srv/a\"\ntarget = \"/work/p\"\n\n[[mounts]]\nsource = \"/srv/b\"\ntarget = \"/work/./p/\"\n"
+        );
+        assert_error(&text, "already mounted by mounts[0]");
+    }
+
+    #[test]
+    fn home_and_workdir_agreement_survives_normalisation() {
+        let text = MINIMAL
+            .replace("workdir = \"/work\"", "workdir = \"/work/../home/agent\"")
+            .replace("home = \"/home/agent\"", "home = \"/home/agent/\"");
+        assert_error(&text, "workdir and home must differ");
+        let text = MINIMAL.replace("workdir = \"/work\"", "workdir = \"/work/..\"");
+        assert_error(&text, "must not be the jail root");
     }
 
     #[test]

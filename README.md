@@ -166,7 +166,7 @@ Spelled out plainly:
 | `agentjail-launcher`: pipes, SIGINT/SIGTERM/SIGQUIT + resize forwarding, exit codes, root refusal, 3-turn JSON-RPC over pipes | **implemented** and tested |
 | `run` with `network.mode = "none"` (hardened podman argv, secret-store injection, outside network check, `exec` passthrough) | **implemented** |
 | `run` with `network.mode = "allowlist"`: per-run class network, class gateway container, `HTTPS_PROXY`/`ALL_PROXY` + `--dns <gateway>` + `--dns-search .`, profile-vs-class subset check, both removed on every exit path | **implemented** |
-| Egress gateway: DNS (`A` → loopback for class names, NXDOMAIN for the rest), CONNECT allowlist, one audit line per connection and per query on two separate streams | **implemented** |
+| Egress gateway: DNS (`A` → loopback for class names, NXDOMAIN for the rest), CONNECT allowlist, one audit line per decision and per query on two separate streams (an allow at establishment, its byte counts when it closes) | **implemented** |
 | Egress classes `model` / `external` / `internal` as three committed configs, one binary, one container per run | **implemented** |
 | Network lifecycle: `Drop` guard on network + gateway, dead-pid pruning only, never by profile prefix | **implemented** |
 | Proofs (class beats ACL text both ways, raw IP refused, allow audited, deny logged) | **implemented**, run in the normal `ci` job |

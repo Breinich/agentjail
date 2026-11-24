@@ -258,9 +258,10 @@ agentjail-gateway --config gateway/classes/model.toml --check   # print, start n
 - **CONNECT (TCP)**: relays only `host:port` pairs on the allowlist; exact host or
   `*.suffix`, port part of the match. A raw `IP:port` is refused even if listed.
   Non-CONNECT methods are refused.
-- **Logging**: one audit line per connection (including denials) on a stream
+- **Logging**: one audit line per decision (including denials) on a stream
   separate from the DNS log, with the class, the jail id, the destination, the
-  decision, and the bytes.
+  decision, and the bytes. An allowed connection logs `decision=allow` when it is
+  established and `decision=allow-close` with the byte counts when it ends.
 
 Full detail, including the audit line format and the residual weaknesses:
 `docs/egress-classes.md`. The proofs in `scripts/prove-egress-classes.sh` run on

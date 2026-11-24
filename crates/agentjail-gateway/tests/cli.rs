@@ -203,8 +203,8 @@ fn an_allowlisted_destination_answers_through_the_proxy_and_is_audited() {
     assert_eq!(status, "HTTP/1.1 200 Connection established", "{body}");
     assert!(body.contains("hello from allowed"), "{body}");
 
-    // The audit line is written when the connection closes, so give the relay a
-    // moment to finish both directions.
+    // The allow line is written when the connection is established; the close
+    // line carries the byte counts. Either one is enough for this test.
     let deadline = Instant::now() + Duration::from_secs(5);
     while !gateway.audit().contains("decision=allow") {
         assert!(
@@ -224,6 +224,85 @@ fn an_allowlisted_destination_answers_through_the_proxy_and_is_audited() {
     assert!(line.contains("jail=jail-42"), "{line}");
     assert!(line.contains(&format!("dest=localhost:{port}")), "{line}");
     assert!(line.contains("bytes="), "{line}");
+}
+
+#[test]
+fn an_established_connection_is_audited_at_once_and_a_reset_leaves_its_line() {
+    let (port, _server) = target_server("reset");
+    let gateway = Gateway::start("reset", &format!("  \"localhost:{port}\","), "");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    write!(
+        stream,
+        "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+    )
+    .expect("write");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+    let mut status = String::new();
+    reader.read_line(&mut status).expect("status line");
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+
+    // The tunnel is still open, so a line now can only come from the decision
+    // made at establish time. Before the fix the stream stayed empty until the
+    // relay finished, and a connection established and then reset produced no
+    // line at all - the case an incident review looks for.
+    let needle = format!("dest=localhost:{port} decision=allow reason=- bytes=0/0");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gateway.audit().contains(&needle) {
+        assert!(
+            Instant::now() < deadline,
+            "no allow line while the tunnel is open: {:?}",
+            gateway.audit()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Reset rather than close: SO_LINGER 0 makes the kernel send RST on drop, so
+    // the relay sees a reset client, not an orderly end of stream.
+    drop(reader);
+    reset(stream);
+
+    // The reset adds the counts on a second line and never removes the first.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gateway.audit().contains("decision=allow-close") {
+        assert!(
+            Instant::now() < deadline,
+            "no close line after the reset: {:?}",
+            gateway.audit()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let audit = gateway.audit();
+    let close = audit
+        .lines()
+        .find(|line| line.contains("decision=allow-close"))
+        .expect("close line");
+    assert!(close.contains(&format!("dest=localhost:{port}")), "{close}");
+    assert!(close.contains("bytes="), "{close}");
+}
+
+/// Close a socket with `SO_LINGER 0`, which makes the kernel send RST instead of
+/// FIN. That is the client that goes away mid-tunnel.
+fn reset(stream: TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "SO_LINGER 0");
+    drop(stream);
 }
 
 #[test]

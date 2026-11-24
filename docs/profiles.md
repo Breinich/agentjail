@@ -151,9 +151,23 @@ podman image inspect --format '{{.Digest}}' localhost/agentjail-base:1
 
 Semantic rules:
 
-- Two mounts may not share a `target`.
-- `target` may not be `/`, `/proc`, `/sys`, `/dev`, or `/run`, and may not equal
+- `source` and `target` are **lexically normalised** when the profile is parsed:
+  `.`, `..`, repeated `/`, and a trailing `/` collapse, so `/proc/`, `//proc`,
+  and `/work/../proc` are one string. There is no filesystem resolution and no
+  symlink following: a source may not exist yet, and neither side is read the
+  way the host would read it. Validation, `profile show`, and the podman argv
+  all use that one normalised string. Because it is lexical, `..` after a
+  symlink is collapsed as text (`/a/link/../b` becomes `/a/b`), which is not
+  what the kernel would do: write the path you mean.
+- Two mounts may not share a `target` (compared after normalisation).
+- `target` may not be `/`, `/proc`, `/sys`, `/dev`, or `/run` (after
+  normalisation, so every traversal spelling is refused), and may not equal
   `home`.
+- `source` may not be `/`, `/proc`, `/sys`, `/dev`, or `/run` either: those are
+  the host's own runtime surface (host processes, devices, kernel state), not a
+  data path.
+- Neither `source` nor `target` may contain `,` or `=`: both reach podman's
+  `--mount` option parser, where those characters separate options.
 - **FUSE-backed sources are rejected**: AppImage runtime mounts (`/tmp/.mount_*`),
   AppImage files (`*.AppImage`), gvfs and document-portal mounts
   (`/run/user/*/gvfs`, `/run/user/*/doc`), and `/dev/fuse`. `crun` cannot

@@ -15,3 +15,6 @@ path = "src/main.rs"
 [dependencies]
 agentjail-core = { path = "../agentjail-core" }
 clap = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }

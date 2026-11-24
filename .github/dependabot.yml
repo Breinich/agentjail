@@ -8,3 +8,9 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # One PR for all actions: three separate PRs meant three CI runs on a
+    # private repo, which is the cost this is meant to stop.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

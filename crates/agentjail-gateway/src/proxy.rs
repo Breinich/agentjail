@@ -5,8 +5,11 @@
 //! allowlist (exact host, or `*.suffix`) or it is refused. A raw IP is refused
 //! even when listed: an allowlist of names cannot be satisfied by an address.
 //!
-//! Denials are written to the audit stream as they happen. An allowed
-//! connection is written once, when it closes, with the byte counts both ways.
+//! Denials are written to the audit stream as they happen, and so are allows:
+//! the `decision=allow` line is written the moment the connection exists, so a
+//! tunnel that is established and then reset still leaves evidence. The byte
+//! counts are written when the tunnel ends, on a second `decision=allow-close`
+//! line.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
@@ -90,15 +93,37 @@ fn handle(mut stream: TcpStream, config: &ClassConfig, logs: &Logs) {
         }
     };
 
+    // Record the decision the moment the connection exists, not when it ends: a
+    // tunnel that is established and then reset, or a gateway torn down
+    // mid-relay, is exactly what an incident review looks for, and it must not
+    // leave the stream silent. Denials already log at decision time.
+    allow(logs, &peer, &dest);
     if respond(&mut stream, 200, "Connection established").is_err() {
         return;
     }
     let _ = stream.set_read_timeout(None);
     let (up, down) = relay(stream, target);
+    allow_close(logs, &peer, &dest, up, down);
+}
+
+/// One `decision=allow` line: the connection exists. `bytes` is `0/0` here by
+/// definition; the counts are on the matching `allow-close` line.
+fn allow(logs: &Logs, peer: &str, dest: &str) {
     logs.audit(&[
-        ("peer", peer),
-        ("dest", dest),
+        ("peer", peer.to_string()),
+        ("dest", dest.to_string()),
         ("decision", "allow".to_string()),
+        ("reason", "-".to_string()),
+        ("bytes", "0/0".to_string()),
+    ]);
+}
+
+/// The whole-connection byte counts for the `allow` line above.
+fn allow_close(logs: &Logs, peer: &str, dest: &str, up: u64, down: u64) {
+    logs.audit(&[
+        ("peer", peer.to_string()),
+        ("dest", dest.to_string()),
+        ("decision", "allow-close".to_string()),
         ("reason", "-".to_string()),
         ("bytes", format!("{up}/{down}")),
     ]);
