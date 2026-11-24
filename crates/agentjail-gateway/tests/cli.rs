@@ -44,6 +44,21 @@ fn target_server(label: &'static str) -> (u16, std::thread::JoinHandle<()>) {
     (port, handle)
 }
 
+/// A loopback server that answers one line and closes, so the client sees the
+/// end of the tunnel instead of waiting for its own read timeout.
+fn one_shot_server(label: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind target");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.write_all(format!("hello from {label}\n").as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (port, handle)
+}
+
 struct Gateway {
     child: Child,
     /// The gateway's own stderr: startup lines, then DNS lines (audit defaults
@@ -54,8 +69,32 @@ struct Gateway {
     dir: PathBuf,
 }
 
+/// The limits a test class runs with. The default is generous enough that a
+/// normal small connection is never refused, and `address_policy = "loopback"`
+/// is what lets a test own a fixture on the machine it runs on; no committed
+/// class uses that policy.
+struct Limits {
+    max_bytes: u64,
+    max_connections: usize,
+    address_policy: &'static str,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_bytes: 1 << 20,
+            max_connections: 8,
+            address_policy: "loopback",
+        }
+    }
+}
+
 impl Gateway {
     fn start(name: &str, allow: &str, extra: &str) -> Gateway {
+        Gateway::start_with(name, allow, extra, Limits::default())
+    }
+
+    fn start_with(name: &str, allow: &str, extra: &str, limits: Limits) -> Gateway {
         let dir = tmpdir(name);
         let config = format!(
             r#"class = "test"
@@ -63,12 +102,18 @@ listen = "127.0.0.1:0"
 dns = "127.0.0.1:0"
 audit_log = "{}"
 dns_log = "-"
+max_bytes = {}
+max_connections = {}
+address_policy = "{}"
 {extra}
 allow = [
 {allow}
 ]
 "#,
             dir.join("audit.log").display(),
+            limits.max_bytes,
+            limits.max_connections,
+            limits.address_policy,
         );
         let config_path = dir.join("class.toml");
         std::fs::write(&config_path, config).expect("write class config");
@@ -160,7 +205,8 @@ fn check_prints_the_class_allowlist_and_exits_zero() {
     let config = dir.join("class.toml");
     std::fs::write(
         &config,
-        "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nallow = [\"api.example.com:443\"]\n",
+        "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+         max_bytes = 1048576\nmax_connections = 4\nallow = [\"api.example.com:443\"]\n",
     )
     .expect("write");
     let output = Command::new(binary())
@@ -173,6 +219,15 @@ fn check_prints_the_class_allowlist_and_exits_zero() {
     assert!(stdout.contains("class: model"), "{stdout}");
     assert!(stdout.contains("audit stream: stdout"), "{stdout}");
     assert!(stdout.contains("dns stream: stderr"), "{stdout}");
+    assert!(
+        stdout.contains("budget: 1048576 byte(s) per jail"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("cap: 4 concurrent connection(s)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("address policy: public"), "{stdout}");
 }
 
 #[test]
@@ -181,7 +236,8 @@ fn an_invalid_class_config_is_refused() {
     let config = dir.join("class.toml");
     std::fs::write(
         &config,
-        "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nallow = [\"https://api.example.com\"]\n",
+        "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+         max_bytes = 1048576\nmax_connections = 4\nallow = [\"https://api.example.com\"]\n",
     )
     .expect("write");
     let output = Command::new(binary())
@@ -196,7 +252,7 @@ fn an_invalid_class_config_is_refused() {
 
 #[test]
 fn an_allowlisted_destination_answers_through_the_proxy_and_is_audited() {
-    let (port, _server) = target_server("allowed");
+    let (port, _server) = one_shot_server("allowed");
     let gateway = Gateway::start("allow", &format!("  \"localhost:{port}\","), "");
 
     let (status, body) = gateway.connect(&format!("localhost:{port}"));
@@ -224,6 +280,184 @@ fn an_allowlisted_destination_answers_through_the_proxy_and_is_audited() {
     assert!(line.contains("jail=jail-42"), "{line}");
     assert!(line.contains(&format!("dest=localhost:{port}")), "{line}");
     assert!(line.contains("bytes="), "{line}");
+    // The other half of the answer: what the name resolved to and which
+    // address the tunnel actually went to. A rebind that lands on a public
+    // address is only visible here.
+    assert!(line.contains("resolved="), "{line}");
+    assert!(line.contains("127.0.0.1"), "{line}");
+    assert!(line.contains("pinned=127.0.0.1"), "{line}");
+}
+
+/// A server that answers with `bytes` bytes of filler, for the budget.
+fn flood_server(bytes: usize) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind target");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let filler = vec![b'x'; bytes];
+            let _ = stream.write_all(&filler);
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    (port, handle)
+}
+
+#[test]
+fn a_connection_that_exceeds_the_byte_budget_is_cut_and_logged() {
+    let (port, _server) = flood_server(64 * 1024);
+    // Small enough that one relay chunk of filler is delivered and the next is
+    // refused: the cut is the budget, not the target closing.
+    let budget = 20_000;
+    let gateway = Gateway::start_with(
+        "budget",
+        &format!("  \"localhost:{port}\","),
+        "",
+        Limits {
+            max_bytes: budget,
+            ..Limits::default()
+        },
+    );
+
+    let mut stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    write!(
+        stream,
+        "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+    )
+    .expect("write");
+    let mut received = Vec::new();
+    let _ = stream.read_to_end(&mut received);
+    let body = String::from_utf8_lossy(&received);
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    let delivered = body.matches('x').count();
+    assert!(delivered > 0, "the tunnel delivered nothing: {body:?}");
+    assert!(
+        delivered < 64 * 1024,
+        "the whole 64 KiB passed a {budget}-byte budget"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gateway.audit().contains("reason=byte-budget") {
+        assert!(
+            Instant::now() < deadline,
+            "the cut was not logged: {:?}",
+            gateway.audit()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let audit = gateway.audit();
+    let line = audit
+        .lines()
+        .find(|line| line.contains("reason=byte-budget"))
+        .expect("budget denial");
+    assert!(line.contains(&format!("dest=localhost:{port}")), "{line}");
+    assert!(line.contains("decision=deny"), "{line}");
+    assert!(line.contains(&format!("budget={budget}")), "{line}");
+    assert!(line.contains("bytes="), "{line}");
+}
+
+#[test]
+fn a_second_connection_over_the_cap_is_refused_and_logged() {
+    let (port, _server) = target_server("capped");
+    let gateway = Gateway::start_with(
+        "cap",
+        &format!("  \"localhost:{port}\","),
+        "",
+        Limits {
+            max_connections: 1,
+            ..Limits::default()
+        },
+    );
+
+    // The first tunnel stays open: the fixture answers and then waits, so the
+    // slot is still held when the second attempt arrives.
+    let mut holder = TcpStream::connect(("127.0.0.1", gateway.proxy_port)).expect("connect");
+    holder
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    write!(
+        holder,
+        "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+    )
+    .expect("write");
+    let mut reader = BufReader::new(holder.try_clone().expect("clone"));
+    let mut status = String::new();
+    reader.read_line(&mut status).expect("status");
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+
+    let (status, _body) = gateway.connect(&format!("localhost:{port}"));
+    assert!(
+        status.starts_with("HTTP/1.1 429"),
+        "a second connection over the cap must be refused, got {status}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gateway.audit().contains("reason=connection-cap") {
+        assert!(
+            Instant::now() < deadline,
+            "the cap refusal was not logged: {:?}",
+            gateway.audit()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let audit = gateway.audit();
+    let line = audit
+        .lines()
+        .find(|line| line.contains("reason=connection-cap"))
+        .expect("cap denial");
+    assert!(line.contains("decision=deny"), "{line}");
+    assert!(line.contains("connections=1/1"), "{line}");
+    drop(reader);
+}
+
+#[test]
+fn a_name_resolving_to_a_blocked_address_is_refused_with_the_range_named() {
+    let (port, _server) = target_server("blocked");
+    // The `public` policy is the default for the committed `model` and
+    // `external` classes: `localhost` is allowlisted by name and resolves to
+    // loopback, which is exactly the answer that must be refused.
+    let gateway = Gateway::start_with(
+        "blocked",
+        &format!("  \"localhost:{port}\","),
+        "",
+        Limits {
+            address_policy: "public",
+            ..Limits::default()
+        },
+    );
+
+    let (status, _body) = gateway.connect(&format!("localhost:{port}"));
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "a loopback answer must be refused, got {status}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gateway.audit().contains("reason=blocked-") {
+        assert!(
+            Instant::now() < deadline,
+            "no blocked-range denial: {:?}",
+            gateway.audit()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let audit = gateway.audit();
+    let line = audit
+        .lines()
+        .find(|line| line.contains("reason=blocked-"))
+        .expect("blocked denial");
+    assert!(line.contains("reason=blocked-loopback"), "{line}");
+    // `localhost` resolves to both loopback families; whichever the resolver
+    // lists first is the answer that is reported.
+    assert!(
+        line.contains("address=127.0.0.1") || line.contains("address=::1"),
+        "{line}"
+    );
+    assert!(line.contains(&format!("dest=localhost:{port}")), "{line}");
 }
 
 #[test]
@@ -342,7 +576,7 @@ fn a_denied_destination_is_refused_and_logged_as_a_denial() {
 
 #[test]
 fn a_raw_ip_destination_is_refused_even_when_the_name_is_allowlisted() {
-    let (port, _server) = target_server("named");
+    let (port, _server) = one_shot_server("named");
     let gateway = Gateway::start("raw-ip", &format!("  \"localhost:{port}\","), "");
 
     let (status, _body) = gateway.connect(&format!("127.0.0.1:{port}"));
@@ -390,6 +624,17 @@ fn a_method_other_than_connect_is_refused() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The plain-HTTP attempt is logged in the denial shape, with the
+    // destination it named, so it is as visible as a policy denial.
+    let audit = gateway.audit();
+    let line = audit
+        .lines()
+        .find(|line| line.contains("reason=not-connect"))
+        .expect("denial line");
+    assert!(line.contains("decision=deny"), "{line}");
+    assert!(line.contains("dest=http://example.com/"), "{line}");
+    assert!(line.contains("class=test"), "{line}");
+    assert!(line.contains("jail=jail-42"), "{line}");
 }
 
 #[test]

@@ -87,6 +87,17 @@ pub fn verify_inspect_json(raw: &str) -> Result<NetworkPosture, String> {
             network.name
         ));
     }
+    // IPv6 is either handled or explicitly off. A class network that carries a
+    // v6 prefix is a second route out that nothing in this design manages, so a
+    // jail on it has a bypass that looks like nothing at all.
+    if network.ipv6_enabled {
+        return Err(format!(
+            "network {:?} has IPv6 enabled; a class network must be IPv4-only (create it with \
+             `podman network create --ipv6=false`), because an unmanaged v6 route is a bypass. \
+             Refusing to launch.",
+            network.name
+        ));
+    }
     if network.subnets.is_empty() {
         return Err(format!(
             "network {:?} has no subnet, so the jail cannot be placed on it; refusing to launch",
@@ -135,6 +146,18 @@ mod tests {
         let error = verify_inspect_json(r#"[{"name":"x","subnets":[{"subnet":"10.0.0.0/24"}]}]"#)
             .expect_err("missing internal must fail closed");
         assert!(error.contains("not internal"), "{error}");
+    }
+
+    #[test]
+    fn a_network_with_ipv6_enabled_fails_closed() {
+        let error = verify_inspect_json(
+            r#"[{"name":"x","internal":true,"ipv6_enabled":true,
+                 "subnets":[{"subnet":"10.0.0.0/24"}]}]"#,
+        )
+        .expect_err("ipv6 on a class network must be refused");
+        assert!(error.contains("IPv6 enabled"), "{error}");
+        assert!(error.contains("--ipv6=false"), "{error}");
+        assert!(error.contains("Refusing to launch"), "{error}");
     }
 
     #[test]

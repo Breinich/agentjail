@@ -68,7 +68,7 @@ jobs:
             while IFS= read -r path; do
               [ -n "$path" ] || continue
               case "$path" in
-                *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|rust-toolchain.toml|schema/*|profiles/*|images/*|gateway/*|scripts/*|docs/diagrams/*|.github/workflows/*)
+                *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|rust-toolchain.toml|Makefile|schema/*|profiles/*|images/*|gateway/*|scripts/*|docs/diagrams/*|.github/workflows/*)
                   relevant=true
                   ;;
               esac
@@ -169,17 +169,12 @@ jobs:
             echo "image=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Cheapest first: a formatting error must not cost a compile.
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy --locked -D warnings
-        timeout-minutes: 8
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: cargo test --locked
-        timeout-minutes: 8
-        run: cargo test --locked --workspace
+      # One command, the same one a developer runs before pushing: the Makefile
+      # is the single entry point for fmt --check, clippy with -D warnings across
+      # all targets, and the workspace tests. Nothing here re-lists them.
+      - name: make check (fmt, clippy -D warnings, workspace tests)
+        timeout-minutes: 12
+        run: make check
 
       - name: Validate example profiles
         run: |

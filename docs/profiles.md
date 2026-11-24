@@ -244,7 +244,7 @@ needs.
 | Field | Required | Rule |
 | --- | --- | --- |
 | `name` | no | Attach to this existing podman network instead of creating one (`mode = "none"` only; refused with `allowlist`). Verified against the single-route invariant on **every** start; `run` refuses a network that is not internal. Pattern: `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`. |
-| `class` | with `allowlist` | Egress class: `model`, `external`, or `internal`. It names the internal network the jail joins, and therefore which committed allowlist (`gateway/classes/<class>.toml`) applies. The agent cannot change it from inside. Refused with `mode = "none"`. |
+| `class` | with `allowlist` | Egress class: `model`, `external`, or `internal`. It names the internal network the jail joins, and therefore which committed allowlist (`gateway/classes/<class>.toml`) applies. The agent cannot change it from inside. Refused with `mode = "none"`. The class config also decides what the profile cannot: the jail's byte budget and connection cap (`max_bytes`, `max_connections`) and which address ranges an allowlisted name may resolve to (`address_policy`). See `docs/egress-classes.md`. |
 | `mode` | yes | `none` or `allowlist`. |
 | `dns` | yes | `none`, `gateway`, or `pinned`. `pinned` parses and is **refused by validation as not implemented**; `gateway` is the only accepted resolver with `mode = "allowlist"`. |
 | `egress` | no | Array of destinations; required non-empty when `mode = "allowlist"`. |

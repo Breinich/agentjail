@@ -10,16 +10,22 @@
 //!   stream. Pinning to loopback is deliberate: a jail that resolves a name and
 //!   then dials it directly reaches its own loopback and fails, instead of
 //!   reaching the destination and bypassing the proxy.
-//! * **CONNECT**: permits only `host:port` pairs on that allowlist, relays the
-//!   bytes, and logs the decision when it is made: `decision=allow` as soon as
-//!   the connection exists, `decision=allow-close` with the byte counts when it
-//!   ends. Denials are logged too: they are the security signal.
+//! * **CONNECT**: permits only `host:port` pairs on that allowlist, resolves the
+//!   name once, checks **every** answer against the class address policy, and
+//!   relays the bytes to a checked address. It logs the decision when it is
+//!   made: `decision=allow` as soon as the connection exists (with the resolved
+//!   set and the address dialled), `decision=allow-close` with the byte counts
+//!   when it ends. Denials are logged too: they are the security signal.
+//! * **Limits**: each jail has a byte budget (both directions) and a concurrent
+//!   connection cap from its class config. Reaching either is a refusal in the
+//!   same shape as a policy denial, with the counters that caused it.
 //!
 //! Nothing is decided by an ACL inside a shared proxy: the class is the network
 //! the jail is joined to, and the jail cannot change its own membership.
 
 mod audit;
 mod dns;
+mod egress;
 mod proxy;
 
 use std::path::PathBuf;
@@ -85,6 +91,14 @@ fn run(cli: &Cli) -> Result<u8, String> {
             config.dns, config.dns_policy
         );
         println!(
+            "budget: {} byte(s) per jail, both directions; cap: {} concurrent connection(s)",
+            config.max_bytes, config.max_connections
+        );
+        println!(
+            "address policy: {} (which ranges an allowlisted name may resolve to)",
+            config.address_policy.as_str()
+        );
+        println!(
             "audit stream: {}",
             describe_stream(&config.audit_log, "stdout")
         );
@@ -98,8 +112,14 @@ fn run(cli: &Cli) -> Result<u8, String> {
 
     let logs = audit::Logs::open(&config)?.with_jail(&cli.jail_id);
     eprintln!(
-        "agentjail-gateway: class {} jail {}: dns on {}, connect on {}, deny by default",
-        config.class, cli.jail_id, config.dns, config.listen
+        "agentjail-gateway: class {} jail {}: dns on {}, connect on {}, budget {} byte(s), cap {} connection(s), address policy {}, deny by default",
+        config.class,
+        cli.jail_id,
+        config.dns,
+        config.listen,
+        config.max_bytes,
+        config.max_connections,
+        config.address_policy.as_str()
     );
 
     let dns_logs = logs.clone();

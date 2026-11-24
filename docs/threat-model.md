@@ -54,8 +54,10 @@ For the jailed process, and assuming a correct rootless Podman installation:
 4. **One route out, and only one.** The default network model is
    `mode = "none"`: the jail sits on an internal network with no route out and
    no resolver. With `mode = "allowlist"` the only way out is the egress
-   gateway, and the gateway permits only the listed `host:port` destinations.
-   This is the single-route invariant, stated and enforced separately below.
+   gateway, and the gateway permits only the listed `host:port` destinations,
+   only at addresses their class policy allows, within a byte budget and a
+   connection cap. This is the single-route invariant, stated and enforced
+   separately below.
 5. **No inherited DNS search domains.** Whenever the jail has a resolver
    (`mode = "allowlist"`), the launcher passes `--dns-search .`, an empty search
    list, so a host search domain cannot turn a short or unqualified name into an
@@ -66,7 +68,9 @@ For the jailed process, and assuming a correct rootless Podman installation:
    allowlist.
 6. **Bounded resources.** CPU, memory, pids, open files, tmpfs sizes, and the
    writable layer size are declared in the profile and enforced by the runtime,
-   not merely printed.
+   not merely printed. The jail's **egress** is bounded too: a byte budget (both
+   directions) and a concurrent-connection cap, both required in its class
+   config, both enforced in the gateway and both logged when reached.
 7. **Isolation between jails.** Two concurrent jails use distinct container
    names, networks, and homes, and cannot read each other's files, sockets, or
    credentials.
@@ -107,6 +111,10 @@ is verified, never assumed, and it fails closed:
 
 Rules that go with it:
 
+- **IPv6 is off, explicitly and verifiably.** Both networks the launcher creates
+  are created with `--ipv6=false`, and `run` refuses a class network that reports
+  `ipv6_enabled: true`: a jail with an unmanaged v6 route is a bypass, and the
+  default of a runtime is not a policy. Silence is not an option on a boundary.
 - **Both checks run on every start**, not once per profile install. Networks
   change under you; a network verified yesterday proves nothing today.
 - **`run` and `doctor` share one implementation.** Two copies drift, and the
@@ -174,33 +182,73 @@ The sentence above is "the gateway is the only control on the egress path", and
 these are the limits of that control. They are not footnotes to be found later in
 a PR body:
 
-- **The gateway's own outbound leg is unrestricted by design.** It is
-  dual-homed: one leg on the per-run internal network (the jail), one leg on a
-  real egress network (`podman`/`bridge` or `AGENTJAIL_EGRESS_NETWORK`). The
-  CONNECT allowlist is the **only** thing standing between that second leg and
-  anything the host can reach — there is no egress firewall behind the proxy, no
-  second check on the resolved address, and no per-destination policy beyond the
-  class file. **A bug in the proxy is therefore fleet-wide egress for that
-  class**: one path that fails open, and every jail of that class has the
-  gateway's whole reach. That is the residual risk of this design, accepted
-  because the alternative (per-destination enforcement in the kernel) is a much
-  larger thing to get right.
 - **`CONNECT` only.** The proxy relays a TLS tunnel to an allowlisted
-  `host:port`; a plain-HTTP request gets `405` and is logged, and
-  `protocol = "http"` / `"tcp"` in a profile does nothing. So "allowed" means
-  "TLS through CONNECT", and nothing else is covered by this control.
-- **No per-connection byte cap and no connection limit.** An allowlisted
-  destination can be used to move unlimited bytes for as long as the connection
-  lives (`shortcut:` in `proxy.rs`). The jail's pids and memory limits are the
-  only brakers, and neither bounds bytes out.
-- **The resolver is the host's.** The gateway resolves names with the host
-  resolvers, so a class name that resolves to a private address is reachable.
-  Keep LAN names in `internal` and never in `model`/`external`.
+  `host:port`; a plain-HTTP request gets `405` and is **logged as a denial with
+  the destination it named**, and `protocol = "http"` / `"tcp"` in a profile does
+  nothing. So "allowed" means "TLS through CONNECT", and nothing else is covered
+  by this control.
+- **Budgets bound totals, not speed.** Each jail has a byte budget (both
+  directions) and a concurrent-connection cap, both required in its class config
+  and both enforced in the proxy: crossing either is a refusal logged in the
+  denial shape with the counters that caused it. Neither is a rate limit — a jail
+  with 8 connections and 256 MiB can still move that 256 MiB as fast as the
+  destination will accept it.
+- **The resolver is not authenticated.** The gateway resolves an allowlisted name
+  once, checks **every** answer against the class address policy, and connects
+  only to a checked address; one blocked answer refuses the whole name, and the
+  answer set plus the address used are on the audit line. What that catches is an
+  answer pointing at internal space. What it does not catch is a hostile resolver
+  answering with a public address of its choosing: the policy permits public
+  space by definition, and there is no DNSSEC or DoH here.
 - **The dual-homing shape has one end-to-end test that is `#[ignore]`d.** The
   four-way concurrent case (four runs, four distinct networks, all removed) runs
   only on a host with podman, the base image and the gateway image; in normal
   `ci` the same ground is covered by the fake-podman argv tests and by the
   lifecycle cases in the proof script, not by the concurrency test itself.
+
+### If the gateway itself is compromised
+
+This is the honest sentence an adopter needs, and it is deliberately one place.
+
+The gateway is the component whose compromise is total for its class: it is the
+only process with a route out, and it is dual-homed by design. So assume it
+completely: an attacker who runs code in the gateway container has the class
+allowlist, the audit stream, and the gateway's outbound leg.
+
+**What remains reachable is exactly what that leg reaches, minus nothing:**
+
+- every destination the **host** can reach over IPv4 from the gateway's egress
+  network — the public internet, plus whatever the host itself can route to
+  (LAN hosts, RFC1918 services, the router, anything the host's resolver
+  answers). Nothing behind the proxy filters packets, so the class allowlist is
+  a decision the compromised process simply stops making;
+- the class's committed allowlist, which becomes a *hint* rather than a control;
+- the audit stream itself, which the attacker can stop writing to, forge lines
+  in (the format is not signed), or flood.
+
+**What it does not reach, because these are runtime/network facts and not proxy
+decisions:**
+
+- the jail's filesystem, home, mounts, and injected `secrets[]` values (a
+  network peer cannot read them);
+- the host filesystem, the container runtime socket, the host's D-Bus/systemd
+  session, and other containers — the gateway is an ordinary rootless container
+  with `--cap-drop=ALL --cap-add=NET_BIND_SERVICE`, a read-only rootfs, and no
+  mount it was not given;
+- other classes' allowlists: a `model` gateway cannot make a jail on `internal`
+  reach anything, because class membership is the per-run network, and the
+  gateway only sits on its own class's network;
+- inbound connections to the jail: the jail is on an internal network with no
+  route in either direction except through this gateway, and the gateway relays
+  only outbound `CONNECT` tunnels.
+
+That is the accepted residual risk of this design. The mitigation is not a larger
+proxy: it is that the gateway is small (no TLS termination, no config reload, no
+upstream resolver, a static musl binary in a `scratch` image), that it starts by
+**image ID pinned at run time**, and that its class config is mounted read-only
+from the checkout. Per-destination enforcement in the kernel (an egress firewall
+between the gateway and the host's network) is what would change the sentence
+above, and it is a much larger thing to get right than the proxy it would defend.
 
 ### Egress classes bound the blast radius, and are the residual authority
 
@@ -210,14 +258,16 @@ fleet-wide "union of everything" weakness: a `model` jail can only ever reach wh
 `model.toml` lists. What remains:
 
 - the committed class config is authority over every profile of that class, so
-  editing it is a review event;
-- the gateway resolves destinations with the host's resolvers, so any name on a
-  class list that resolves to a private address is reachable. Keep LAN names in
-  `internal` and never in `model`/`external`;
-- there is no connection cap or byte budget in the gateway yet (a `shortcut:` in
-  `proxy.rs`): the profile's pids and memory limits are the only brakers;
+  editing it is a review event. That includes `address_policy`: `internal` names
+  it `lan` because LAN reach is its purpose, and a class config that relaxes it
+  for `model`/`external` is a security change;
+- a class name that resolves to internal space is refused unless the class policy
+  permits that range, and the refusal names the range (`reason=blocked-<range>`);
+  but a hostile resolver can still answer with a public address the policy
+  permits, so the class list plus DNS control remain the authority;
+- the byte budget and the connection cap bound totals per jail, not speed;
 - `protocol = "http"` / `"tcp"` entries do not work: the proxy implements CONNECT
-  only, and refuses a non-CONNECT request (`405`, logged).
+  only, and refuses a non-CONNECT request (`405`, logged with its destination).
 
 This is accepted risk: the gateway is small, single-purpose, and the only
 component whose compromise matters most.

@@ -156,13 +156,44 @@ pub fn network_list() -> Result<Vec<String>, String> {
 /// (aardvark) as the network's nameserver, which shadows the gateway the jail is
 /// told to use, and on an internal network that resolver has nowhere to forward
 /// to. With it off, `--dns <gateway>` is the jail's only resolver.
+///
+/// `--ipv6=false` is explicit for the same class of reason: IPv6 is handled or
+/// turned off, never left to a default that can change under us. The network is
+/// verified afterwards (`verify_inspect_json`), so a runtime that ignores the
+/// flag is caught before anything is launched on it.
 pub fn network_create(name: &str) -> Result<(), String> {
-    let output = podman(&["network", "create", "--internal", "--disable-dns", name])?;
+    let output = podman(&[
+        "network",
+        "create",
+        "--internal",
+        "--disable-dns",
+        "--ipv6=false",
+        name,
+    ])?;
     if output.success() {
         return Ok(());
     }
     Err(format!(
         "podman network create --internal --disable-dns {name:?} failed ({}): {}",
+        output.code,
+        output.stderr.trim()
+    ))
+}
+
+/// Create the gateway's own outbound leg: a dedicated bridge network for this
+/// run, IPv6 off.
+///
+/// It is not shared with the host's default `podman` bridge, so nothing else
+/// rides the leg the gateway uses, and it is not internal because the gateway is
+/// the one component that must have a route out. The gateway is the only
+/// container on it; the jail never sees it.
+pub fn egress_network_create(name: &str) -> Result<(), String> {
+    let output = podman(&["network", "create", "--ipv6=false", name])?;
+    if output.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "podman network create {name:?} for the gateway's egress leg failed ({}): {}",
         output.code,
         output.stderr.trim()
     ))

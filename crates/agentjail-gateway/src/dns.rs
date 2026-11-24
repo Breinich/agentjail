@@ -178,6 +178,8 @@ mod tests {
 class = "model"
 listen = "127.0.0.1:0"
 dns = "127.0.0.1:0"
+max_bytes = 1048576
+max_connections = 4
 allow = ["api.example.com:443"]
 "#;
 

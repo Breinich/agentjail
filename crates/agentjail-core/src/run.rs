@@ -687,7 +687,7 @@ args = ["-lc", "echo {workdir}"]
         run_blockers(&profile).expect("an allowlist profile with a class is runnable");
 
         let class = crate::class::ClassConfig::parse(
-            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nallow = [\"api.anthropic.com:443\"]\n",
+            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nmax_bytes = 1048576\nmax_connections = 4\nallow = [\"api.anthropic.com:443\"]\n",
         )
         .expect("class config");
         assert!(egress_outside_class(&profile, &class).is_empty());
@@ -727,7 +727,7 @@ args = ["-lc", "echo {workdir}"]
             );
         let profile = parse_and_validate(&text).expect("valid");
         let class = crate::class::ClassConfig::parse(
-            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nallow = [\"api.openai.com:443\"]\n",
+            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nmax_bytes = 1048576\nmax_connections = 4\nallow = [\"api.openai.com:443\"]\n",
         )
         .expect("class config");
         let outside = egress_outside_class(&profile, &class);

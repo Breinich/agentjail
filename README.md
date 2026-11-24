@@ -166,19 +166,23 @@ Spelled out plainly:
 | `agentjail-launcher`: pipes, SIGINT/SIGTERM/SIGQUIT + resize forwarding, exit codes, root refusal, 3-turn JSON-RPC over pipes | **implemented** and tested |
 | `run` with `network.mode = "none"` (hardened podman argv, secret-store injection, outside network check, `exec` passthrough) | **implemented** |
 | `run` with `network.mode = "allowlist"`: per-run class network, class gateway container, `HTTPS_PROXY`/`ALL_PROXY` + `--dns <gateway>` + `--dns-search .`, profile-vs-class subset check, both removed on every exit path | **implemented** |
-| Egress gateway: DNS (`A` → loopback for class names, NXDOMAIN for the rest), CONNECT allowlist, one audit line per decision and per query on two separate streams (an allow at establishment, its byte counts when it closes) | **implemented** |
+| Egress gateway: DNS (`A` → loopback for class names, NXDOMAIN for the rest), CONNECT allowlist, resolve-once/check-every-answer/connect-pinned, per-jail byte budget and connection cap, one audit line per decision and per query on two separate streams (an allow at establishment with the resolved set, its byte counts when it closes or the budget cuts it) | **implemented** |
+| `agentjail audit`: both gateway streams read back, merged in time order and filtered by jail, class, decision | **implemented** |
 | Egress classes `model` / `external` / `internal` as three committed configs, one binary, one container per run | **implemented** |
 | Network lifecycle: `Drop` guard on network + gateway, dead-pid pruning only, never by profile prefix | **implemented** |
-| Proofs (class beats ACL text both ways, raw IP refused, allow audited, deny logged) | **implemented**, run in the normal `ci` job |
+| Proofs (class beats ACL text both ways, raw IP refused, allow audited, deny logged, byte budget cuts a tunnel, connection cap refuses one) | **implemented**, run in the normal `ci` job |
 | `selftest` (negative set + positive control), baseline and jailed in `ci` | **implemented** (`--baseline` proves each negative holds without a jail; jailed proves it is denied) |
 | Base image (`images/base/Containerfile`) | written; not published |
-| CI: fmt, clippy, tests, profile validation, Containerfile checks, musl builds | **implemented** |
+| CI: `make check` (fmt, clippy `-D warnings`, workspace tests), profile validation, Containerfile checks, musl builds | **implemented**; `make check` is the same command a developer runs |
 | CI: real image build | non-blocking job (external apt/npm dependency) |
 
 Where the implementation is weaker than the design, `docs/egress-classes.md`
-says so at the end: `CONNECT` only (no plain-HTTP or raw-TCP proxying), no
-connection or byte cap, the gateway image not pinned by digest, and the gateway
-resolving destinations with the host's resolvers.
+says so at the end: `CONNECT` only (no plain-HTTP or raw-TCP proxying), a byte
+budget and connection cap that bound totals but not speed, DNS answers that are
+checked but not authenticated, IPv6 egress off rather than implemented, and the
+gateway image pinned by ID rather than attested. What remains reachable if the
+gateway itself is compromised is stated in one place,
+`docs/threat-model.md#if-the-gateway-itself-is-compromised`.
 
 ## Documentation
 

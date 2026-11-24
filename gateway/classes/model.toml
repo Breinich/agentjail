@@ -21,6 +21,19 @@ dns_policy = "allowlist"
 audit_log = "-"
 dns_log = "-"
 
+# Limits: an allowlisted destination with no size limit is an exfiltration
+# channel with a receipt. `max_bytes` is this jail's budget, both directions
+# together; `max_connections` is how many tunnels it may hold open. Reaching
+# either is a refusal logged like a policy denial, with the counters that
+# caused it.
+max_bytes = 268435456
+max_connections = 8
+
+# Which ranges an allowlisted name may resolve to. `public` refuses every answer
+# that is not globally routable, so a rebound or poisoned name cannot point this
+# class at loopback, the metadata address, or the LAN.
+address_policy = "public"
+
 # `host` means port 443. `*.suffix` covers subdomains only, never the apex.
 allow = [
   "api.anthropic.com:443",
