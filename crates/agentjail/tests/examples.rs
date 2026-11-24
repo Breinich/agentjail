@@ -44,22 +44,58 @@ fn example_profiles_all_validate() {
 }
 
 #[test]
-fn example_profiles_are_runnable_in_this_increment() {
-    // Allowlist profiles are valid TOML but refused by `profile validate` and
-    // `run` until the egress gateway exists, so no example ships with it.
+fn example_profiles_are_runnable_and_stay_inside_their_class() {
+    let classes = repo_root().join("gateway").join("classes");
     for entry in std::fs::read_dir(repo_root().join("profiles")).expect("profiles dir") {
         let path = entry.expect("entry").path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
         }
         let profile = parse_and_validate(&read(&path)).expect("valid profile");
-        assert_eq!(profile.network.mode, NetworkMode::None);
-        assert!(
-            profile.network.name.is_some(),
-            "{}: run requires an existing internal network",
+        agentjail_core::run::run_blockers(&profile).expect("runnable");
+        match profile.network.mode {
+            NetworkMode::None => assert!(
+                profile.network.name.is_some(),
+                "{}: mode none requires an existing internal network",
+                path.display()
+            ),
+            NetworkMode::Allowlist => {
+                let class = profile
+                    .network
+                    .class
+                    .as_deref()
+                    .expect("allowlist example names its class");
+                let text = read(&classes.join(format!("{class}.toml")));
+                let config = agentjail_core::class::ClassConfig::parse(&text)
+                    .unwrap_or_else(|errors| panic!("{class}.toml: {errors:#?}"));
+                let outside = agentjail_core::run::egress_outside_class(&profile, &config);
+                assert!(
+                    outside.is_empty(),
+                    "{}: example asks for what its class does not allow: {outside:#?}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_committed_class_config_parses_and_is_consistent() {
+    let classes = repo_root().join("gateway").join("classes");
+    for class in agentjail_core::class::CLASSES {
+        let path = classes.join(format!("{class}.toml"));
+        let config = agentjail_core::class::ClassConfig::parse(&read(&path))
+            .unwrap_or_else(|errors| panic!("{class}.toml: {errors:#?}"));
+        assert_eq!(
+            config.class,
+            class,
+            "{}: file and class disagree",
             path.display()
         );
-        agentjail_core::run::run_blockers(&profile).expect("runnable");
+        assert!(
+            !config.allow.is_empty(),
+            "{class}.toml: a class with no destination is a class nobody can use"
+        );
     }
 }
 

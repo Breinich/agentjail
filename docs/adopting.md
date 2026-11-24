@@ -25,13 +25,21 @@ were.
 
 ## What is not ready
 
-- `run` works only with `network.mode = "none"`; allowlist profiles are refused
-  until the gateway exists.
-- `selftest` exits with code 3 (not implemented).
-- The gateway parses an allowlist but does not proxy or resolve anything yet.
-- The inside half of the single-route check is not implemented.
+- `run` supports `network.mode = "none"` and `network.mode = "allowlist"` with
+  one of the three committed egress classes (`docs/egress-classes.md`). The three
+  proofs and the lifecycle cases run in the normal `ci` job.
+- `selftest` exits with code 3 (not implemented); its egress assertions live in
+  `scripts/prove-egress-classes.sh` today.
+- The gateway implements `CONNECT` only: a plain `http://` destination is
+  refused, and `protocol = "http"`/`"tcp"` egress entries do nothing yet.
+- Class membership is enforced from outside the jail; the *inside* half of the
+  single-route check (no second peer, interface or route) is asserted by the
+  proof script, not by an in-jail probe.
 - Secrets are injected by reference through podman's secret store (env vars
-  only); the store entry is pruned on the next run, not at exit.
+  only); entries this run created are removed at exit, dead-pid entries by the
+  next run of the same profile.
+- The gateway image (`localhost/agentjail-gateway:1`) is built locally, not
+  published or pinned by digest.
 - The base image is not built or published by CI.
 - There is no published crate; build from a checkout with the pinned toolchain
   (`cargo build --release`), or use the static musl binaries built in CI.

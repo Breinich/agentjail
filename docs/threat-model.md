@@ -103,7 +103,7 @@ is verified, never assumed, and it fails closed:
 | Side | Evidence | Status |
 | --- | --- | --- |
 | Outside | the target network's own metadata: `internal: true`, at least one subnet, and no upstream route or gateway exposed off that network (`podman network inspect`) | **implemented** (`crates/agentjail-core/src/network.rs`) |
-| Inside | from within the jail: the only reachable peer is the gateway, and no other peer, interface, or route can be added (no `NET_ADMIN`) | **not implemented** (needs the run path); specified here and in the selftest contract |
+| Inside | from within the jail: the only reachable peer is the gateway, and no other peer, interface, or route can be added (no `NET_ADMIN`) | **asserted on every PR** by `scripts/prove-egress-classes.sh` (proofs 2 and 3, from a real jail). It is **not yet a `selftest` case**: the capability exists, what is missing is the test inside `agentjail selftest`, which is still the exit-3 stub. |
 
 Rules that go with it:
 
@@ -118,9 +118,11 @@ Rules that go with it:
   not internal, `run` refuses before anything is created; the refusal is a
   selftest case, not an aspiration.
 
-Until the gateway and the inside check exist, an `allowlist` profile is a
-description of intent, not a live control. That is why `run` is stubbed rather
-than half-implemented.
+The inside half is now implemented for allowlist profiles, and asserted on every
+PR: the jail is joined to a per-run internal network whose only peer is that
+class's gateway, a raw `IP:port` and a direct dial both fail, and the resolver
+answers loopback for allowlisted names so "resolve then dial" reaches nothing.
+See `scripts/prove-egress-classes.sh` and `docs/egress-classes.md`.
 
 ## Out of scope: explicitly not guaranteed
 
@@ -153,32 +155,68 @@ agent would simply unset it and connect directly. So:
   the only reachable peer, and it is the only thing with a route out;
 - `HTTPS_PROXY`/`HTTP_PROXY` are set inside the jail **only as a convenience**
   for well-behaved clients, never as the boundary;
-- the gateway decides per destination, using the CONNECT target and SNI (TLS)
-  or the request host (`http`), and refuses anything not in the allowlist, with
-  no wildcard, no suffix matching, and no "just this once";
-- DNS does not bypass this either: with `dns = "gateway"` the gateway answers
-  only allowlisted names, and with `dns = "pinned"` there is no recursive
-  resolver at all. Raw IP literals still have to pass the gateway, which has no
-  route for them unless they are listed as a host.
+- the gateway refuses anything not on its class allowlist, and a raw IP literal is
+  refused **even if it is listed**: the allowlist is names;
+- the class is decided by the network the jail is joined to, not by a rule inside
+  a shared proxy, so a jail cannot reach another class's destinations even when
+  its own profile text names them (the profile is checked against the class and
+  the difference is refused before start);
+- DNS does not bypass this either: the gateway answers only names its class may
+  reach, and answers them with **loopback**, so a client that resolves and dials
+  reaches itself instead of the destination;
+- a process that ignores the proxy or dials a raw address **fails closed**. That
+  is the control working, not a defect: there is no route to fail over to.
 
-Until the gateway exists, a profile with `mode = "allowlist"` is a description
-of intent, not a live control. That is why `run` is stubbed rather than
-half-implemented in this increment.
+#### What that claim does not cover — stated here, beside it
 
-### The egress proxy is fleet-wide authority
+The sentence above is "the gateway is the only control on the egress path", and
+these are the limits of that control. They are not footnotes to be found later in
+a PR body:
 
-A single shared gateway holds the union of what every profile may reach, so a
-bug or misconfiguration in it is a fleet-wide weakness, and one compromised
-jail can only be held to the union, not to its own profile. Mitigations we
-intend:
+- **The gateway's own outbound leg is unrestricted by design.** It is
+  dual-homed: one leg on the per-run internal network (the jail), one leg on a
+  real egress network (`podman`/`bridge` or `AGENTJAIL_EGRESS_NETWORK`). The
+  CONNECT allowlist is the **only** thing standing between that second leg and
+  anything the host can reach — there is no egress firewall behind the proxy, no
+  second check on the resolved address, and no per-destination policy beyond the
+  class file. **A bug in the proxy is therefore fleet-wide egress for that
+  class**: one path that fails open, and every jail of that class has the
+  gateway's whole reach. That is the residual risk of this design, accepted
+  because the alternative (per-destination enforcement in the kernel) is a much
+  larger thing to get right.
+- **`CONNECT` only.** The proxy relays a TLS tunnel to an allowlisted
+  `host:port`; a plain-HTTP request gets `405` and is logged, and
+  `protocol = "http"` / `"tcp"` in a profile does nothing. So "allowed" means
+  "TLS through CONNECT", and nothing else is covered by this control.
+- **No per-connection byte cap and no connection limit.** An allowlisted
+  destination can be used to move unlimited bytes for as long as the connection
+  lives (`shortcut:` in `proxy.rs`). The jail's pids and memory limits are the
+  only brakers, and neither bounds bytes out.
+- **The resolver is the host's.** The gateway resolves names with the host
+  resolvers, so a class name that resolves to a private address is reachable.
+  Keep LAN names in `internal` and never in `model`/`external`.
+- **The dual-homing shape has one end-to-end test that is `#[ignore]`d.** The
+  four-way concurrent case (four runs, four distinct networks, all removed) runs
+  only on a host with podman, the base image and the gateway image; in normal
+  `ci` the same ground is covered by the fake-podman argv tests and by the
+  lifecycle cases in the proof script, not by the concurrency test itself.
 
-- one gateway per launch or per profile set, with the allowlist supplied at
-  start-up and never widened at runtime;
-- the profile's list is the whole configuration surface: no rules file, no
-  dynamic API, no per-request override;
-- gateway logs record destinations and verdicts (never payloads) so an
-  unexpected destination is visible, and the selftest asserts a denied
-  destination is denied.
+### Egress classes bound the blast radius, and are the residual authority
+
+There is no single shared gateway. Each run starts its own gateway container,
+with the committed config of its class, on its own network. That removes the
+fleet-wide "union of everything" weakness: a `model` jail can only ever reach what
+`model.toml` lists. What remains:
+
+- the committed class config is authority over every profile of that class, so
+  editing it is a review event;
+- the gateway resolves destinations with the host's resolvers, so any name on a
+  class list that resolves to a private address is reachable. Keep LAN names in
+  `internal` and never in `model`/`external`;
+- there is no connection cap or byte budget in the gateway yet (a `shortcut:` in
+  `proxy.rs`): the profile's pids and memory limits are the only brakers;
+- `protocol = "http"` / `"tcp"` entries do not work: the proxy implements CONNECT
+  only, and refuses a non-CONNECT request (`405`, logged).
 
 This is accepted risk: the gateway is small, single-purpose, and the only
 component whose compromise matters most.
@@ -211,13 +249,15 @@ remedy: copy the runtime into the image, or into a normal directory that is
 itself a bind mount. Treating such a mount as "mostly working" would be worse
 than refusing it.
 
-### The run path currently has no egress at all
+### Egress is implemented, and its limits are stated where they bite
 
-`network.mode = "allowlist"` is refused by `profile validate` and `run` until the
-egress gateway lands; only `mode = "none"` runs. This is the safe direction, but
-it means there is no allowlist to bypass because there is no egress at all, and
-no positive control has been demonstrated yet. Do not read the gateway design in
-this document as implemented.
+`network.mode = "allowlist"` runs. The proofs in `scripts/prove-egress-classes.sh`
+run in the normal `ci` job and print the line each one asserted: class membership
+beats profile text in both directions, a raw `IP:port` is refused through the
+proxy and by direct dial, an allowed destination answers through the proxy with
+its audit line, and a denied destination is refused and logged as a denial.
+`docs/egress-classes.md` ends with the list of places where the implementation is
+weaker than the design; that list is the honest current posture.
 
 ### Secret-store durability
 

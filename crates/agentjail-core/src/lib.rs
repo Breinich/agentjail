@@ -5,7 +5,9 @@
 //! the CLI, the launcher, the gateway, and the tests all share one definition of
 //! what a valid profile is.
 
+pub mod class;
 pub mod doctor;
+pub mod lifecycle;
 pub mod network;
 pub mod paths;
 pub mod podman;

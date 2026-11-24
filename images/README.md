@@ -1,5 +1,22 @@
 # Images
 
+Two images exist, and neither is published:
+
+- `images/base/Containerfile` — the jail (below).
+- `images/gateway/Containerfile` — `scratch` plus the static
+  `agentjail-gateway` binary plus the committed class configs in
+  `gateway/classes/`. Nothing is built inside it:
+
+  ```sh
+  cargo build --locked --release --target x86_64-unknown-linux-musl -p agentjail-gateway
+  scripts/build-gateway-image.sh            # localhost/agentjail-gateway:1
+  ```
+
+`run` needs the gateway image for any `network.mode = "allowlist"` profile and
+refuses to start without it. It runs as uid 65534 with
+`--cap-drop=ALL --cap-add=NET_BIND_SERVICE` (port 53), a read-only rootfs, and
+the class config bind-mounted read-only.
+
 `images/base/Containerfile` is the jail base image: a pinned Debian slim base,
 Node, Python, git, ripgrep, and an unprivileged `agent` user (uid/gid 10000).
 It contains no credentials and no jail state.

@@ -329,6 +329,15 @@
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
           "description": "Attach to this existing podman network instead of creating one. The single-route invariant is verified from outside (this network's metadata) and from inside (inside the jail) on every start; run refuses a network that is not internal. Omit to let the launcher create a dedicated internal network."
         },
+        "class": {
+          "type": "string",
+          "enum": [
+            "model",
+            "external",
+            "internal"
+          ],
+          "description": "Egress class, required with mode=\"allowlist\". The class is the internal podman network the jail joins; each class has its own committed allowlist, DNS policy and log stream (gateway/classes/<class>.toml). The agent cannot change its network membership from inside the jail."
+        },
         "mode": {
           "enum": [
             "none",
@@ -342,7 +351,7 @@
             "gateway",
             "pinned"
           ],
-          "description": "DNS strategy. none: no resolver. gateway: DNS is answered and pinned by the egress gateway. pinned: static entries only, no recursive resolver. Required with no default so it can never be unset by accident: an inherited host search domain can silently resolve internal names and defeat an allowlist. When the jail has a resolver (allowlist mode), the launcher additionally passes --dns-search . so host search domains cannot leak in; with dns=none there is no resolver at all (see docs/threat-model.md)."
+          "description": "DNS strategy. Required with no default so it can never be unset by accident: an inherited host search domain can silently resolve internal names and defeat an allowlist. none: no resolver (only with mode=\"none\"). gateway: the class gateway is the resolver and answers only allowlisted names, pinned to loopback. pinned is reserved and refused by validation until it is implemented: the launcher always starts the class gateway as the resolver. With a resolver the launcher additionally passes --dns-search . so host search domains cannot leak in (see docs/threat-model.md)."
         },
         "egress": {
           "type": "array",
@@ -352,7 +361,26 @@
           },
           "default": []
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "const": "allowlist"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "class"
+            ]
+          }
+        }
+      ]
     },
     "egress": {
       "type": "object",

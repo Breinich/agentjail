@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+#
+# agentjail-gateway image: one static binary and the committed class configs.
+# Nothing is built here. The container only COPYs what this repository already
+# produced, which is why CI can prove the real thing without a compiler in the
+# container.
+#
+# Build (scripts/build-gateway-image.sh does exactly this, with a staging dir as
+# the context):
+#   cargo build --release --target x86_64-unknown-linux-musl -p agentjail-gateway
+#   scripts/build-gateway-image.sh
+#
+# One image, three instances: each instance is started with
+# `--config /etc/agentjail/classes/<class>.toml`, so the allowlist, the DNS
+# policy, and the log streams differ per class while the code does not.
+FROM scratch
+
+# The binary is musl-static: no libc, no shell, no package manager, no CA bundle
+# (the proxy never terminates TLS; it relays CONNECT).
+COPY agentjail-gateway /agentjail-gateway
+COPY classes/ /etc/agentjail/classes/
+
+# Numeric uid: scratch has no /etc/passwd, and a jail never shares this
+# container's namespace anyway. Binding :53 needs NET_BIND_SERVICE, which the
+# launcher adds to an otherwise empty capability set.
+USER 65534:65534
+
+ENTRYPOINT ["/agentjail-gateway"]

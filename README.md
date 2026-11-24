@@ -43,7 +43,8 @@ vendor-specific code or configuration in the product.
 - **Not a proxy you can trust from inside.** An allowlist a jailed process can
   bypass by ignoring `HTTPS_PROXY` is not enforcement. The boundary is the
   network: an internal network with no route, where the gateway is the only
-  peer. Whether the gateway is implemented yet is stated in Status, honestly.
+  peer. Three egress classes (`model`, `external`, `internal`) make that
+  boundary concrete; see `docs/egress-classes.md`.
 
 ## The single-route invariant
 
@@ -132,12 +133,28 @@ args = ["--mode", "rpc"]
 ```
 
 Two complete examples live in `profiles/minimal.toml` (no egress) and
-`profiles/allowlist.toml` (one allowlisted destination). The full reference is
-`docs/profiles.md`.
+`profiles/allowlist.toml` (one destination, through the `model` egress class).
+The full reference is `docs/profiles.md`; egress classes are in
+`docs/egress-classes.md`.
+
+```sh
+# Build the only two images a run needs (both are local; nothing is published).
+podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
+cargo build --locked --release --target x86_64-unknown-linux-musl -p agentjail-gateway
+scripts/build-gateway-image.sh
+
+# Run a jail that may reach exactly one destination.
+agentjail run profiles/allowlist.toml -- bash -l
+```
+
+The egress class is decided by the internal network the jail joins, and the
+gateway for that class is the jail's only peer. A process that ignores the proxy,
+dials a raw `IP:port`, or resolves a name and connects to it **fails closed** —
+that is the control working, not a bug.
 
 ## Status
 
-Increment 1 is the scaffolding PR. Spell it out plainly:
+Spelled out plainly:
 
 | Piece | State |
 | --- | --- |
@@ -147,16 +164,20 @@ Increment 1 is the scaffolding PR. Spell it out plainly:
 | CLI wiring, exit codes, help text, launcher/selftest contracts | **implemented** |
 | `agentjail-launcher`: pipes, SIGINT/SIGTERM/SIGQUIT + resize forwarding, exit codes, root refusal, 3-turn JSON-RPC over pipes | **implemented** and tested |
 | `run` with `network.mode = "none"` (hardened podman argv, secret-store injection, outside network check, `exec` passthrough) | **implemented** |
-| `run` with `network.mode = "allowlist"` (needs the gateway) | **refused at validation** (clear error) |
-| `selftest` (negative set + positive control) | **not implemented** (exit 3) |
-| Gateway proxy (DNS pinning, CONNECT allowlist) | **not implemented** — allowlist parsing only (exit 3) |
+| `run` with `network.mode = "allowlist"`: per-run class network, class gateway container, `HTTPS_PROXY`/`ALL_PROXY` + `--dns <gateway>` + `--dns-search .`, profile-vs-class subset check, both removed on every exit path | **implemented** |
+| Egress gateway: DNS (`A` → loopback for class names, NXDOMAIN for the rest), CONNECT allowlist, one audit line per connection and per query on two separate streams | **implemented** |
+| Egress classes `model` / `external` / `internal` as three committed configs, one binary, one container per run | **implemented** |
+| Network lifecycle: `Drop` guard on network + gateway, dead-pid pruning only, never by profile prefix | **implemented** |
+| Proofs (class beats ACL text both ways, raw IP refused, allow audited, deny logged) | **implemented**, run in the normal `ci` job |
+| `selftest` (negative set + positive control) | **not implemented** (exit 3); the egress assertions live in `scripts/prove-egress-classes.sh` |
 | Base image (`images/base/Containerfile`) | written; not published |
 | CI: fmt, clippy, tests, profile validation, Containerfile checks, musl builds | **implemented** |
 | CI: real image build | non-blocking job (external apt/npm dependency) |
 
-`run` is deliberately not half-implemented: the single-route invariant depends
-on the gateway, and a proxy that does not hold the security property would be
-worse than none.
+Where the implementation is weaker than the design, `docs/egress-classes.md`
+says so at the end: `CONNECT` only (no plain-HTTP or raw-TCP proxying), no
+connection or byte cap, the gateway image not pinned by digest, and the gateway
+resolving destinations with the host's resolvers.
 
 ## Documentation
 

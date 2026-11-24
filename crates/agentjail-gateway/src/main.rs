@@ -1,39 +1,51 @@
-//! `agentjail-gateway`: the jail's only route out.
+//! `agentjail-gateway`: the jail's only route out, one instance per egress
+//! class.
 //!
-//! Intended shape (documented in `docs/cli.md`): one process that answers DNS
-//! for allowlisted names only and accepts CONNECT for allowlisted
-//! `host:port` destinations, on an internal network where it is the sole
-//! reachable peer.
+//! One binary, three instances. Each instance reads one committed class config
+//! ([`agentjail_core::class`]) and runs two halves that share that single
+//! allowlist:
 //!
-//! Status in increment 1: the allowlist is parsed, typed, and validated from a
-//! profile, and `--check` prints exactly what the proxy will permit. The proxy
-//! itself (listener, CONNECT handling, DNS pinning) is **not implemented**, and
-//! this binary says so and exits 3. No half-finished proxy ships: a proxy that
-//! holds the security property is the whole point, and an incomplete one would
-//! be worse than none.
+//! * **DNS** (UDP): answers `A` for names the class may reach, pinned to
+//!   loopback, and NXDOMAINs everything else. Every query is logged on the DNS
+//!   stream. Pinning to loopback is deliberate: a jail that resolves a name and
+//!   then dials it directly reaches its own loopback and fails, instead of
+//!   reaching the destination and bypassing the proxy.
+//! * **CONNECT**: permits only `host:port` pairs on that allowlist, relays the
+//!   bytes, and logs one audit line per connection on the audit stream. Denials
+//!   are logged too: they are the security signal.
+//!
+//! Nothing is decided by an ACL inside a shared proxy: the class is the network
+//! the jail is joined to, and the jail cannot change its own membership.
+
+mod audit;
+mod dns;
+mod proxy;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use agentjail_core::profile::{parse_and_validate, DnsStrategy, NetworkMode, Protocol};
+use agentjail_core::class::ClassConfig;
 use clap::Parser;
 
 const EXIT_OK: u8 = 0;
 const EXIT_FAILURE: u8 = 1;
-const EXIT_NOT_IMPLEMENTED: u8 = 3;
 
 #[derive(Parser)]
 #[command(
     name = "agentjail-gateway",
     version,
-    about = "Egress gateway for an agentjail jail: DNS pinning and CONNECT allowlist."
+    about = "Egress gateway for one agentjail class: DNS pinning and a CONNECT allowlist."
 )]
 struct Cli {
-    /// Profile whose network allowlist this gateway enforces.
+    /// Class config this instance enforces (gateway/classes/<class>.toml).
     #[arg(long, value_name = "PATH")]
-    profile: PathBuf,
+    config: PathBuf,
 
-    /// Validate the allowlist and print it; start no listener.
+    /// Jail id written into every audit and DNS line. `run` passes its run id.
+    #[arg(long, value_name = "ID", default_value = "-")]
+    jail_id: String,
+
+    /// Validate the class config and print it; start no listener.
     #[arg(long)]
     check: bool,
 }
@@ -50,12 +62,12 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<u8, String> {
-    let text = std::fs::read_to_string(&cli.profile)
-        .map_err(|error| format!("cannot read profile {}: {error}", cli.profile.display()))?;
-    let profile = parse_and_validate(&text).map_err(|errors| {
+    let text = std::fs::read_to_string(&cli.config)
+        .map_err(|error| format!("cannot read class config {}: {error}", cli.config.display()))?;
+    let config = ClassConfig::parse(&text).map_err(|errors| {
         format!(
-            "profile {} is invalid:\n{}",
-            cli.profile.display(),
+            "class config {} is invalid:\n{}",
+            cli.config.display(),
             errors
                 .iter()
                 .map(|error| format!("  - {error}"))
@@ -64,53 +76,45 @@ fn run(cli: &Cli) -> Result<u8, String> {
         )
     })?;
 
-    if profile.network.mode != NetworkMode::Allowlist {
-        return Err(format!(
-            "profile {:?} has network.mode = {:?}; a gateway only exists for \"allowlist\"",
-            cli.profile.display(),
-            profile.network.mode.as_str()
-        ));
-    }
-
-    let destinations = profile
-        .network
-        .egress
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}:{}/{}",
-                entry.host,
-                entry.port,
-                match entry.protocol {
-                    Protocol::Tls => "tls",
-                    Protocol::Http => "http",
-                    Protocol::Tcp => "tcp",
-                }
-            )
-        })
-        .collect::<Vec<_>>();
-
-    println!("allowlist ({} destination(s)):", destinations.len());
-    for destination in &destinations {
-        println!("  {destination}");
-    }
-    println!(
-        "dns strategy: {}",
-        match profile.network.dns {
-            DnsStrategy::None => "none",
-            DnsStrategy::Gateway => "gateway (allowlisted names only)",
-            DnsStrategy::Pinned => "pinned (static entries, no recursive resolver)",
-        }
-    );
-    println!("everything not listed here must be refused by the gateway, and there is no other route out");
-
     if cli.check {
+        println!("class: {}", config.class);
+        println!("connect listener: {}", config.listen);
+        println!(
+            "dns listener: {} (policy: {:?})",
+            config.dns, config.dns_policy
+        );
+        println!(
+            "audit stream: {}",
+            describe_stream(&config.audit_log, "stdout")
+        );
+        println!("dns stream: {}", describe_stream(&config.dns_log, "stderr"));
+        println!("allowlist ({} destination(s)):", config.allow.len());
+        for entry in &config.allow {
+            println!("  {}:{}", entry.host, entry.port);
+        }
         return Ok(EXIT_OK);
     }
 
+    let logs = audit::Logs::open(&config)?.with_jail(&cli.jail_id);
     eprintln!(
-        "agentjail-gateway: not implemented: the DNS and CONNECT proxy is not implemented in this \
-         increment. Until it is, an allowlist profile is a description of intent, not a live control."
+        "agentjail-gateway: class {} jail {}: dns on {}, connect on {}, deny by default",
+        config.class, cli.jail_id, config.dns, config.listen
     );
-    Ok(EXIT_NOT_IMPLEMENTED)
+
+    let dns_logs = logs.clone();
+    let dns_config = config.clone();
+    let dns = std::thread::spawn(move || dns::serve(&dns_config, &dns_logs));
+
+    let proxy_result = proxy::serve(&config, &logs);
+    let _ = dns.join();
+    proxy_result?;
+    Ok(EXIT_OK)
+}
+
+fn describe_stream(path: &str, default: &str) -> String {
+    if path == "-" {
+        default.to_string()
+    } else {
+        path.to_string()
+    }
 }

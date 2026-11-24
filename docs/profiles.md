@@ -43,11 +43,12 @@ name = "localhost/agentjail-base:1"
 digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 [network]
+class = "model"
 mode = "allowlist"
 dns = "gateway"
 
 [[network.egress]]
-host = "api.example.com"
+host = "api.anthropic.com"
 port = 443
 protocol = "tls"
 
@@ -115,7 +116,7 @@ Defaulted, each because absence is **strictly restrictive or unambiguous**:
 | `env` | `{}` | No extra environment. |
 | `secrets` | `[]` | No credentials. |
 | `network.egress` | `[]` | In `mode = "none"` there is nothing to reach; in `mode = "allowlist"` an empty list is a validation error. |
-| `network.name` | none | **Required by `run`**: agentjail attaches to an existing internal network and does not create one. Verified on every start. |
+| `network.name` | none | **Required by `run` in `mode = "none"`**: there agentjail attaches to an existing internal network and does not create one. Verified on every start. An allowlist profile names no network: its per-run class network is created and verified for you. |
 | `mounts[].read_only` | `true` | Writable access must be requested. |
 | `mounts[].required` | `true` | A missing path fails the launch instead of silently shrinking the jail. |
 | `secrets[].delivery` | `"env"` | `file` is valid schema but refused by `run`: secrets are injected as environment variables only. |
@@ -226,9 +227,10 @@ needs.
 
 | Field | Required | Rule |
 | --- | --- | --- |
-| `name` | no | Attach to this existing podman network instead of creating one. Verified against the single-route invariant on **every** start; `run` refuses a network that is not internal. Pattern: `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`. |
+| `name` | no | Attach to this existing podman network instead of creating one (`mode = "none"` only; refused with `allowlist`). Verified against the single-route invariant on **every** start; `run` refuses a network that is not internal. Pattern: `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`. |
+| `class` | with `allowlist` | Egress class: `model`, `external`, or `internal`. It names the internal network the jail joins, and therefore which committed allowlist (`gateway/classes/<class>.toml`) applies. The agent cannot change it from inside. Refused with `mode = "none"`. |
 | `mode` | yes | `none` or `allowlist`. |
-| `dns` | yes | `none`, `gateway`, or `pinned`. |
+| `dns` | yes | `none`, `gateway`, or `pinned`. `pinned` parses and is **refused by validation as not implemented**; `gateway` is the only accepted resolver with `mode = "allowlist"`. |
 | `egress` | no | Array of destinations; required non-empty when `mode = "allowlist"`. |
 
 `dns` has **no default**: leaving it out is an error, not a silent choice. An
@@ -242,8 +244,8 @@ isolated network.
 | `mode` | `dns` | Meaning |
 | --- | --- | --- |
 | `none` (safe posture) | `none` | Internal network, no route out, no resolver. `egress` must be empty. |
-| `allowlist` | `gateway` | **Refused by `run` in this increment** (egress gateway not implemented); schema and validation still describe it. |
-| `allowlist` | `pinned` | **Refused by `run` in this increment** (egress gateway not implemented). |
+| `allowlist` | `gateway` | Joined to the per-run class network; the class gateway is the only peer, the resolver, and the proxy. `egress` must be a subset of the class allowlist. |
+| `allowlist` | `pinned` | **Refused by validation** ("not implemented yet"): the launcher always starts the class gateway as the resolver, so this value would be a knob with no enforcement behind it. |
 
 #### `[[network.egress]]`
 

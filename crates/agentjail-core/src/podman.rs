@@ -1,8 +1,10 @@
-//! Thin, read-only wrappers around the podman CLI.
+//! Thin wrappers around the podman CLI.
 //!
 //! Everything here is optional in the sense that a missing podman must never
 //! panic: the caller gets an error and decides. No command is ever run through a
-//! shell, and nothing here mutates host state.
+//! shell. The mutating calls (network/container create and remove) exist only for
+//! the per-run lifecycle in `agentjail run`, which owns what it creates and
+//! removes it on every exit path.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -136,6 +138,145 @@ pub fn verify_network(name: &str) -> Result<crate::network::NetworkPosture, Stri
     crate::network::verify_inspect_json(&raw)
 }
 
+/// Names of the podman networks that exist.
+pub fn network_list() -> Result<Vec<String>, String> {
+    let raw = podman_stdout(&["network", "ls", "--format", "{{.Name}}"])?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Create an internal network: no route out, so the only way off it is a peer
+/// that has one (the class gateway).
+///
+/// `--disable-dns` matters twice. Podman otherwise installs its own resolver
+/// (aardvark) as the network's nameserver, which shadows the gateway the jail is
+/// told to use, and on an internal network that resolver has nowhere to forward
+/// to. With it off, `--dns <gateway>` is the jail's only resolver.
+pub fn network_create(name: &str) -> Result<(), String> {
+    let output = podman(&["network", "create", "--internal", "--disable-dns", name])?;
+    if output.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "podman network create --internal --disable-dns {name:?} failed ({}): {}",
+        output.code,
+        output.stderr.trim()
+    ))
+}
+
+/// Remove a network, ignoring one that is already gone.
+pub fn network_remove(name: &str) -> Result<(), String> {
+    let output = podman(&["network", "rm", "-f", name])?;
+    if output.success()
+        || output.stderr.contains("no such network")
+        || output.stderr.contains("not found")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "podman network rm -f {name:?} failed ({}): {}",
+            output.code,
+            output.stderr.trim()
+        ))
+    }
+}
+
+/// Names of containers that exist, running or not.
+pub fn container_list() -> Result<Vec<String>, String> {
+    let raw = podman_stdout(&["ps", "-a", "--format", "{{.Names}}"])?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Start a detached container from a ready argv (see `run::gateway_args`).
+pub fn container_start(args: &[String]) -> Result<(), String> {
+    let output = podman(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    if output.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "podman {} failed ({}): {}",
+        args.join(" "),
+        output.code,
+        output.stderr.trim()
+    ))
+}
+
+/// Remove a container, ignoring one that is already gone.
+pub fn container_remove(name: &str) -> Result<(), String> {
+    let output = podman(&["rm", "-f", name])?;
+    if output.success()
+        || output.stderr.contains("no such container")
+        || output.stderr.contains("not found")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "podman rm -f {name:?} failed ({}): {}",
+            output.code,
+            output.stderr.trim()
+        ))
+    }
+}
+
+/// The address a container has on one of its networks. Empty until the container
+/// is running, so the caller polls.
+pub fn container_ip(container: &str, network: &str) -> Result<String, String> {
+    let format = format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}");
+    podman_stdout(&["container", "inspect", "--format", &format, container])
+}
+
+/// Resolve an image reference (usually a tag) to the image ID it currently
+/// means, and refuse anything that is not an ID.
+///
+/// A tag is a name, not a thing: whatever carries
+/// `localhost/agentjail-gateway:1` when the run starts is the process the jail
+/// talks to. Resolving once, then starting the container by ID, means a retag
+/// between the check and the start cannot substitute a different binary.
+pub fn image_id(reference: &str) -> Result<String, String> {
+    let raw = podman_stdout(&["image", "inspect", "--format", "{{.Id}}", reference]).map_err(
+        |error| {
+            format!(
+                "gateway image {reference:?} is not present ({error}); build it with \
+                 scripts/build-gateway-image.sh (or set AGENTJAIL_GATEWAY_IMAGE)"
+            )
+        },
+    )?;
+    pin_image_reference(&raw).map_err(|error| format!("gateway image {reference:?}: {error}"))
+}
+
+/// Accept only a real image ID: `sha256:` plus 64 hex characters, or the 64 hex
+/// characters podman also prints. An empty answer, a tag, or anything else is
+/// refused, because "some image" is not a pin.
+pub fn pin_image_reference(resolved: &str) -> Result<String, String> {
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "the image is absent (no ID was reported), so there is nothing to run".to_string(),
+        );
+    }
+    let has_prefix = trimmed
+        .strip_prefix("sha256:")
+        .map(str::to_string)
+        .unwrap_or_else(|| trimmed.to_string());
+    if has_prefix.len() == 64 && has_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(format!("sha256:{}", has_prefix.to_ascii_lowercase()))
+    } else {
+        Err(format!(
+            "{trimmed:?} is not an image ID (expected sha256:<64 hex>); \
+             a tag is a name, and this process is the jail's only route out"
+        ))
+    }
+}
+
 /// Create (or replace) a podman secret from a value passed on stdin, so the
 /// value never appears in an argv that `ps` could show.
 pub fn secret_create(name: &str, value: &str) -> Result<(), String> {
@@ -205,6 +346,37 @@ pub fn secret_remove(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_real_image_id_is_accepted_as_a_pin() {
+        let hex = "5f78f0dfcc526190811f735720e01b3acfa401a40eb3406801a3e5a8b25d9783";
+        assert_eq!(
+            pin_image_reference(hex).expect("bare hex"),
+            format!("sha256:{hex}")
+        );
+        assert_eq!(
+            pin_image_reference(&format!("sha256:{hex}\n")).expect("prefixed"),
+            format!("sha256:{hex}")
+        );
+        assert_eq!(
+            pin_image_reference(&format!("sha256:{}", hex.to_uppercase())).expect("case folded"),
+            format!("sha256:{hex}")
+        );
+        for bad in [
+            "",
+            "   ",
+            "localhost/agentjail-gateway:1",
+            "sha256:abc",
+            &format!("{hex}ff"),
+            "sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let error = pin_image_reference(bad).expect_err(bad);
+            assert!(
+                error.contains("absent") || error.contains("not an image ID"),
+                "{bad}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn missing_path_var_means_not_found() {

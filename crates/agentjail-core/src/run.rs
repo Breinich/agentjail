@@ -1,18 +1,23 @@
 //! The run path: turn a validated profile into a `podman run` invocation.
 //!
-//! Everything here is a pure planner (it returns the argv and the secrets to
-//! inject) so it can be unit-tested without a container runtime. The CLI does
-//! the side effects: creating podman secrets and finally `exec`ing podman, so
-//! stdio, signals, and the exit code are untouched.
+//! Everything here is a pure planner (it returns argv vectors and the secrets to
+//! inject) so it can be unit-tested without a container runtime. The CLI does the
+//! side effects: creating the per-run network and class gateway, injecting
+//! podman secrets, and finally either `exec`ing podman (nothing to clean up) or
+//! supervising it (something to clean up).
 //!
-//! Deliberate limits in this increment, refused rather than half-implemented:
-//! `network.mode = "allowlist"` needs the egress gateway (next increment), and
+//! With `network.mode = "allowlist"` the jail joins a per-run internal network
+//! whose only other peer is that class's gateway, and gets `HTTPS_PROXY` /
+//! `ALL_PROXY` plus `--dns <gateway>` and `--dns-search .`.
+//!
+//! Deliberate limit, refused rather than half-implemented:
 //! `secrets[].delivery = "file"` is not offered because secrets are injected as
 //! environment variables only.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::class::{ClassConfig, PROXY_PORT};
 use crate::profile::{Agent, Mount, NetworkMode, Profile, Secret, SecretDelivery, SecretSource};
 
 /// Name of the container for one run of one profile.
@@ -34,29 +39,40 @@ pub fn secret_prefix(profile_name: &str) -> String {
     format!("agentjail-{stem}-")
 }
 
-/// The allowlist gate, also applied by `agentjail profile validate`.
-pub fn validation_blockers(profile: &Profile) -> Result<(), Vec<String>> {
-    if profile.network.mode != NetworkMode::None {
-        return Err(vec![
-            "network.mode: \"allowlist\" needs the egress gateway, which is not implemented in \
-             this increment; use mode = \"none\" (the gateway arrives with the selftest)"
-                .to_string(),
-        ]);
+/// Destinations a profile asks for that its egress class does not permit.
+///
+/// The profile's `network.egress` is a promise to the reader; the class config is
+/// the control. A profile may therefore ask for less than its class allows, never
+/// more, and `run` refuses the difference before creating anything.
+pub fn egress_outside_class(profile: &Profile, class: &ClassConfig) -> Vec<String> {
+    let mut outside = Vec::new();
+    for entry in &profile.network.egress {
+        if !class.allows(&entry.host, entry.port) {
+            outside.push(format!(
+                "network.egress: {}:{}/{} is not in egress class {:?} \
+                 (gateway/classes/{}.toml)",
+                entry.host,
+                entry.port,
+                entry.protocol.as_str(),
+                class.class,
+                class.class
+            ));
+        }
     }
-    Ok(())
+    outside
 }
 
-/// Refuse profiles this increment cannot honour, before anything starts.
+/// Refuse profiles this build cannot honour, before anything starts.
 pub fn run_blockers(profile: &Profile) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
-    if let Err(mut blockers) = validation_blockers(profile) {
-        errors.append(&mut blockers);
-    }
-    if profile.network.name.is_none() {
+    // `network.class` presence and its membership of the shipped classes are
+    // checked by profile validation; mode `none` still needs a named, existing
+    // internal network because it creates nothing.
+    if profile.network.mode == NetworkMode::None && profile.network.name.is_none() {
         errors.push(
-            "network.name: required for run: agentjail attaches to an existing network and does \
-             not create one; name an internal podman network"
+            "network.name: required for mode \"none\": agentjail attaches to an existing network \
+             and does not create one; name an internal podman network"
                 .to_string(),
         );
     }
@@ -197,6 +213,11 @@ pub fn plan_secrets(
 /// Context for building the argv.
 pub struct RunContext {
     pub container_name: String,
+    /// The internal network the jail joins. For `mode = "none"` it is the
+    /// profile's; for `mode = "allowlist"` it is the per-run class network.
+    pub network: String,
+    /// The class gateway's address on that network, when the profile has egress.
+    pub gateway_ip: Option<String>,
     pub selinux: bool,
     pub term: Option<String>,
 }
@@ -234,8 +255,17 @@ pub fn podman_args(
     ]);
     let nofile = profile.resources.effective_nofile();
     args.extend(["--ulimit".into(), format!("nofile={nofile}:{nofile}")]);
-    if let Some(network) = &profile.network.name {
-        args.extend(["--network".into(), network.clone()]);
+    args.extend(["--network".into(), context.network.clone()]);
+    if let Some(gateway) = &context.gateway_ip {
+        // The gateway is the resolver as well as the proxy, and the search
+        // domain is emptied so a host search domain cannot resolve a name the
+        // class does not allow.
+        args.extend(["--dns".into(), gateway.clone()]);
+        args.extend(["--dns-search".into(), ".".into()]);
+        let proxy = format!("http://{gateway}:{PROXY_PORT}");
+        for name in ["HTTPS_PROXY", "ALL_PROXY", "https_proxy", "all_proxy"] {
+            args.extend(["--env".into(), format!("{name}={proxy}")]);
+        }
     }
 
     // Bounded writable scratch only: /tmp and /run always, with profile sizes
@@ -333,6 +363,62 @@ pub fn podman_args(
     } else {
         Err(errors)
     }
+}
+
+/// Where the class config lands inside the gateway container.
+pub const CONTAINER_CLASS_CONFIG: &str = "/etc/agentjail/class.toml";
+
+/// Everything one gateway container needs to be started.
+pub struct GatewayContext {
+    pub container_name: String,
+    /// The gateway image **by ID** (`sha256:…`), never by tag: the tag is a name
+    /// and this process is the jail's only route out.
+    pub image_id: String,
+    /// Host path of the committed class config, bind-mounted read-only.
+    pub class_config: String,
+    /// The per-run internal network the jail and the gateway share.
+    pub network: String,
+    /// The gateway's own outbound leg. The jail never gets this network.
+    pub egress_network: String,
+    pub jail_id: String,
+    pub selinux: bool,
+}
+
+/// `podman run -d ...` for the class gateway.
+///
+/// The gateway is dual-homed on purpose: the internal network is where the jail
+/// can reach it, and the egress network is how it reaches the destinations the
+/// class allows. The jail is single-homed, so a bypass has nowhere to go.
+pub fn gateway_args(context: &GatewayContext) -> Vec<String> {
+    let mut args: Vec<String> = vec!["run".into(), "--detach".into(), "--rm".into()];
+    args.extend(["--name".into(), context.container_name.clone()]);
+    args.extend(["--pull=never".into()]);
+    args.extend(["--read-only".into()]);
+    // No capabilities except the one that binds :53 as a non-root uid.
+    args.extend(["--cap-drop=ALL".into()]);
+    args.extend(["--cap-add=NET_BIND_SERVICE".into()]);
+    args.extend(["--security-opt=no-new-privileges".into()]);
+    args.extend(["--network".into(), context.network.clone()]);
+    args.extend(["--network".into(), context.egress_network.clone()]);
+    let mut option = "ro".to_string();
+    if context.selinux {
+        option.push_str(",Z");
+    }
+    args.extend([
+        "--mount".into(),
+        format!(
+            "type=bind,source={},destination={CONTAINER_CLASS_CONFIG},{option}",
+            context.class_config
+        ),
+    ]);
+    args.push(context.image_id.clone());
+    args.extend([
+        "--config".into(),
+        CONTAINER_CLASS_CONFIG.to_string(),
+        "--jail-id".into(),
+        context.jail_id.clone(),
+    ]);
+    args
 }
 
 /// Expand `{workdir}` / `{home}` in agent args (the launcher does the same at
@@ -454,6 +540,8 @@ args = ["-lc", "echo {workdir}"]
     fn context() -> RunContext {
         RunContext {
             container_name: "agentjail-test-1".to_string(),
+            network: "agentjail-test".to_string(),
+            gateway_ip: None,
             selinux: false,
             term: Some("xterm-256color".to_string()),
         }
@@ -513,6 +601,8 @@ args = ["-lc", "echo {workdir}"]
 
         let labelled = RunContext {
             container_name: "agentjail-test-1".to_string(),
+            network: "agentjail-test".to_string(),
+            gateway_ip: None,
             selinux: true,
             term: None,
         };
@@ -531,19 +621,69 @@ args = ["-lc", "echo {workdir}"]
     }
 
     #[test]
-    fn allowlist_profiles_are_refused_with_a_gateway_message() {
+    fn an_allowlist_profile_needs_no_network_name_and_a_jail_with_egress_gets_the_proxy() {
         let text = PROFILE
             .replace("mode = \"none\"", "mode = \"allowlist\"")
             .replace("dns = \"none\"", "dns = \"gateway\"")
+            .replace("name = \"agentjail-test\"\n", "")
+            .replace("class = ", "")
             .replace(
                 "[[mounts]]",
-                "[[network.egress]]\nhost = \"api.example.com\"\nport = 443\n\n[[mounts]]",
+                "class = \"model\"\n\n[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n\n[[mounts]]",
             );
         let profile = parse_and_validate(&text).expect("schema-valid allowlist profile");
-        let errors = run_blockers(&profile).expect_err("must refuse");
+        run_blockers(&profile).expect("an allowlist profile with a class is runnable");
+
+        let class = crate::class::ClassConfig::parse(
+            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nallow = [\"api.anthropic.com:443\"]\n",
+        )
+        .expect("class config");
+        assert!(egress_outside_class(&profile, &class).is_empty());
+
+        let egress_context = RunContext {
+            container_name: "agentjail-test-1".to_string(),
+            network: "agentjail-test-42-model".to_string(),
+            gateway_ip: Some("10.89.0.2".to_string()),
+            selinux: false,
+            term: None,
+        };
+        let args = podman_args(&profile, &egress_context, &[], &[]).expect("argv");
+        let joined = args.join(" ");
+        for expected in [
+            "--network agentjail-test-42-model",
+            "--dns 10.89.0.2",
+            "--dns-search .",
+            "--env HTTPS_PROXY=http://10.89.0.2:3128",
+            "--env ALL_PROXY=http://10.89.0.2:3128",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing {expected:?} in {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_destination_outside_the_class_is_refused() {
+        let text = PROFILE
+            .replace("mode = \"none\"", "mode = \"allowlist\"")
+            .replace("dns = \"none\"", "dns = \"gateway\"")
+            .replace("name = \"agentjail-test\"\n", "")
+            .replace(
+                "[[mounts]]",
+                "class = \"model\"\n\n[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n\n[[mounts]]",
+            );
+        let profile = parse_and_validate(&text).expect("valid");
+        let class = crate::class::ClassConfig::parse(
+            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nallow = [\"api.openai.com:443\"]\n",
+        )
+        .expect("class config");
+        let outside = egress_outside_class(&profile, &class);
+        assert_eq!(outside.len(), 1);
+        assert!(outside[0].contains("api.anthropic.com:443"), "{outside:#?}");
         assert!(
-            errors.iter().any(|error| error.contains("egress gateway")),
-            "{errors:#?}"
+            outside[0].contains("gateway/classes/model.toml"),
+            "{outside:#?}"
         );
     }
 

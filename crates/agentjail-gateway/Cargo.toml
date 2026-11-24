@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "DNS and CONNECT egress gateway: the jail's only route out"
+description = "DNS and CONNECT egress gateway: the jail's only route out, one instance per class"
 
 [[bin]]
 name = "agentjail-gateway"
