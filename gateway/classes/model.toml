@@ -35,8 +35,18 @@ max_connections = 8
 address_policy = "public"
 
 # `host` means port 443. `*.suffix` covers subdomains only, never the apex.
+#
+# Every host here is one an agent's own model traffic needs; a name that is
+# missing does not degrade the agent, it stops it. A jailed agent whose class
+# is wrong starts, lists its tools, and then cannot answer a single prompt —
+# the failure looks like a broken agent, not like a missing allowlist entry.
+#
+# opencode.ai: the opencode zen gateway (`/inference/go/…`) used by Pi's
+# `opencode-go` provider. Verified by driving one real turn through a CONNECT
+# proxy and reading the CONNECT line it emits.
 allow = [
   "api.anthropic.com:443",
+  "opencode.ai:443",
   "console.anthropic.com:443",
   "statsig.anthropic.com:443",
   "api.openai.com:443",
