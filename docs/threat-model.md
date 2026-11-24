@@ -269,6 +269,16 @@ remedy: copy the runtime into the image, or into a normal directory that is
 itself a bind mount. Treating such a mount as "mostly working" would be worse
 than refusing it.
 
+### Mount paths are normalised lexically, not resolved
+
+The validator normalises `mounts[].source`, `mounts[].target`, `home`, `workdir`,
+`resources.tmpfs` keys, and the containment check for `secrets[].target` as
+text (`.`, `..`, `//`, trailing `/`), deliberately without touching the
+filesystem: it refuses the runtime surface (`/proc`, `/sys`, `/dev`, `/run`) and
+the jail home by spelling, not by inode, so a source whose parent directory is a
+symlink can still resolve to a different path at run time than the one the
+validator checked.
+
 ### Egress is implemented, and its limits are stated where they bite
 
 `network.mode = "allowlist"` runs. The proofs in `scripts/prove-egress-classes.sh`

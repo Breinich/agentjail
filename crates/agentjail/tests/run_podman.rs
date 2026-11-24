@@ -585,3 +585,115 @@ args = ["-lc", "printf 'started\n'; sleep 60"]
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// The finding's reproduction, against the fixed build.
+///
+/// `mounts[].target` used to be compared as a plain string (`"/proc" == target`)
+/// and handed to podman verbatim by `podman_args`. So `//proc`, `/proc/` and
+/// `/work/../proc` all validated, and the jail's own `/proc` was replaced by the
+/// host's: the pid-namespace count inside the jail became the host's. `source =
+/// "/proc"` did the same at any target, and a `,` in a path went straight into
+/// podman's `--mount` option parser.
+///
+/// Every one of those spellings must now be refused by validation, before a
+/// container exists, and the ordinary jail must still see only its own
+/// processes.
+#[test]
+#[ignore = "requires rootless podman and the local base image"]
+fn every_spelling_of_a_runtime_path_mount_is_refused_before_a_container_exists() {
+    let dir = tmpdir("mount-canon");
+    let network = network_name("mount-canon");
+    create_network(&network, true);
+    let host_source = dir.to_str().expect("host path").to_string();
+
+    let cases = [
+        (
+            "proc-source",
+            "/proc",
+            "//proc",
+            "refusing to bind the host's",
+        ),
+        (
+            "proc-target",
+            &host_source,
+            "/work/../proc",
+            "refusing to mount over",
+        ),
+        (
+            "dev-source",
+            "/dev",
+            "/work/dev",
+            "refusing to bind the host's",
+        ),
+        (
+            "home-target",
+            &host_source,
+            "/home/agent/",
+            "is the jail home",
+        ),
+        (
+            "option-syntax",
+            &host_source,
+            "/work/x,bind-propagation=shared",
+            "podman reads as --mount option syntax",
+        ),
+    ];
+    for (label, source, target, expected) in cases {
+        let path = profile(
+            &dir,
+            label,
+            &network,
+            &format!(
+                "command = \"sh\"\nargs = [\"-lc\", \"echo should-not-run\"]\n\n\
+                 [[mounts]]\nsource = \"{source}\"\ntarget = \"{target}\"\n"
+            ),
+        );
+        let output = agentjail(&["run", path.to_str().expect("path")], &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{label}: {stderr}");
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+        assert!(
+            no_agentjail_containers(&format!("agentjail-{label}-")),
+            "{label}: the refusal created a container"
+        );
+        println!(
+            "refused {label}: source={source} target={target} -> {}",
+            stderr.lines().find(|l| l.contains(expected)).unwrap_or("-")
+        );
+    }
+
+    // The number the reproduction turned on. Under the old build the first case
+    // produced a jail whose count equalled the host's, because /proc was the
+    // host's /proc.
+    let host_pids = numeric_proc_entries(Path::new("/proc"));
+    let path = profile(
+        &dir,
+        "pid-count",
+        &network,
+        r#"command = "sh"
+args = ["-lc", "ls -d /proc/[0-9]* | wc -l"]"#,
+    );
+    let output = agentjail(&["run", path.to_str().expect("path")], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let jail_pids: usize = stdout
+        .trim()
+        .lines()
+        .last()
+        .and_then(|line| line.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no pid count from the jail: {stdout}"));
+    println!("pid count: jail={jail_pids} host={host_pids}");
+    assert!(
+        jail_pids < host_pids,
+        "the jail saw the host's process table: jail={jail_pids} host={host_pids}"
+    );
+
+    remove_network(&network);
+}
+
+fn numeric_proc_entries(path: &Path) -> usize {
+    std::fs::read_dir(path)
+        .expect("read /proc")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name.to_string_lossy().chars().all(|c| c.is_ascii_digit()))
+        .count()
+}

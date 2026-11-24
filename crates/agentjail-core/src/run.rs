@@ -613,6 +613,58 @@ args = ["-lc", "echo {workdir}"]
     }
 
     #[test]
+    fn the_argv_carries_the_normalised_tmpfs_path() {
+        // Same shape as the mount destination above: the key the validator saw
+        // is the key podman gets, and the default `/tmp` entry is not emitted
+        // twice because the spelled-out key is the same path.
+        let text = PROFILE.replace(
+            "[resources.tmpfs]\n\"/tmp\"",
+            "[resources.tmpfs]\n\"/tmp/.//\"",
+        );
+        let profile: Profile = toml::from_str(&text).expect("typed profile");
+        assert_eq!(
+            profile.resources.tmpfs.keys().collect::<Vec<_>>(),
+            vec!["/tmp"]
+        );
+        let args = podman_args(&profile, &context(), &[], &[]).expect("argv");
+        let tmpfs: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("/tmp:") || arg.starts_with("/run:"))
+            .collect();
+        assert_eq!(
+            tmpfs,
+            vec![
+                "/tmp:rw,noexec,nosuid,nodev,size=32m",
+                "/run:rw,noexec,nosuid,nodev,size=16m"
+            ],
+            "{args:#?}"
+        );
+    }
+
+    #[test]
+    fn the_argv_carries_the_normalised_destination_not_the_raw_spelling() {
+        // Deliberately not `parse_and_validate`: validation refuses this target,
+        // and the point here is that the argv builder cannot emit the raw string
+        // even for a profile that never passed through the validator. A refactor
+        // that re-reads the raw spelling would pass every validator test and
+        // still hand podman `/work/../proc`.
+        let text = PROFILE.replace("target = \"/work/tmp\"", "target = \"/work/../proc\"");
+        let profile: Profile = toml::from_str(&text).expect("typed profile");
+        assert_eq!(profile.mounts[0].target, "/proc");
+        let args = podman_args(&profile, &context(), &[], &[]).expect("argv");
+        let mounts: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("type=bind,"))
+            .collect();
+        assert_eq!(mounts.len(), 1, "{args:#?}");
+        assert_eq!(mounts[0], "type=bind,source=/tmp,destination=/proc,ro");
+        assert!(
+            !mounts[0].contains(".."),
+            "the raw spelling reached the argv: {mounts:?}"
+        );
+    }
+
+    #[test]
     fn missing_required_mount_fails_before_start() {
         let mut profile = profile();
         profile.mounts[0].source = "/definitely/missing/agentjail".to_string();

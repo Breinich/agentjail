@@ -151,9 +151,23 @@ podman image inspect --format '{{.Digest}}' localhost/agentjail-base:1
 
 Semantic rules:
 
-- Two mounts may not share a `target`.
-- `target` may not be `/`, `/proc`, `/sys`, `/dev`, or `/run`, and may not equal
+- `source` and `target` are **lexically normalised** when the profile is parsed:
+  `.`, `..`, repeated `/`, and a trailing `/` collapse, so `/proc/`, `//proc`,
+  and `/work/../proc` are one string. There is no filesystem resolution and no
+  symlink following: a source may not exist yet, and neither side is read the
+  way the host would read it. Validation, `profile show`, and the podman argv
+  all use that one normalised string. Because it is lexical, `..` after a
+  symlink is collapsed as text (`/a/link/../b` becomes `/a/b`), which is not
+  what the kernel would do: write the path you mean.
+- Two mounts may not share a `target` (compared after normalisation).
+- `target` may not be `/`, `/proc`, `/sys`, `/dev`, or `/run` (after
+  normalisation, so every traversal spelling is refused), and may not equal
   `home`.
+- `source` may not be `/`, `/proc`, `/sys`, `/dev`, or `/run` either: those are
+  the host's own runtime surface (host processes, devices, kernel state), not a
+  data path.
+- Neither `source` nor `target` may contain `,` or `=`: both reach podman's
+  `--mount` option parser, where those characters separate options.
 - **FUSE-backed sources are rejected**: AppImage runtime mounts (`/tmp/.mount_*`),
   AppImage files (`*.AppImage`), gvfs and document-portal mounts
   (`/run/user/*/gvfs`, `/run/user/*/doc`), and `/dev/fuse`. `crun` cannot
@@ -214,7 +228,9 @@ Semantics:
   Nothing is written to the image, to a bind mount, or to the jail filesystem.
 - `delivery = "file"` stages the value on a **size-limited tmpfs** and refuses
   any target that is not under a declared tmpfs, so a secret can never land on a
-  bind mount or the image's writable layer.
+  bind mount or the image's writable layer. The containment check compares
+  normalised paths: `/tmp/../etc/shadow` starts with `/tmp` as text but not as a
+  path, and is refused.
 - Two secrets may not share a `target`.
 - `mode` is only valid with `delivery = "file"`; it is rejected for `env`.
 - `agentjail run --no-secrets` resolves none of them. A profile with secrets
@@ -276,8 +292,11 @@ entries when a task actually fails, not pre-emptively.
 
 | `tmpfs` | table | `{}` | Absolute in-jail path → size (`"/tmp" = "64m"`). |
 
-Semantic rules: tmpfs keys must be absolute paths, and every size must match
-the size pattern; `run` mounts each as a bounded tmpfs.
+Semantic rules: tmpfs keys are lexically normalised like every other path
+(`/tmp/`, `//tmp` and `/tmp/./x/..` are one entry, and two spellings of one path
+are refused rather than silently collapsed), they must be absolute and may not
+contain `,` or `=`, because each key becomes `--tmpfs <path>:rw,...` option text;
+every size must match the size pattern; `run` mounts each as a bounded tmpfs.
 
 There is deliberately **no `disk` field**: the rootfs is mounted read-only, so
 the only writable space is this scratch. "Writable scratch" is therefore the

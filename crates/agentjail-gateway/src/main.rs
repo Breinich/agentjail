@@ -11,8 +11,9 @@
 //!   then dials it directly reaches its own loopback and fails, instead of
 //!   reaching the destination and bypassing the proxy.
 //! * **CONNECT**: permits only `host:port` pairs on that allowlist, relays the
-//!   bytes, and logs one audit line per connection on the audit stream. Denials
-//!   are logged too: they are the security signal.
+//!   bytes, and logs the decision when it is made: `decision=allow` as soon as
+//!   the connection exists, `decision=allow-close` with the byte counts when it
+//!   ends. Denials are logged too: they are the security signal.
 //!
 //! Nothing is decided by an ACL inside a shared proxy: the class is the network
 //! the jail is joined to, and the jail cannot change its own membership.

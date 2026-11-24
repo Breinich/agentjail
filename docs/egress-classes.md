@@ -95,11 +95,14 @@ rebuild/redeploy the gateway image — not to the agent's environment.
 
 ## Audit
 
-One line per connection, on a stream **separate** from the DNS log:
+Two lines per **allowed** connection, one per denial, on a stream **separate**
+from the DNS log:
 
 ```text
 ts=1795477011164 class=model jail=proof-target-2463051 peer=10.89.6.2:37888 \
-  dest=agentjail-proof-target-1124:9001 decision=allow reason=- bytes=0/16
+  dest=agentjail-proof-target-1124:9001 decision=allow reason=- bytes=0/0
+ts=1795477011164 class=model jail=proof-target-2463051 peer=10.89.6.2:37889 \
+  dest=agentjail-proof-target-1124:9001 decision=allow-close reason=- bytes=0/16
 ts=1795477011167 class=model jail=proof-target-2463051 peer=10.89.6.2:37898 \
   dest=agentjail-proof-target-1124:9002 decision=deny reason=not-in-class bytes=0/0
 ```
@@ -107,9 +110,15 @@ ts=1795477011167 class=model jail=proof-target-2463051 peer=10.89.6.2:37898 \
 - `ts` is Unix milliseconds; `class` and `jail` identify the policy and the run
   (`<profile>-<pid>`); `peer` is the jailed side's address; `dest` is what the
   client asked for, never rewritten.
-- `decision` is `allow` or `deny`; `bytes` is `up/down`, and `0/0` for a denial.
-- An allowed connection is logged when it closes, so `bytes` is the whole
-  connection. A denial is logged as it happens.
+- `decision` is `allow`, `allow-close`, or `deny`; `bytes` is `up/down`, and
+  `0/0` on a denial.
+- **A decision is logged when it is made, not when the connection ends.**
+  `decision=allow` is written the moment the outbound connection exists (its
+  `bytes` is always `0/0`), so a tunnel that is established and then reset, or a
+  gateway torn down mid-relay, still leaves a line — the case an incident review
+  looks for. A denial is written at decision time for the same reason.
+- `decision=allow-close` carries the whole-connection byte counts, and is the
+  only line that can be missing: it is written when the relay ends.
 - Denials are not noise. They are the signal that something in the jail is trying
   to leave by a route it was not given.
 
