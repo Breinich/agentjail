@@ -232,8 +232,10 @@ pub struct Resources {
     pub pids: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nofile: Option<u64>,
-    /// Absolute in-jail path -> size, e.g. `"/tmp" = "64m"`.
-    #[serde(default)]
+    /// Absolute in-jail path -> size, e.g. `"/tmp" = "64m"`. Keys are
+    /// normalised by deserialisation like every other path, so the argv cannot
+    /// carry a spelling the validator never saw.
+    #[serde(default, deserialize_with = "normalized_tmpfs")]
     pub tmpfs: BTreeMap<String, String>,
 }
 
@@ -471,6 +473,27 @@ where
 {
     let raw = String::deserialize(deserializer)?;
     Ok(normalize_path(&raw))
+}
+
+/// The same for the tmpfs map's keys. Two spellings of one path are one entry,
+/// so `/tmp` and `/tmp/` together are a profile mistake and are refused here
+/// rather than silently collapsed: one of the two sizes would disappear.
+fn normalized_tmpfs<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let raw = BTreeMap::<String, String>::deserialize(deserializer)?;
+    let mut tmpfs = BTreeMap::new();
+    for (path, size) in raw {
+        let path = normalize_path(&path);
+        if tmpfs.insert(path.clone(), size).is_some() {
+            return Err(D::Error::custom(format!(
+                "duplicate tmpfs path {path:?} after normalisation; declare it once"
+            )));
+        }
+    }
+    Ok(tmpfs)
 }
 
 /// Parse and fully validate a profile document.
@@ -785,7 +808,10 @@ fn secret_errors(secrets: &[Secret], tmpfs: &BTreeMap<String, String>) -> Vec<St
                     errors.push(format!(
                         "secrets[{index}].target: file delivery needs an absolute path"
                     ));
-                } else if !tmpfs.keys().any(|path| is_inside(&secret.target, path)) {
+                } else if !tmpfs
+                    .keys()
+                    .any(|path| is_inside(&normalize_path(&secret.target), path))
+                {
                     let declared = if tmpfs.is_empty() {
                         "none".to_string()
                     } else {
@@ -950,6 +976,14 @@ fn resource_errors(resources: &Resources) -> Vec<String> {
         if !path.starts_with('/') {
             errors.push(format!(
                 "resources.tmpfs: {path:?} is not an absolute in-jail path"
+            ));
+        }
+        // The key becomes podman option text (`--tmpfs <path>:rw,...`), so it
+        // may not carry the characters that separate options - the same rule as
+        // `mounts[].source`/`target`, one field over.
+        if path.contains(',') || path.contains('=') {
+            errors.push(format!(
+                "resources.tmpfs: {path:?} contains ',' or '=', which podman reads as --tmpfs option syntax; a path must be only a path"
             ));
         }
         if !is_size(size) {
@@ -1405,6 +1439,67 @@ args = ["-lc", "true"]
         assert_error(&text, "workdir and home must differ");
         let text = MINIMAL.replace("workdir = \"/work\"", "workdir = \"/work/..\"");
         assert_error(&text, "must not be the jail root");
+    }
+
+    #[test]
+    fn tmpfs_key_option_syntax_is_refused() {
+        // The key becomes `--tmpfs <path>:rw,...` option text, so it may not
+        // carry the characters that separate options.
+        for path in ["/tmp,bind-propagation=shared", "/tmp/mode=1777"] {
+            let text = format!("{MINIMAL}\n[resources]\ntmpfs = {{ \"{path}\" = \"64m\" }}\n");
+            assert_error(&text, "podman reads as --tmpfs option syntax");
+        }
+    }
+
+    #[test]
+    fn tmpfs_keys_are_normalised_and_a_second_spelling_is_refused() {
+        let text = format!("{MINIMAL}\n[resources]\ntmpfs = {{ \"/tmp/./scratch/\" = \"64m\" }}\n");
+        let profile = parse_and_validate(&text).expect("valid");
+        assert_eq!(
+            profile.resources.tmpfs.keys().collect::<Vec<_>>(),
+            vec!["/tmp/scratch"]
+        );
+        assert_eq!(
+            profile.effective_json()["resources"]["tmpfs"]["/tmp/scratch"],
+            "64m"
+        );
+
+        // Two spellings of one path would collapse into one entry and silently
+        // lose a size, so it is refused instead.
+        let text = format!(
+            "{MINIMAL}\n[resources]\ntmpfs = {{ \"/tmp\" = \"64m\", \"/tmp/\" = \"128m\" }}\n"
+        );
+        assert_error(&text, "duplicate tmpfs path");
+    }
+
+    #[test]
+    fn tmpfs_sizes_must_stay_sizes() {
+        for size in ["64m,exec", "64m,size=1g", "=64m", "64m=1g"] {
+            let text = format!("{MINIMAL}\n[resources]\ntmpfs = {{ \"/tmp\" = \"{size}\" }}\n");
+            let found = errors(&text);
+            assert!(
+                found.iter().any(|error| error.contains("is not a size")),
+                "{size}: {found:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_secret_target_cannot_escape_its_tmpfs_by_traversal() {
+        // `/tmp/../etc/shadow` starts with the declared tmpfs as text but not as
+        // a path: the containment check must run on the normalised form.
+        let text = format!(
+            "{MINIMAL}\n[resources]\ntmpfs = {{ \"/tmp\" = \"64m\" }}\n\n[[secrets]]\nsource = \"file\"\nref = \"/srv/secret\"\ndelivery = \"file\"\ntarget = \"/tmp/../etc/shadow\"\n"
+        );
+        assert_error(&text, "not inside a declared tmpfs");
+
+        // And a traversal spelling of the declared tmpfs still holds its own
+        // contents, because both sides are compared normalised.
+        let text = format!(
+            "{MINIMAL}\n[resources]\ntmpfs = {{ \"/tmp/../tmp/\" = \"64m\" }}\n\n[[secrets]]\nsource = \"file\"\nref = \"/srv/secret\"\ndelivery = \"file\"\ntarget = \"/tmp/secrets/x\"\n"
+        );
+        let profile = parse_and_validate(&text).expect("valid");
+        assert_eq!(profile.secrets[0].target, "/tmp/secrets/x");
     }
 
     #[test]

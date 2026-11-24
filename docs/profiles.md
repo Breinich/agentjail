@@ -228,7 +228,9 @@ Semantics:
   Nothing is written to the image, to a bind mount, or to the jail filesystem.
 - `delivery = "file"` stages the value on a **size-limited tmpfs** and refuses
   any target that is not under a declared tmpfs, so a secret can never land on a
-  bind mount or the image's writable layer.
+  bind mount or the image's writable layer. The containment check compares
+  normalised paths: `/tmp/../etc/shadow` starts with `/tmp` as text but not as a
+  path, and is refused.
 - Two secrets may not share a `target`.
 - `mode` is only valid with `delivery = "file"`; it is rejected for `env`.
 - `agentjail run --no-secrets` resolves none of them. A profile with secrets
@@ -290,8 +292,11 @@ entries when a task actually fails, not pre-emptively.
 
 | `tmpfs` | table | `{}` | Absolute in-jail path → size (`"/tmp" = "64m"`). |
 
-Semantic rules: tmpfs keys must be absolute paths, and every size must match
-the size pattern; `run` mounts each as a bounded tmpfs.
+Semantic rules: tmpfs keys are lexically normalised like every other path
+(`/tmp/`, `//tmp` and `/tmp/./x/..` are one entry, and two spellings of one path
+are refused rather than silently collapsed), they must be absolute and may not
+contain `,` or `=`, because each key becomes `--tmpfs <path>:rw,...` option text;
+every size must match the size pattern; `run` mounts each as a bounded tmpfs.
 
 There is deliberately **no `disk` field**: the rootfs is mounted read-only, so
 the only writable space is this scratch. "Writable scratch" is therefore the
