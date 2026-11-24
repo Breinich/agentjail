@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::address::AddressPolicy;
+
 /// The classes this build ships. `run` refuses anything else, so a profile
 /// cannot invent a class whose allowlist nobody reviewed.
 pub const CLASSES: [&str; 3] = ["model", "external", "internal"];
@@ -127,6 +129,16 @@ struct RawClass {
     dns_log: String,
     #[serde(default)]
     allow: Vec<String>,
+    /// Bytes this jail may move through the gateway, both directions together.
+    /// Required: an allowlisted destination with no size limit is an
+    /// exfiltration channel with a receipt.
+    max_bytes: Option<u64>,
+    /// Concurrent CONNECT tunnels this jail may hold open. Required for the
+    /// same reason.
+    max_connections: Option<usize>,
+    /// Which address ranges an allowlisted name may resolve to.
+    #[serde(default)]
+    address_policy: AddressPolicy,
 }
 
 fn dash() -> String {
@@ -142,6 +154,9 @@ pub struct ClassConfig {
     pub audit_log: String,
     pub dns_log: String,
     pub allow: Vec<AllowEntry>,
+    pub max_bytes: u64,
+    pub max_connections: usize,
+    pub address_policy: AddressPolicy,
 }
 
 impl ClassConfig {
@@ -186,6 +201,44 @@ impl ClassConfig {
             }
         }
 
+        let max_bytes = match raw.max_bytes {
+            Some(bytes) if bytes > 0 => bytes,
+            Some(_) => {
+                errors.push(
+                    "max_bytes: must be greater than 0; a class with no byte budget is an \
+                     exfiltration channel"
+                        .to_string(),
+                );
+                0
+            }
+            None => {
+                errors.push(
+                    "max_bytes: required, in bytes, both directions together per jail; a class \
+                     with no byte budget is an exfiltration channel"
+                        .to_string(),
+                );
+                0
+            }
+        };
+        let max_connections = match raw.max_connections {
+            Some(count) if count > 0 => count,
+            Some(_) => {
+                errors.push(
+                    "max_connections: must be greater than 0; a class with no cap has no cap"
+                        .to_string(),
+                );
+                0
+            }
+            None => {
+                errors.push(
+                    "max_connections: required, concurrent CONNECT tunnels per jail; a class with \
+                     no cap has no cap"
+                        .to_string(),
+                );
+                0
+            }
+        };
+
         if errors.is_empty() {
             Ok(ClassConfig {
                 class: raw.class,
@@ -195,6 +248,9 @@ impl ClassConfig {
                 audit_log: raw.audit_log,
                 dns_log: raw.dns_log,
                 allow,
+                max_bytes,
+                max_connections,
+                address_policy: raw.address_policy,
             })
         } else {
             Err(errors)
@@ -288,6 +344,8 @@ mod tests {
 class = "model"
 listen = "0.0.0.0:3128"
 dns = "0.0.0.0:53"
+max_bytes = 1048576
+max_connections = 4
 allow = ["api.example.com:443", "*.mirror.example.net:443", "plain.example.org"]
 "#;
 
@@ -360,5 +418,50 @@ allow = ["api.example.com:443", "*.mirror.example.net:443", "plain.example.org"]
         assert_eq!(config.dns_policy, DnsPolicy::Allowlist);
         let config = ClassConfig::parse(&format!("{MODEL}dns_policy = \"off\"\n")).expect("valid");
         assert_eq!(config.dns_policy, DnsPolicy::Off);
+    }
+
+    #[test]
+    fn the_limits_are_required_and_positive() {
+        let config = ClassConfig::parse(MODEL).expect("valid");
+        assert_eq!(config.max_bytes, 1_048_576);
+        assert_eq!(config.max_connections, 4);
+
+        for (key, value, expected) in [
+            ("max_bytes", "0", "greater than 0"),
+            ("max_connections", "0", "greater than 0"),
+        ] {
+            let text = MODEL.replace(
+                &format!(
+                    "{key} = {}",
+                    if key == "max_bytes" { "1048576" } else { "4" }
+                ),
+                &format!("{key} = {value}"),
+            );
+            let errors = ClassConfig::parse(&text).expect_err(key);
+            assert!(errors[0].contains(expected), "{key}: {errors:#?}");
+        }
+
+        for key in ["max_bytes", "max_connections"] {
+            let text = MODEL.replace(
+                &format!(
+                    "{key} = {}",
+                    if key == "max_bytes" { "1048576" } else { "4" }
+                ),
+                "",
+            );
+            let errors = ClassConfig::parse(&text).expect_err(key);
+            assert!(errors[0].contains("required"), "{key}: {errors:#?}");
+        }
+    }
+
+    #[test]
+    fn the_address_policy_defaults_to_public_and_is_explicit_per_class() {
+        let config = ClassConfig::parse(MODEL).expect("valid");
+        assert_eq!(config.address_policy, AddressPolicy::Public);
+        let config =
+            ClassConfig::parse(&format!("{MODEL}address_policy = \"lan\"\n")).expect("valid");
+        assert_eq!(config.address_policy, AddressPolicy::Lan);
+        let config = ClassConfig::parse(&format!("{MODEL}address_policy = \"nonsense\"\n"));
+        assert!(config.is_err(), "an unknown policy is a config error");
     }
 }

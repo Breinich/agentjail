@@ -284,7 +284,7 @@ fn run_jailed(
     // uses as its outbound leg. It listens on one allowed and one denied port.
     let egress_network = format!("agentjail-selftest-egress-{}", std::process::id());
     cleanup.networks.push(egress_network.clone());
-    podman_ok(&["network", "create", &egress_network])?;
+    podman_ok(&["network", "create", "--ipv6=false", &egress_network])?;
     let target_name = format!("agentjail-selftest-target-{}", std::process::id());
     cleanup.containers.push(target_name.clone());
     let target_image = std::env::var("AGENTJAIL_SELFTEST_TARGET_IMAGE")
@@ -315,8 +315,14 @@ fn run_jailed(
     let classes = dir.join("classes");
     std::fs::create_dir_all(&classes)
         .map_err(|error| format!("cannot make class directory: {error}"))?;
+    // The fixture is a container on the egress network, so its name resolves to
+    // RFC1918 space: `address_policy = "lan"` is what lets this generated class
+    // reach it. Loopback, link-local, CGNAT and the mapped spellings stay
+    // refused, exactly as in a committed class.
     let class_config = format!(
-        "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\nallow = [\n  \"{}:{}\",\n]\n",
+        "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+         max_bytes = 67108864\nmax_connections = 8\naddress_policy = \"lan\"\n\
+         allow = [\n  \"{}:{}\",\n]\n",
         target_name, TARGET_PORT_ALLOWED
     );
     std::fs::write(classes.join("model.toml"), class_config)
@@ -374,8 +380,22 @@ fn run_jailed(
     let peer_b = format!("agentjail-selftest-peer-b-{}", std::process::id());
     cleanup.networks.push(peer_a.clone());
     cleanup.networks.push(peer_b.clone());
-    podman_ok(&["network", "create", "--internal", "--disable-dns", &peer_a])?;
-    podman_ok(&["network", "create", "--internal", "--disable-dns", &peer_b])?;
+    podman_ok(&[
+        "network",
+        "create",
+        "--internal",
+        "--disable-dns",
+        "--ipv6=false",
+        &peer_a,
+    ])?;
+    podman_ok(&[
+        "network",
+        "create",
+        "--internal",
+        "--disable-dns",
+        "--ipv6=false",
+        &peer_b,
+    ])?;
 
     let token_a = random_token("owner");
     let token_b = random_token("prober");

@@ -10,6 +10,16 @@ dns_policy = "allowlist"
 audit_log = "-"
 dns_log = "-"
 
+# Budget and cap: 1 GiB per jail both directions, 8 tunnels at a time. A
+# registry fetch is large, but it is not unlimited.
+max_bytes = 1073741824
+max_connections = 8
+
+# Public space only, for the same reason as `model`: this class fetches from
+# the internet, and an answer that lands anywhere else is a rebind, not a
+# destination somebody listed.
+address_policy = "public"
+
 allow = [
   "github.com:443",
   "api.github.com:443",

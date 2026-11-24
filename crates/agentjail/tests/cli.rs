@@ -75,7 +75,11 @@ case "$1" in
         cat "${AGENTJAIL_TEST_NETWORKS:-/dev/null}"
         ;;
       create)
-        echo "network-create $5" >> "$log"
+        # The name is the last argument whatever the flag set is.
+        last=""
+        for arg in "$@"; do last=$arg; done
+        echo "network-create $last" >> "$log"
+        echo "network-create-argv $*" >> "$log"
         ;;
       inspect)
         case "$3" in
@@ -715,26 +719,65 @@ fn allowlist_run_creates_the_class_network_and_gateway_and_then_removes_both() {
         .lines()
         .map(str::to_string)
         .collect();
-    let network = events
+    let created: Vec<String> = events
         .iter()
-        .find_map(|event| event.strip_prefix("network-create "))
+        .filter_map(|event| event.strip_prefix("network-create "))
+        .map(str::to_string)
+        .collect();
+    let network = created
+        .iter()
+        .find(|name| name.ends_with("-model"))
         .expect("a class network was created")
         .to_string();
+    let egress = created
+        .iter()
+        .find(|name| name.ends_with("-egress"))
+        .expect("the gateway's egress leg is its own network")
+        .to_string();
     assert!(
-        network.starts_with("agentjail-allowlist-") && network.ends_with("-model"),
+        network.starts_with("agentjail-allowlist-"),
         "class network is named after the profile, the pid and the class: {network}"
     );
+    assert!(
+        egress.starts_with("agentjail-allowlist-"),
+        "the egress network belongs to this run too: {egress}"
+    );
+    // IPv6 is off explicitly, on both networks, rather than left to a default.
+    for name in [&network, &egress] {
+        let argv = events
+            .iter()
+            .find(|event| {
+                event.starts_with("network-create-argv ") && event.contains(name.as_str())
+            })
+            .expect("create argv");
+        assert!(argv.contains("--ipv6=false"), "{argv}");
+    }
+    let class_argv = events
+        .iter()
+        .find(|event| event.starts_with("network-create-argv ") && event.ends_with(&network))
+        .expect("class create argv");
+    assert!(
+        class_argv.contains("--internal --disable-dns"),
+        "the class network has no route out and no runtime resolver: {class_argv}"
+    );
+
+    // Removal order: the gateway first, then its egress leg, then the class
+    // network it shared with the jail.
     assert_eq!(
         events.last().map(String::as_str),
         Some(format!("network-rm {network}").as_str()),
-        "the network is removed last: {events:?}"
+        "the class network is removed last: {events:?}"
+    );
+    assert!(
+        events.contains(&format!("network-rm {egress}")),
+        "the egress network is removed: {events:?}"
     );
     assert!(
         events.contains(&format!(
             "container-rm {}",
             network.replace("-model", "-gateway")
         )),
-        "the gateway is removed before the network: {events:?}"
+        "the gateway is removed before the networks: {events:?}"
     );
 
     // The gateway: on the class network and its own outbound leg, one capability,
@@ -755,8 +798,8 @@ fn allowlist_run_creates_the_class_network_and_gateway_and_then_removes_both() {
         );
     }
     assert!(
-        gateway.contains(&format!("--network {network} --network podman")),
-        "the gateway must be dual-homed: {gateway}"
+        gateway.contains(&format!("--network {network} --network {egress}")),
+        "the gateway must be dual-homed, on its own egress leg: {gateway}"
     );
     assert!(
         gateway.contains("gateway/classes/model.toml"),
@@ -881,4 +924,190 @@ fn a_gateway_image_that_does_not_resolve_to_an_id_is_refused() {
             "{bad}: a refuseable run created a network"
         );
     }
+}
+
+const AUDIT_LINES: &str = "\
+ts=1795477011164 class=model jail=proof-1 peer=10.89.6.2:37888 dest=api.example.com:443 decision=allow reason=- bytes=0/0 resolved=93.184.216.34 pinned=93.184.216.34
+ts=1795477011167 class=model jail=proof-1 peer=10.89.6.2:37898 dest=github.com:443 decision=deny reason=not-in-class bytes=0/0
+ts=1795477011170 class=model jail=proof-1 peer=10.89.6.2:37900 dest=api.example.com:443 decision=deny reason=byte-budget bytes=0/4096 budget=8192
+ts=1795477011175 class=model jail=proof-2 peer=10.89.6.9:41000 dest=github.com:443 decision=allow reason=- bytes=0/0 resolved=140.82.121.4 pinned=140.82.121.4
+";
+
+const DNS_LINES: &str = "\
+ts=1795477011165 class=model jail=proof-1 peer=10.89.6.2:48512 qname=api.example.com qtype=1 decision=answer reason=in-class
+ts=1795477011166 class=model jail=proof-1 peer=10.89.6.2:48513 qname=github.com qtype=1 decision=nxdomain reason=not-in-class
+";
+
+/// `agentjail audit` is the incident view: both streams, in time order, with
+/// the filters that make a specific jail's story readable.
+#[test]
+fn audit_merges_both_streams_and_filters_by_jail_and_decision() {
+    let dir = tmpdir("audit-view");
+    let audit = dir.join("audit.log");
+    let dns = dir.join("dns.log");
+    std::fs::write(&audit, AUDIT_LINES).expect("audit");
+    std::fs::write(&dns, DNS_LINES).expect("dns");
+
+    let output = run(
+        &[
+            "audit",
+            "--audit",
+            audit.to_str().unwrap(),
+            "--dns",
+            dns.to_str().unwrap(),
+        ],
+        &dir,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 6, "{}", stdout(&output));
+    // Time order across the two streams, tagged with the stream it came from.
+    assert!(
+        lines[0].starts_with("stream=audit ts=1795477011164 "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("stream=dns ts=1795477011165 "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[2].starts_with("stream=dns ts=1795477011166 "),
+        "{lines:?}"
+    );
+
+    let output = run(
+        &[
+            "audit",
+            "--audit",
+            audit.to_str().unwrap(),
+            "--dns",
+            dns.to_str().unwrap(),
+            "--jail",
+            "proof-1",
+            "--decision",
+            "deny",
+        ],
+        &dir,
+        None,
+    );
+    let text = stdout(&output);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.contains("reason=not-in-class"), "{text}");
+    assert!(text.contains("reason=byte-budget"), "{text}");
+    assert!(
+        text.contains("budget=8192"),
+        "the counter that caused it: {text}"
+    );
+    assert!(!text.contains("proof-2"), "{text}");
+
+    // Tail: the last N of the merged, filtered view.
+    let output = run(
+        &[
+            "audit",
+            "--audit",
+            audit.to_str().unwrap(),
+            "--dns",
+            dns.to_str().unwrap(),
+            "--tail",
+            "2",
+        ],
+        &dir,
+        None,
+    );
+    let text = stdout(&output);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.contains("proof-2"), "{text}");
+
+    // One stream only.
+    let output = run(
+        &[
+            "audit",
+            "--audit",
+            audit.to_str().unwrap(),
+            "--dns",
+            dns.to_str().unwrap(),
+            "--stream",
+            "dns",
+        ],
+        &dir,
+        None,
+    );
+    let text = stdout(&output);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(
+        text.lines().all(|line| line.starts_with("stream=dns ")),
+        "{text}"
+    );
+}
+
+#[test]
+fn audit_reads_the_streams_configured_for_a_class() {
+    let dir = tmpdir("audit-class");
+    let classes = dir.join("classes");
+    std::fs::create_dir_all(&classes).expect("classes");
+    let audit = dir.join("model-audit.log");
+    let dns = dir.join("model-dns.log");
+    std::fs::write(&audit, AUDIT_LINES).expect("audit");
+    std::fs::write(&dns, DNS_LINES).expect("dns");
+    std::fs::write(
+        classes.join("model.toml"),
+        format!(
+            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+             audit_log = \"{}\"\ndns_log = \"{}\"\nmax_bytes = 8192\nmax_connections = 2\n\
+             allow = [\"api.example.com:443\"]\n",
+            audit.display(),
+            dns.display()
+        ),
+    )
+    .expect("class config");
+
+    let output = run_with_env(
+        &["audit", "--class", "model", "--jail", "proof-2"],
+        &dir,
+        None,
+        &[("AGENTJAIL_CLASS_DIR", classes.to_str().unwrap())],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("proof-2"), "{text}");
+
+    // With neither a class nor a path there is nothing to read: say so rather
+    // than printing an empty report that looks like "no activity".
+    let output = run(&["audit"], &dir, None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("--class"), "{}", stderr(&output));
+}
+
+#[test]
+fn audit_reads_a_captured_stream_from_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tmpdir("audit-stdin");
+    let mut child = Command::new(binary())
+        .args(["audit", "--audit", "-", "--decision", "deny"])
+        .current_dir(&dir)
+        .env_remove("AGENTJAIL_PODMAN")
+        .env("PATH", "/nonexistent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(AUDIT_LINES.as_bytes())
+        .expect("write");
+    let output = child.wait_with_output().expect("wait");
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(
+        text.lines().all(|line| line.starts_with("stream=audit ")),
+        "{text}"
+    );
 }

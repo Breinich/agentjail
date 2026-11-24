@@ -18,6 +18,7 @@ use agentjail_core::profile::{self, NetworkMode, Profile};
 use agentjail_core::run;
 use clap::{ArgAction, Parser, Subcommand};
 
+mod audit;
 mod probe;
 mod selftest;
 
@@ -97,6 +98,9 @@ enum Command {
     /// Internal probe executed by the selftest in either executor. Not public API.
     #[command(name = "__probe", hide = true)]
     Probe(Box<ProbeArgs>),
+    /// Read the audit and DNS streams back: one merged, filtered view for an incident.
+    #[command(after_long_help = AUDIT_CONTRACT)]
+    Audit(AuditArgs),
     /// Report podman version, rootless mode, SELinux state, config paths, and a network invariant check.
     Doctor {
         /// Machine-readable output.
@@ -172,6 +176,41 @@ struct ProbeArgs {
     alloc_bytes: u64,
 }
 
+const AUDIT_CONTRACT: &str = "\
+The two gateway streams, read back in one view.
+
+  stream=audit  one line per connection decision: allow, allow-close, deny
+  stream=dns    one line per query: answer, nxdomain, refused, drop
+
+Both are `key=value` lines written by the gateway (docs/egress-classes.md). With
+no path given, the streams configured for --class are read. `--audit -` reads
+stdin, which is how a captured `podman logs` is inspected.";
+
+#[derive(clap::Args)]
+struct AuditArgs {
+    /// Egress class: whose configured streams to read, and the class to filter on.
+    #[arg(long, value_name = "CLASS")]
+    class: Option<String>,
+    /// Audit stream: a file, or `-` for stdin.
+    #[arg(long, value_name = "PATH")]
+    audit: Option<String>,
+    /// DNS stream: a file.
+    #[arg(long, value_name = "PATH")]
+    dns: Option<String>,
+    /// Only lines whose jail id is exactly this.
+    #[arg(long, value_name = "ID")]
+    jail: Option<String>,
+    /// Only lines with this decision (allow, allow-close, deny, answer, nxdomain, ...).
+    #[arg(long, value_name = "DECISION")]
+    decision: Option<String>,
+    /// Only one stream.
+    #[arg(long, value_name = "audit|dns")]
+    stream: Option<String>,
+    /// Only the last N matching lines.
+    #[arg(long, value_name = "N")]
+    tail: Option<usize>,
+}
+
 #[derive(clap::Args)]
 struct RunArgs {
     /// Profile name or path to a .toml profile.
@@ -206,6 +245,7 @@ fn dispatch(cli: Cli, env: &BTreeMap<String, String>) -> Result<u8, String> {
             ProfileAction::Show { profile } => show_command(&profile, &cli.profile_dirs, env, &cwd),
         },
         Command::Run(args) => run_command(args, &cli.profile_dirs, env, &cwd),
+        Command::Audit(args) => audit_command(args, env, &cwd),
         Command::Selftest(args) => selftest_command(args, &cli.profile_dirs, env, &cwd),
         Command::Probe(args) => {
             let _ = args.mode;
@@ -446,19 +486,112 @@ fn run_command(
     }
 }
 
+/// `agentjail audit`: read both gateway streams back.
+///
+/// Paths come from the flags, or from the class config of `--class`. A stream
+/// configured as `-` went to podman's log rather than a file, so there is
+/// nothing here to read: say so instead of printing an empty result that looks
+/// like "no activity".
+fn audit_command(
+    args: AuditArgs,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<u8, String> {
+    let streams = match args.stream.as_deref() {
+        None => audit::Streams::Both,
+        Some("audit") => audit::Streams::Audit,
+        Some("dns") => audit::Streams::Dns,
+        Some(other) => {
+            return Err(format!(
+                "--stream {other:?} is not a stream; use audit, dns, or omit it"
+            ))
+        }
+    };
+
+    let (mut audit_path, mut dns_path) = (args.audit.clone(), args.dns.clone());
+    if audit_path.is_none() && dns_path.is_none() {
+        let class = args.class.as_deref().ok_or_else(|| {
+            "give --class <class> to read its configured streams, or --audit/--dns <path>"
+                .to_string()
+        })?;
+        let (path, config) = class::load(class, &class::config_search_dirs(env, cwd))
+            .map_err(|error| format!("cannot read the streams of class {class:?}: {error}"))?;
+        eprintln!(
+            "agentjail: streams from {} (audit_log={:?}, dns_log={:?})",
+            path.display(),
+            config.audit_log,
+            config.dns_log
+        );
+        audit_path = Some(config.audit_log);
+        dns_path = Some(config.dns_log);
+    }
+
+    let mut sources: Vec<(&'static str, String)> = Vec::new();
+    for (name, path) in [(audit::AUDIT, audit_path), (audit::DNS, dns_path)] {
+        let Some(path) = path else { continue };
+        if path == "-" {
+            if name == audit::AUDIT {
+                // `podman logs <gateway> | agentjail audit --audit -`: the
+                // captured stream is stdin, and it is the audit stream.
+                let mut text = String::new();
+                use std::io::Read;
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .map_err(|error| format!("cannot read the audit stream from stdin: {error}"))?;
+                sources.push((audit::AUDIT, text));
+            } else {
+                eprintln!(
+                    "agentjail: the {name} stream is configured as \"-\" (podman's log, not a \
+                     file); capture it with `podman logs <gateway>` or set a path in the class config"
+                );
+            }
+            continue;
+        }
+        if path == "stderr" || path == "stdout" {
+            eprintln!(
+                "agentjail: the {name} stream is configured as {path:?}, which is a pipe; \
+                 capture it to a file to read it back"
+            );
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read the {name} stream {path:?}: {error}"))?;
+        sources.push((name, text));
+    }
+
+    let filter = audit::Filter {
+        jail: args.jail,
+        class: args.class,
+        decision: args.decision,
+        streams: Some(streams),
+        tail: args.tail,
+    };
+    let borrowed: Vec<(&'static str, &str)> = sources
+        .iter()
+        .map(|(stream, text)| (*stream, text.as_str()))
+        .collect();
+    let lines = audit::view(&borrowed, &filter);
+    for line in &lines {
+        println!("{}", line.render());
+    }
+    eprintln!("agentjail: {} line(s)", lines.len());
+    Ok(EXIT_OK)
+}
+
 /// Everything this run created, removed whenever the process stops: normal
-/// exit, non-zero exit, forwarded signal, or panic. Container before network,
-/// because a network cannot be removed while a peer is attached to it.
+/// exit, non-zero exit, forwarded signal, or panic. Container before networks,
+/// because a network cannot be removed while a peer is attached to it, and
+/// networks in reverse creation order.
 #[derive(Default)]
 struct RunCleanup {
     secrets: Vec<String>,
     container: Option<String>,
-    network: Option<String>,
+    networks: Vec<String>,
 }
 
 impl RunCleanup {
     fn is_empty(&self) -> bool {
-        self.secrets.is_empty() && self.container.is_none() && self.network.is_none()
+        self.secrets.is_empty() && self.container.is_none() && self.networks.is_empty()
     }
 
     fn describe(&self) -> String {
@@ -473,7 +606,7 @@ impl RunCleanup {
         if let Some(container) = &self.container {
             parts.push(format!("gateway container {container:?}"));
         }
-        if let Some(network) = &self.network {
+        for network in &self.networks {
             parts.push(format!("network {network:?}"));
         }
         parts.join(", ")
@@ -492,7 +625,7 @@ impl Drop for RunCleanup {
                 eprintln!("agentjail: warning: could not remove gateway {container:?}: {error}");
             }
         }
-        if let Some(network) = &self.network {
+        for network in self.networks.iter().rev() {
             if let Err(error) = podman::network_remove(network) {
                 eprintln!("agentjail: warning: could not remove network {network:?}: {error}");
             }
@@ -654,7 +787,6 @@ fn start_class_side(
         .unwrap_or_else(|| "localhost/agentjail-gateway:1".to_string());
     let image_id = podman::image_id(&image_ref)?;
     eprintln!("agentjail: gateway image {image_ref:?} is {image_id} (pinned by ID)");
-    let egress_network = egress_network(env)?;
 
     // Backstop for SIGKILL and host crashes: remove only what is provably dead,
     // i.e. resources of this profile whose owning pid is gone.
@@ -662,12 +794,28 @@ fn start_class_side(
 
     let network = lifecycle::network_name(profile_name, run_id, &config.class);
     podman::network_create(&network)?;
-    cleanup.network = Some(network.clone());
+    cleanup.networks.push(network.clone());
 
     // The invariant, now on the network this run created rather than one it was
-    // told about: internal, has a subnet, or nothing starts.
+    // told about: internal, has a subnet, IPv4 only, or nothing starts.
     let posture = podman::verify_network(&network)?;
     eprintln!("agentjail: preflight OK: {}", posture.describe());
+
+    // The gateway's own outbound leg: its own network, created for this run, not
+    // the host's shared default bridge. The jail never joins it.
+    let egress_network = match env
+        .get("AGENTJAIL_EGRESS_NETWORK")
+        .filter(|value| !value.is_empty())
+    {
+        Some(name) => name.clone(),
+        None => {
+            let name = lifecycle::egress_network_name(profile_name, run_id);
+            podman::egress_network_create(&name)?;
+            cleanup.networks.push(name.clone());
+            eprintln!("agentjail: gateway egress leg on its own network {name:?}");
+            name
+        }
+    };
 
     let container = lifecycle::gateway_name(profile_name, run_id);
     let argv = run::gateway_args(&run::GatewayContext {
@@ -690,27 +838,6 @@ fn start_class_side(
         config.allow.len()
     );
     Ok((network, gateway_ip))
-}
-
-/// The network the gateway uses for its own outbound leg. Never the jail's.
-fn egress_network(env: &BTreeMap<String, String>) -> Result<String, String> {
-    if let Some(name) = env
-        .get("AGENTJAIL_EGRESS_NETWORK")
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(name.clone());
-    }
-    let names = podman::network_list()?;
-    for candidate in ["podman", "bridge"] {
-        if names.iter().any(|name| name == candidate) {
-            return Ok(candidate.to_string());
-        }
-    }
-    Err(
-        "no default podman network to give the gateway its outbound leg; set \
-         AGENTJAIL_EGRESS_NETWORK"
-            .to_string(),
-    )
 }
 
 /// Remove resources of this profile whose run is gone. Never by profile alone.

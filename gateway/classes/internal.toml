@@ -13,6 +13,16 @@ dns_policy = "allowlist"
 audit_log = "-"
 dns_log = "-"
 
+# Budget and cap: LAN services are small and few, so this class is the tightest.
+max_bytes = 134217728
+max_connections = 4
+
+# `lan` is the one relaxation this build ships, and it is the reason this class
+# exists: a named LAN service resolves to RFC1918 or ULA space, so `public`
+# would refuse every name here. Loopback, link-local, CGNAT, multicast,
+# unspecified, and the IPv4-mapped spellings stay refused even here.
+address_policy = "lan"
+
 allow = [
   "git.internal:443",
   "registry.internal:443",

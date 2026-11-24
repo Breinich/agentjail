@@ -51,16 +51,22 @@ Implemented for `network.mode = "none"` (no egress). The build path:
 - **allowlist (`network.mode = "allowlist"`, `network.class = "…"`)**: before the
   jail exists, `run` creates the per-run internal network
   `agentjail-<profile>-<pid>-<class>`, verifies it with the same invariant as
-  above, starts that class's gateway container on it (`--cap-drop=ALL
-  --cap-add=NET_BIND_SERVICE`, read-only, the committed class config mounted
-  read-only), and reads its address back. The jail then gets `--network <class
-  network> --dns <gateway> --dns-search .` and `HTTPS_PROXY` / `ALL_PROXY` (and
-  the lowercase spellings) pointing at the gateway. The jail has no other route
-  and no other resolver; see `docs/egress-classes.md`. The profile's `egress`
-  must be a subset of its class allowlist, and the difference is refused before
-  anything is created. Both the network and the gateway are removed on every exit
-  path by the same `Drop` guard that removes secret entries; a `SIGKILL` leaves
-  them for the next run of the same profile to prune by dead pid.
+  above (including **IPv6 off**: a class network reporting `ipv6_enabled: true`
+  is refused), creates the gateway's own egress leg
+  `agentjail-<profile>-<pid>-egress` (its own network, not the host's shared
+  `podman` bridge), starts that class's gateway container on both
+  (`--cap-drop=ALL --cap-add=NET_BIND_SERVICE`, read-only, the committed class
+  config mounted read-only), and reads its address back. The jail then gets
+  `--network <class network> --dns <gateway> --dns-search .` and `HTTPS_PROXY` /
+  `ALL_PROXY` (and the lowercase spellings) pointing at the gateway. The jail has
+  no other route and no other resolver; see `docs/egress-classes.md`. The
+  profile's `egress` must be a subset of its class allowlist, and the difference
+  is refused before anything is created. Both networks and the gateway are
+  removed on every exit path by the same `Drop` guard that removes secret
+  entries (container, then networks in reverse creation order); a `SIGKILL`
+  leaves them for the next run of the same profile to prune by dead pid.
+  `AGENTJAIL_EGRESS_NETWORK` names an existing network for the gateway's leg
+  instead of creating one (the proof script uses it).
 
 ### Transport (a requirement, not a nicety)
 
@@ -146,6 +152,35 @@ There is no "warning and continue" mode and no start-then-kill. A `mode = "none"
 profile names an existing network (`network.name`); if it names a bridged one,
 `run` refuses. An allowlist profile names no network: `run` creates a dedicated
 internal one and verifies it the same way before starting anything.
+
+## `agentjail audit`
+
+Reads the gateway's two streams back: the audit stream (one line per connection
+decision) and the DNS stream (one line per query), merged in time order and
+filtered. This is the incident view; the streams themselves, their destinations,
+rotation and retention are described in `docs/egress-classes.md`.
+
+```sh
+agentjail audit --class model                          # both streams of a class
+agentjail audit --class model --jail proof-1 --decision deny --tail 50
+agentjail audit --audit a.log --dns d.log --stream dns
+podman logs agentjail-proof-1-gateway | agentjail audit --audit -   # captured stream
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--class <class>` | read the streams configured for that class (`audit_log`, `dns_log`) and filter on that class |
+| `--audit <path>` / `--dns <path>` | read these files instead; `--audit -` reads stdin |
+| `--jail <id>` | only lines whose `jail=` field is exactly this |
+| `--decision <d>` | only lines with this decision: `allow`, `allow-close`, `deny` (audit) or `answer`, `nxdomain`, `refused`, `drop` (DNS) |
+| `--stream audit` or `dns` | only one stream |
+| `--tail <n>` | only the last N matching lines |
+
+Output keeps the line the gateway wrote and prefixes it with the stream it came
+from (`stream=audit ts=… decision=deny reason=byte-budget budget=4096 …`), so a
+merged view is still evidence rather than a re-rendering. A stream configured as
+`-` went to the runtime's log rather than a file: `audit` says so instead of
+printing nothing, because "no lines" and "not captured" look identical otherwise.
 
 ## `agentjail selftest [profile]`
 
@@ -256,14 +291,27 @@ agentjail-gateway --config gateway/classes/model.toml --check   # print, start n
   for everything else. Loopback is deliberate — a jail that resolves and then
   dials directly reaches itself and fails closed.
 - **CONNECT (TCP)**: relays only `host:port` pairs on the allowlist; exact host or
-  `*.suffix`, port part of the match. A raw `IP:port` is refused even if listed.
-  Non-CONNECT methods are refused.
+  `*.suffix`, port part of the match. A raw `IP:port` is refused even if listed,
+  and a non-CONNECT request gets `405`, logged in the same shape as a denial.
+  The name is resolved **once**, **every** answer is checked against the class
+  `address_policy`, and the tunnel goes to a checked address — one blocked answer
+  refuses the whole name.
+- **Limits**: each jail has `max_bytes` (both directions) and `max_connections`
+  from its class config; both are required, and reaching either refuses and logs
+  with the counters (`reason=byte-budget budget=…`, `reason=connection-cap
+  connections=…/…`, `429` for the cap).
 - **Logging**: one audit line per decision (including denials) on a stream
   separate from the DNS log, with the class, the jail id, the destination, the
   decision, and the bytes. An allowed connection logs `decision=allow` when it is
-  established and `decision=allow-close` with the byte counts when it ends.
+  established (with `resolved=` and `pinned=`) and `decision=allow-close` with the
+  byte counts when it ends — or `decision=deny reason=byte-budget` when the budget
+  cut it. A panic in the proxy itself is `decision=deny reason=internal-error`,
+  so an errored proxy never looks like a connection that never happened.
 
-Full detail, including the audit line format and the residual weaknesses:
-`docs/egress-classes.md`. The proofs in `scripts/prove-egress-classes.sh` run on
-every PR.
+`--check` prints the listeners, the budget, the cap, the address policy and the
+allowlist, and starts nothing.
+
+Full detail, including the audit line format, rotation and retention, and the
+residual weaknesses: `docs/egress-classes.md`. The proofs in
+`scripts/prove-egress-classes.sh` run on every PR.
 

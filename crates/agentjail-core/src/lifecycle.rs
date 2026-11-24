@@ -30,6 +30,11 @@ pub fn gateway_name(profile_name: &str, pid: u32) -> String {
     format!("{}{pid}-gateway", profile_prefix(profile_name))
 }
 
+/// `agentjail-<profile>-<pid>-egress`: the gateway's own outbound leg.
+pub fn egress_network_name(profile_name: &str, pid: u32) -> String {
+    format!("{}{pid}-egress", profile_prefix(profile_name))
+}
+
 /// What a resource name says about the run that owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunTag {
@@ -89,6 +94,17 @@ mod tests {
         assert_eq!(
             gateway_name("my/profile", 42),
             "agentjail-my-profile-42-gateway"
+        );
+        assert_eq!(
+            egress_network_name("my/profile", 42),
+            "agentjail-my-profile-42-egress"
+        );
+        assert_eq!(
+            parse_run_name("agentjail-my-profile-42-egress", "my/profile"),
+            Some(RunTag {
+                pid: 42,
+                class: Some("egress".to_string())
+            })
         );
         assert_eq!(
             parse_run_name("agentjail-my-profile-42-model", "my/profile"),

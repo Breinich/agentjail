@@ -11,12 +11,18 @@
 #   proof 5  lifecycle: a normal, a failed and a signal-terminated run each leave
 #            no network and no gateway behind, a SIGKILLed run is cleaned up by
 #            the next run of the same profile, and no other profile's resources
-#            are touched.
+#            are touched;
+#   proof 6  the per-jail byte budget cuts a connection and logs the refusal with
+#            the counter that caused it;
+#   proof 7  the per-jail connection cap refuses a second tunnel and logs it.
 #
 # Proofs 1, 2 and 4 run against the **committed** class configs in
-# gateway/classes. Proof 3 needs a destination that answers, and CI must not
-# depend on an external host, so it uses a proof-only class config that adds one
-# loopback target this script starts. Nothing else differs.
+# gateway/classes. Proofs 3, 6 and 7 need a destination that answers, and CI must
+# not depend on an external host, so they use a proof-only class config that
+# names a target container this script starts on its own network. That config
+# sets `address_policy = "lan"` because the target's address is RFC1918;
+# `model`/`external` ship `public`, which refuses exactly that answer. Nothing
+# else differs.
 #
 # Requires: rootless podman, the static binaries, the gateway image, the pin.
 #   cargo build --locked --release --target x86_64-unknown-linux-musl -p agentjail -p agentjail-gateway
@@ -78,14 +84,20 @@ digest=$(podman image inspect --format '{{.Digest}}' "$JAIL_IMAGE")
 
 # ------------------------------------------------------------------ fixtures
 
-class_config() { # path class allow-entry...
+class_config() { # path class max-bytes max-connections address-policy allow-entry...
   path=$1
   class=$2
-  shift 2
+  max_bytes=$3
+  max_connections=$4
+  policy=$5
+  shift 5
   {
     printf 'class = "%s"\n' "$class"
     printf 'listen = "0.0.0.0:3128"\n'
     printf 'dns = "0.0.0.0:53"\n'
+    printf 'max_bytes = %s\n' "$max_bytes"
+    printf 'max_connections = %s\n' "$max_connections"
+    printf 'address_policy = "%s"\n' "$policy"
     printf 'allow = [\n'
     for entry in "$@"; do printf '  "%s",\n' "$entry"; done
     printf ']\n'
@@ -121,16 +133,38 @@ args = ["-lc"]
 EOF
 }
 
-# The jail-side helper: send one CONNECT through the proxy the jail was given and
+# The jail-side helpers: one CONNECT through the proxy the jail was given and
 # print the status line. bash /dev/tcp is used instead of curl so the image does
 # not need extra packages.
-CONNECT_FN='
-send() {
-  proxy=${HTTPS_PROXY#http://}
-  host=${proxy%%:*}
-  port=${proxy##*:}
-  printf "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" "$1" "$1" \
-    | timeout 10 bash -c "exec 3<>/dev/tcp/$host/$port; cat >&3; head -1 <&3"
+#
+# `connect_ok` retries briefly, and the reason is stated rather than hidden: the
+# fixture is addressed by podman container name, and the gateway resolves that
+# name through the embedded DNS of its egress leg, which can lag a just-started
+# container by a fraction of a second. A proof that needs a successful tunnel
+# must measure the thing it is about (the cap, the budget) and not that race. It
+# does not soften anything: a genuinely refused destination still fails on the
+# last attempt, and the printed status is the one the assertion reads.
+PROXY_LIB='
+proxy=${HTTPS_PROXY#http://}
+proxy_host=${proxy%%:*}
+proxy_port=${proxy##*:}
+
+connect() { # fd target
+  eval "exec $1<>/dev/tcp/$proxy_host/$proxy_port"
+  printf "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" "$2" "$2" >&"$1"
+  head -1 <&"$1"
+}
+
+connect_ok() { # fd target
+  attempt=0
+  while : ; do
+    status=$(connect "$1" "$2")
+    case "$status" in *" 200 "*) break ;; esac
+    attempt=$((attempt + 1))
+    [ "$attempt" -ge 5 ] && break
+    sleep 1
+  done
+  echo "$status"
 }
 '
 
@@ -163,15 +197,27 @@ run_jail() { # label profile script wait-for-log
     return
   fi
 
+  # Snapshot the gateway's streams on every poll, not only after the wait below:
+  # a run can end - and its gateway container be removed with it - before the
+  # wait finishes, and a proof cannot assert on the logs of a container that is
+  # gone. A failed capture never overwrites the last good one. DNS is on stderr
+  # and the audit stream on stdout, so one call keeps them in two separate files.
+  snapshot() {
+    if podman logs "$gateway" > "$work/$label.audit.tmp" 2> "$work/$label.dns.tmp"; then
+      mv "$work/$label.audit.tmp" "$work/$label.audit"
+      mv "$work/$label.dns.tmp" "$work/$label.dns"
+    fi
+  }
   if [ -n "$wait_for" ]; then
     deadline=$(( $(date +%s) + 30 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-      if podman logs "$gateway" 2>/dev/null | grep -q -- "$wait_for"; then break; fi
+      snapshot
+      if grep -q -- "$wait_for" "$work/$label.audit"; then break; fi
+      kill -0 "$agentjail_pid" 2>/dev/null || break
       sleep 0.5
     done
   fi
-  # DNS is on stderr and the audit stream on stdout: one call, two separate files.
-  podman logs "$gateway" > "$work/$label.audit" 2>"$work/$label.dns" || true
+  snapshot
   wait "$agentjail_pid" || fail "$label: agentjail exited non-zero ($(sed -n 1p "$work/$label.err"))"
   printf '      jail output: %s\n' "$(tr '\n' '|' < "$work/$label.out")"
 }
@@ -181,9 +227,9 @@ run_jail() { # label profile script wait-for-log
 profile_for "$work/proof-model.toml" proof-model model api.anthropic.com 443
 profile_for "$work/proof-external.toml" proof-external external github.com 443
 
-run_jail model-committed "$work/proof-model.toml" "$CONNECT_FN
-echo \"github-connect=\$(send github.com:443)\"
-echo \"anthropic-connect=\$(send api.anthropic.com:443)\"
+run_jail model-committed "$work/proof-model.toml" "$PROXY_LIB
+echo \"github-connect=\$(connect 3 github.com:443)\"
+echo \"anthropic-connect=\$(connect 3 api.anthropic.com:443)\"
 echo \"github-dns=\$(getent hosts github.com || echo nxdomain)\"
 echo done" "dest=github.com:443 decision=deny"
 
@@ -196,8 +242,8 @@ expect "$work/model-committed.audit" 'decision=deny reason=not-in-class' \
 expect "$work/model-committed.dns" 'qname=github.com qtype=1 decision=nxdomain' \
   'proof 1: the NXDOMAIN query is logged on the DNS stream'
 
-run_jail external-committed "$work/proof-external.toml" "$CONNECT_FN
-echo \"anthropic-connect=\$(send api.anthropic.com:443)\"
+run_jail external-committed "$work/proof-external.toml" "$PROXY_LIB
+echo \"anthropic-connect=\$(connect 3 api.anthropic.com:443)\"
 echo done" "dest=api.anthropic.com:443 decision=deny"
 
 expect "$work/external-committed.out" 'anthropic-connect=HTTP/1.1 403 Forbidden' \
@@ -231,8 +277,15 @@ fi
 
 say "starting the proof target on $target_net"
 podman network create "$target_net" >/dev/null
+# 9001/9002 answer one line and close; 9003 floods 1 MiB, which is what the byte
+# budget in proof 6 must cut short; 9004 answers and **stays open**, which is what
+# lets proof 7 hold one tunnel while it attempts a second. Every socket gets an
+# error handler: the budget proof ends with the gateway cutting the tunnel
+# mid-write, and an unhandled EPIPE in the fixture would kill the target
+# container and make the *next* proof fail for a reason that has nothing to do
+# with what it asserts.
 podman run -d --rm --name "$target_name" --network "$target_net" "$JAIL_IMAGE" \
-  node -e 'const net=require("net");[9001,9002].forEach(p=>net.createServer(s=>{s.end("hello from "+p+"\n")}).listen(p))' \
+  node -e 'const net=require("net");const serve=(p,fn)=>net.createServer(s=>{s.on("error",()=>{});fn(s)}).listen(p);serve(9001,s=>s.end("hello from 9001\n"));serve(9002,s=>s.end("hello from 9002\n"));const f=Buffer.alloc(1048576,120);serve(9003,s=>s.end(f));serve(9004,s=>s.write("held\n"))' \
   >/dev/null
 target_ip=""
 deadline=$(( $(date +%s) + 30 ))
@@ -248,18 +301,18 @@ done
 echo "target $target_name at $target_ip:9001 (model) and :9002 (external)"
 
 mkdir -p "$work/classes"
-class_config "$work/classes/model.toml" model "$target_name:9001"
-class_config "$work/classes/external.toml" external "$target_name:9002"
-class_config "$work/classes/internal.toml" internal "$target_name:9001"
+class_config "$work/classes/model.toml" model 268435456 8 lan "$target_name:9001"
+class_config "$work/classes/external.toml" external 268435456 8 lan "$target_name:9002"
+class_config "$work/classes/internal.toml" internal 268435456 8 lan "$target_name:9001"
 profile_for "$work/proof-target.toml" proof-target model "$target_name" 9001
 
 export AGENTJAIL_CLASS_DIR=$work/classes
 export AGENTJAIL_EGRESS_NETWORK=$target_net
 
-run_jail target "$work/proof-target.toml" "$CONNECT_FN
-echo \"allowed=\$(send $target_name:9001)\"
-echo \"denied=\$(send $target_name:9002)\"
-echo \"raw-ip=\$(send $target_ip:9001)\"
+run_jail target "$work/proof-target.toml" "$PROXY_LIB
+echo \"allowed=\$(connect_ok 3 $target_name:9001)\"
+echo \"denied=\$(connect 3 $target_name:9002)\"
+echo \"raw-ip=\$(connect 3 $target_ip:9001)\"
 set +e
 timeout 5 bash -c \"exec 3<>/dev/tcp/$target_ip/9001\" 2>/dev/null
 direct=\$?
@@ -289,6 +342,100 @@ else
   ok "proof 2: a direct dial to $target_ip:9001 fails closed from inside the jail"
   printf '      %s\n' "$(grep '^direct-dial-exit=' "$work/target.out")"
 fi
+
+# --------------------------------------- proof 6: the byte budget cuts a tunnel
+
+# The budget helper: open one tunnel to the flood port and count what comes
+# through before the gateway ends it. The target answers 1 MiB, so a tunnel that
+# is not cut delivers 1 MiB and the assertion below fails.
+BUDGET_FN='
+read_tunnel() { # target
+  # The status line goes to stderr so the count is the only thing on stdout.
+  connect_ok 3 "$1" >&2
+  timeout 20 cat <&3 | wc -c
+}
+'
+
+say "proof 6: the byte budget cuts a connection"
+class_config "$work/classes/model.toml" model 4096 8 lan "$target_name:9003"
+profile_for "$work/proof-budget.toml" proof-budget model "$target_name" 9003
+run_jail budget "$work/proof-budget.toml" "$PROXY_LIB$BUDGET_FN
+echo \"budget-bytes=\$(read_tunnel $target_name:9003)\"
+echo done" "reason=byte-budget"
+
+budget_bytes=$(sed -n 's/^budget-bytes=//p' "$work/budget.out" | tr -d ' \r')
+[ -n "$budget_bytes" ] || budget_bytes=unknown
+# The head line above may take a few bytes with it, so the exact count is not the
+# assertion; "far less than the 1 MiB the target sent" is.
+if [ "$budget_bytes" = unknown ] || [ "$budget_bytes" -ge 262144 ]; then
+  fail "proof 6: the budget did not cut the tunnel (delivered $budget_bytes of 1048576)"
+else
+  ok "proof 6: the tunnel was cut at the 4096-byte budget (delivered $budget_bytes of 1048576)"
+  printf '      %s\n' "$(grep '^budget-bytes=' "$work/budget.out")"
+fi
+expect "$work/budget.audit" "dest=$target_name:9003 decision=deny reason=byte-budget" \
+  'proof 6: the cut is logged as a denial with its destination'
+expect "$work/budget.audit" 'budget=4096' \
+  'proof 6: the denial names the counter that caused it'
+
+# The fixture has to survive being cut off mid-write; if it did not, the next
+# proof would fail with "resolve-failed" and point at the wrong thing.
+if [ "$(podman container inspect --format '{{.State.Running}}' "$target_name" 2>/dev/null || echo gone)" = true ]; then
+  ok 'the proof target is still running after the cut'
+else
+  fail 'the proof target died when the budget cut its connection'
+fi
+
+# ------------------------------------- proof 7: the connection cap refuses one
+
+# Two tunnels at once against a class that allows one: the first is established
+# and left open, then the second is attempted while it is still open.
+CAP_FN='
+two_tunnels() { # target
+  connect_ok 3 "$1"
+  connect 4 "$1"
+}
+'
+
+# Port 9004 is the fixture that stays open, so the first tunnel is still holding
+# its slot when the second is attempted.
+say "proof 7: the connection cap refuses a second tunnel"
+class_config "$work/classes/model.toml" model 268435456 1 lan "$target_name:9004"
+profile_for "$work/proof-cap.toml" proof-cap model "$target_name" 9004
+run_jail cap "$work/proof-cap.toml" "$PROXY_LIB$CAP_FN
+two_tunnels $target_name:9004
+echo done" "reason=connection-cap"
+
+expect "$work/cap.out" 'HTTP/1.1 200 Connection established' \
+  'proof 7: the first tunnel is established (the cap has one slot)'
+expect "$work/cap.out" 'HTTP/1.1 429 Too Many Requests' \
+  'proof 7: the second tunnel over the cap is refused'
+expect "$work/cap.audit" 'decision=deny reason=connection-cap' \
+  'proof 7: the cap refusal is logged as a denial'
+expect "$work/cap.audit" 'connections=1/1' \
+  'proof 7: the denial names the counters that caused it'
+
+# ------------------------- proof 8: an internal answer is refused, range named
+
+# The same name, the same tunnel, the same fixture — only the class address
+# policy differs. The target is a container on an RFC1918 network, so `public`
+# (what `model` and `external` ship) must refuse the answer and name the range.
+say "proof 8: a name that resolves into internal space is refused"
+class_config "$work/classes/model.toml" model 268435456 8 public "$target_name:9001"
+profile_for "$work/proof-blocked.toml" proof-blocked model "$target_name" 9001
+run_jail blocked "$work/proof-blocked.toml" "$PROXY_LIB
+echo \"blocked=\$(connect 3 $target_name:9001)\"
+echo done" "reason=blocked-private"
+
+expect "$work/blocked.out" 'blocked=HTTP/1.1 403 Forbidden' \
+  'proof 8: an allowlisted name that resolves to a private address is refused'
+expect "$work/blocked.audit" "dest=$target_name:9001 decision=deny reason=blocked-private" \
+  'proof 8: the refusal names the range the answer fell in'
+expect "$work/blocked.audit" "address=$target_ip" \
+  'proof 8: the refusal names the address it was about'
+
+# Restore the class config the later proofs use.
+class_config "$work/classes/model.toml" model 268435456 8 lan "$target_name:9001"
 
 # ------------------------------------------------------------ proof 5: lifecycle
 
@@ -321,7 +468,7 @@ stale=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-' |
   || fail 'lifecycle: expected a SIGKILLed run to leave its network behind (it did not, so this proof proves nothing)'
 
 # Another profile must not touch it.
-class_config "$work/classes/internal.toml" internal "$target_name:9001"
+class_config "$work/classes/internal.toml" internal 268435456 8 lan "$target_name:9001"
 profile_for "$work/proof-other.toml" proof-other model "$target_name" 9001
 "$agentjail" run "$work/proof-other.toml" -- bash -lc 'true' >/dev/null 2>&1 || true
 still_there=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-' || true)
