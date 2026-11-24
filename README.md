@@ -23,8 +23,9 @@ vendor-specific code or configuration in the product.
 - A **trio of small binaries**: `agentjail` (CLI and policy), `agentjail-launcher`
   (stdio/signal/exit-code plumbing inside the jail), `agentjail-gateway` (the
   jail's only route out).
-- A **proof harness**: `agentjail selftest <profile>` is meant to attack its own
-  jail and report what held.
+- A **proof harness**: `agentjail selftest [profile]` attacks its own jail and
+  reports what held; `agentjail selftest --baseline` runs the same probes with no
+  jail to prove each negative is real.
 
 ## What it is NOT
 
@@ -94,7 +95,7 @@ podman network rm agentjail-minimal
 ```
 
 `network.mode = "allowlist"` profiles are refused until the egress gateway
-lands: the error says so. The selftest is still a stub (exit `3`).
+lands: the error says so. The selftest runs in both modes (see "Evidence" below).
 
 The gateway parses and prints its allowlist but does not proxy yet:
 
@@ -169,7 +170,7 @@ Spelled out plainly:
 | Egress classes `model` / `external` / `internal` as three committed configs, one binary, one container per run | **implemented** |
 | Network lifecycle: `Drop` guard on network + gateway, dead-pid pruning only, never by profile prefix | **implemented** |
 | Proofs (class beats ACL text both ways, raw IP refused, allow audited, deny logged) | **implemented**, run in the normal `ci` job |
-| `selftest` (negative set + positive control) | **not implemented** (exit 3); the egress assertions live in `scripts/prove-egress-classes.sh` |
+| `selftest` (negative set + positive control), baseline and jailed in `ci` | **implemented** (`--baseline` proves each negative holds without a jail; jailed proves it is denied) |
 | Base image (`images/base/Containerfile`) | written; not published |
 | CI: fmt, clippy, tests, profile validation, Containerfile checks, musl builds | **implemented** |
 | CI: real image build | non-blocking job (external apt/npm dependency) |
@@ -194,16 +195,22 @@ resolving destinations with the host's resolvers.
 
 ## Evidence for the run path
 
-**CI does not exercise `run`.** The real-jail tests are `#[ignore]`d because they
-need rootless podman and the locally built image, so a green `ci` means "it
-compiles and the pure parts pass" — it is not evidence about the jail. The
-evidence lives in `crates/agentjail/tests/run_podman.rs` and is reproduced on a
-host with rootless podman and `images/base` built:
+**CI exercises the jail through `selftest`, not through every `run` case.** The
+selftest runs in the normal `ci` job in both modes: `--baseline` needs no podman
+and proves the hazards are real; jailed mode uses the same podman setup as the
+egress proofs and proves they are denied. The remaining real-jail `run` tests are
+`#[ignore]`d because they need rootless podman and the locally built base image,
+so a green `ci` does not mean every `run` case passed. Reproduce those on a host
+with rootless podman:
 
 ```sh
 podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
 cargo test -p agentjail --test run_podman -- --ignored --test-threads=1
 ```
+
+The jailed selftest binds a copy of the `agentjail` binary into the jail, so the
+binary must be runnable in the image. CI uses the static musl build; a locally
+built dynamic binary and an older glibc image may not be compatible.
 
 ## Development
 

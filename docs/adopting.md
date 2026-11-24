@@ -16,9 +16,10 @@ were.
 4. **Run the agent**: `agentjail run <profile> -- <agent command…>`, keeping
    stdio as pipes and letting the launcher forward signals and the exit code
    (`docs/cli.md`).
-5. **Prove the jail** before trusting it: run `agentjail selftest <profile>` on
-   the same host and record the result alongside the change that introduced
-   the profile.
+5. **Prove the jail** before trusting it: run `agentjail selftest --baseline`
+   and `agentjail selftest <profile>` on the same host and record both results
+   alongside the change that introduced the profile. Baseline must exit `0`
+   (every hazard is real); jailed must exit `0` (every hazard is denied).
 6. **Adopt incrementally**: start with `mode = "none"`, add a destination only
    when a real task fails, and treat every added mount, secret, and named
    network as a review event.
@@ -28,13 +29,14 @@ were.
 - `run` supports `network.mode = "none"` and `network.mode = "allowlist"` with
   one of the three committed egress classes (`docs/egress-classes.md`). The three
   proofs and the lifecycle cases run in the normal `ci` job.
-- `selftest` exits with code 3 (not implemented); its egress assertions live in
-  `scripts/prove-egress-classes.sh` today.
+- `selftest` runs in both modes in `ci`: `--baseline` with no podman, and jailed
+  after the egress proofs' podman setup. The egress class proofs remain a
+  separate script for class membership and lifecycle.
 - The gateway implements `CONNECT` only: a plain `http://` destination is
   refused, and `protocol = "http"`/`"tcp"` egress entries do nothing yet.
 - Class membership is enforced from outside the jail; the *inside* half of the
   single-route check (no second peer, interface or route) is asserted by the
-  proof script, not by an in-jail probe.
+  jailed `selftest` cases and by the proof script.
 - Secrets are injected by reference through podman's secret store (env vars
   only); entries this run created are removed at exit, dead-pid entries by the
   next run of the same profile.
@@ -45,8 +47,8 @@ were.
   (`cargo build --release`), or use the static musl binaries built in CI.
 
 Do not adopt this for anything with real credentials until the gateway, the
-inside network check, and `selftest` exist — and pass on the host you care
-about.
+inside network check, and both `selftest` modes exist — and pass on the host you
+care about.
 
 ## Diagrams in this repository
 

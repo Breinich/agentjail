@@ -1,9 +1,9 @@
 //! `agentjail`: the CLI.
 //!
-//! Increment 1 implements profile validation, profile display, host
-//! diagnostics, and the outside half of the single-route invariant. `run` and
-//! `selftest` validate their inputs, run the preflight checks that exist, and
-//! then stop with exit code 3 (`NOT_IMPLEMENTED`) instead of pretending.
+//! Profile validation, display, host diagnostics, the outside half of the
+//! single-route invariant, the run path, and the selftest live here. The
+//! selftest runs the same probes as a plain host process (`--baseline`) and
+//! inside a real jail, so the baseline proves each negative is real.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,9 +18,11 @@ use agentjail_core::profile::{self, NetworkMode, Profile};
 use agentjail_core::run;
 use clap::{ArgAction, Parser, Subcommand};
 
+mod probe;
+mod selftest;
+
 const EXIT_OK: u8 = 0;
 const EXIT_FAILURE: u8 = 1;
-const EXIT_NOT_IMPLEMENTED: u8 = 3;
 
 const LAUNCHER_CONTRACT: &str = "\
 Launcher contract (fixed now, implemented in a later increment):
@@ -35,41 +37,32 @@ Launcher contract (fixed now, implemented in a later increment):
   * The container is removed on every exit path, including signal and crash,
     so no jail is orphaned.
 
-Exit codes: 0 success, 1 failure, 2 usage error, 3 not implemented yet. Once
-launching is implemented, the agent's own exit code is passed through.";
+Exit codes: 0 success, 1 failure, 2 usage error; `run` passes the agent's own
+exit code through.";
 
 const SELFTEST_CONTRACT: &str = "\
-Selftest contract (fixed now, implemented in a later increment). Each check is
-run twice in the same test file -- once against the pre-jail baseline and once
-against the jailed build -- and must fail on the baseline while passing in the
-jail:
+Selftest contract: one harness, two executors.
 
-  network (single-route invariant)
-    - a raw IP:port is unreachable: DNS pinning buys nothing if the agent can
-      send packets to an address
-    - a second route, interface, or peer cannot be added from inside (no
-      NET_ADMIN, no ability to change the jail's own network)
-    - a network that is not internal is refused with a clear message, not
-      warned about and not started-then-killed
-    - the gateway is the only reachable peer, verified from inside the jail
+  agentjail selftest            jail every case in a real jail
+  agentjail selftest --baseline run the same probes as a plain host process
 
-  negative (must be denied)
-    - no host secrets readable: a host-only credential path and a host
-      environment variable are both unreachable
-    - no host path writable by default
-    - no unlisted destination reachable, and no DNS answer for an unlisted name
-    - no podman/docker socket or host control socket reachable
-    - no escape: no /proc/1/root, no host /proc mount, no CAP_SYS_ADMIN
-    - two concurrent jails on distinct networks and homes cannot see each
-      other's files, sockets, or credentials
+The assertion functions are shared. Baseline mode proves the hazard is real:
+every negative MUST hold without the jail, or the assertion is weak. Jailed mode
+proves the jail denies every negative and that one allowlisted destination
+answers through the proxy with its audit line.
 
-  positive control
-    - exactly one call to one allowlisted destination succeeds, and the
-      response is well formed
+Cases: host secret file/environment; destination outside the allowlist;
+raw IP:port; route/interface/peer changes; two-jail isolation; memory, pids
+and nofile limits; NET_ADMIN; positive control through the proxy.
 
-  resource limits
-    - cpu, memory, pids, open files, tmpfs size, and writable-layer size are
-      each enforced, not merely declared";
+Baseline exit 0 means every negative correctly held (the hazard was observed),
+non-zero names a negative that was already denied without a jail. Jailed exit 0
+means every negative was denied and the positive control answered, non-zero
+names the case that did not. A case that cannot run in baseline mode is printed
+as SKIPPED-BASELINE with the reason, never silently omitted.
+
+The optional profile selects the image, workdir and home; the selftest generates
+its own network, limits and agent command. --json prints one object per case.";
 
 #[derive(Parser)]
 #[command(
@@ -100,10 +93,10 @@ enum Command {
     Run(RunArgs),
     /// Prove the jail holds by trying to break out of it.
     #[command(long_about = SELFTEST_CONTRACT)]
-    Selftest {
-        /// Profile name or path to a .toml profile.
-        profile: String,
-    },
+    Selftest(SelftestArgs),
+    /// Internal probe executed by the selftest in either executor. Not public API.
+    #[command(name = "__probe", hide = true)]
+    Probe(Box<ProbeArgs>),
     /// Report podman version, rootless mode, SELinux state, config paths, and a network invariant check.
     Doctor {
         /// Machine-readable output.
@@ -127,6 +120,56 @@ enum ProfileAction {
         /// Profile name or path to a .toml profile.
         profile: String,
     },
+}
+
+#[derive(clap::Args)]
+struct SelftestArgs {
+    /// Profile name or path to a .toml profile (selects image, workdir and home).
+    profile: Option<String>,
+    /// Run the probes as a plain host process: no podman, no jail.
+    #[arg(long)]
+    baseline: bool,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct ProbeArgs {
+    #[arg(long, default_value = "main")]
+    case: String,
+    #[arg(long, default_value = "jailed")]
+    mode: String,
+    #[arg(long, default_value = "")]
+    host_secret: String,
+    #[arg(long, default_value = "AGENTJAIL_SELFTEST_SECRET")]
+    env_secret: String,
+    #[arg(long, default_value = "")]
+    target_host: String,
+    #[arg(long, default_value = "")]
+    target_ip: String,
+    #[arg(long, default_value_t = 0)]
+    allowed_port: u16,
+    #[arg(long, default_value_t = 0)]
+    denied_port: u16,
+    #[arg(long, default_value_t = 0)]
+    memory_limit: u64,
+    #[arg(long, default_value_t = 0)]
+    nofile_limit: u64,
+    #[arg(long, default_value_t = 0)]
+    pids_limit: u32,
+    #[arg(long, default_value = "current")]
+    netns: String,
+    #[arg(long, default_value = "owner")]
+    role: String,
+    #[arg(long, default_value = "")]
+    token: String,
+    #[arg(long, default_value = "")]
+    peer_token: String,
+    #[arg(long, default_value_t = 0)]
+    hold_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    alloc_bytes: u64,
 }
 
 #[derive(clap::Args)]
@@ -163,7 +206,34 @@ fn dispatch(cli: Cli, env: &BTreeMap<String, String>) -> Result<u8, String> {
             ProfileAction::Show { profile } => show_command(&profile, &cli.profile_dirs, env, &cwd),
         },
         Command::Run(args) => run_command(args, &cli.profile_dirs, env, &cwd),
-        Command::Selftest { profile } => selftest_command(&profile, &cli.profile_dirs, env, &cwd),
+        Command::Selftest(args) => selftest_command(args, &cli.profile_dirs, env, &cwd),
+        Command::Probe(args) => {
+            let _ = args.mode;
+            let args = *args;
+            let output = probe::run(&probe::ProbeArgs {
+                case: args.case,
+                host_secret: args.host_secret,
+                env_secret: args.env_secret,
+                target_host: args.target_host,
+                target_ip: args.target_ip,
+                allowed_port: args.allowed_port,
+                denied_port: args.denied_port,
+                memory_limit: args.memory_limit,
+                nofile_limit: args.nofile_limit,
+                pids_limit: args.pids_limit,
+                netns: args.netns,
+                role: args.role,
+                token: args.token,
+                peer_token: args.peer_token,
+                hold_ms: args.hold_ms,
+                alloc_bytes: args.alloc_bytes,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+            );
+            Ok(EXIT_OK)
+        }
         Command::Doctor { json, network } => {
             let report = agentjail_core::doctor::collect(env, network.as_deref());
             print!(
@@ -492,30 +562,43 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 fn selftest_command(
-    reference: &str,
+    args: SelftestArgs,
     extra_dirs: &[PathBuf],
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<u8, String> {
-    let loaded = load_profile(reference, extra_dirs, env, cwd)?;
-    let profile = &loaded.profile;
-    let posture = preflight_network(profile)?;
-
-    eprintln!("agentjail: not implemented: selftest is not implemented in this increment");
-    eprintln!(
-        "profile {:?} validated: {}",
-        loaded.profile_name(),
-        profile.summary()
-    );
-    eprintln!("preflight OK: {}", posture.describe());
-    eprintln!(
-        "Planned negative set: raw IP:port unreachable; no second route, interface, or peer can be \
-         added from inside; a non-internal network is refused with a clear message; host secrets \
-         unreadable; host paths read-only; unlisted destinations unreachable; container control \
-         sockets absent; no escape; concurrent jails isolated; resource limits enforced. Positive \
-         control: one allowlisted destination answers. See docs/cli.md."
-    );
-    Ok(EXIT_NOT_IMPLEMENTED)
+    // A profile is optional so the cheap baseline mode works with no fixture at
+    // all. When one is given it selects the image, workdir and home; the
+    // selftest generates its own network, limits and agent command so both modes
+    // run the same cases.
+    let loaded = match &args.profile {
+        Some(reference) => {
+            let loaded = load_profile(reference, extra_dirs, env, cwd)?;
+            run::run_blockers(&loaded.profile).map_err(|errors| {
+                format!(
+                    "refusing to selftest profile {}:\n{}",
+                    loaded.path.display(),
+                    errors
+                        .iter()
+                        .map(|error| format!("  - {error}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })?;
+            Some(loaded)
+        }
+        None => None,
+    };
+    let options = selftest::Options {
+        baseline: args.baseline,
+        json: args.json,
+    };
+    selftest::run(
+        loaded.as_ref().map(|loaded| &loaded.profile),
+        &options,
+        env,
+        cwd,
+    )
 }
 
 /// The class config this profile names, if it has one, with the classes it asks
