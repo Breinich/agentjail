@@ -375,7 +375,8 @@ fn run_jailed(
         1000,
         0,
     );
-    let (output, audit) = run_in_jail(&main_profile, &probe, &child_env, cwd, "selftest-main")?;
+    let (output, audit, audit_view, jail_id) =
+        run_in_jail(&main_profile, &probe, &child_env, cwd, "selftest-main")?;
     let observation = parse_probe(&output, "jailed probe")?;
 
     // Two concurrent jails, each with its own home and its own token. Each
@@ -472,6 +473,7 @@ fn run_jailed(
         evaluate("resource-limits", "jailed", &observation, None),
         evaluate("net-admin", "jailed", &observation, None),
         evaluate("positive-control", "jailed", &observation, Some(&audit)),
+        evaluate_audit_after_run(&audit_view, &jail_id),
     ];
 
     drop(cleanup);
@@ -484,7 +486,7 @@ fn run_in_jail(
     env: &std::collections::BTreeMap<String, String>,
     cwd: &Path,
     profile_name: &str,
-) -> Result<(Output, String), String> {
+) -> Result<(Output, String, String, String), String> {
     let child = spawn_in_jail(profile, probe, env, cwd)?;
     let jail_id = format!("{profile_name}-{}", child.id());
     // The selftest's only allowlist profile is the `model` class, and `run`
@@ -492,8 +494,30 @@ fn run_in_jail(
     let audit_path = run::audit_dir(&paths::state_dir(env), "model")
         .join(run::audit_file_name(&jail_id, "audit"));
     let output = wait_child(child, "jailed probe")?;
-    let gateway_log = std::fs::read_to_string(&audit_path).unwrap_or_default();
-    Ok((output, gateway_log))
+    let audit_file = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    // The documented command, run after the jail and gateway are gone. This is
+    // in the jailed selftest on purpose: CI already pays for the jail here, so
+    // the acceptance check runs on every push instead of only when remembered.
+    let audit_view = read_audit_view(env)?;
+    Ok((output, audit_file, audit_view, jail_id))
+}
+
+fn read_audit_view(env: &std::collections::BTreeMap<String, String>) -> Result<String, String> {
+    let output = Command::new(current_exe()?)
+        .args(["audit", "--class", "model"])
+        .envs(env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("cannot run agentjail audit: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "agentjail audit exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn spawn_in_jail(
@@ -756,6 +780,25 @@ fn hazard(name: &str, observation: &Value, audit: Option<&str>) -> bool {
     }
 }
 
+fn evaluate_audit_after_run(view: &str, jail_id: &str) -> CaseResult {
+    let allow = view.contains("decision=allow");
+    let deny = view.contains("decision=deny");
+    let jail = view.contains(&format!("jail={jail_id}"));
+    CaseResult {
+        name: "audit-after-run",
+        mode: "jailed",
+        expected:
+            "the documented audit command returns the finished run's allow and deny decisions"
+                .to_string(),
+        observed: format!("allow={allow} deny={deny} jail={jail}"),
+        verdict: if allow && deny && jail {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+    }
+}
+
 fn evaluate_isolation(observation: &Value) -> CaseResult {
     let owner = &observation["owner"];
     let prober = &observation["prober"];
@@ -808,6 +851,7 @@ fn setup_failures(mode: &'static str, error: &str) -> Vec<CaseResult> {
             "resource-limits",
             "net-admin",
             "positive-control",
+            "audit-after-run",
         ][..]
     };
     let mut results: Vec<CaseResult> = names

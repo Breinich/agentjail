@@ -54,7 +54,9 @@ answers through the proxy with its audit line.
 
 Cases: host secret file/environment; destination outside the allowlist;
 raw IP:port; route/interface/peer changes; two-jail isolation; memory, pids
-and nofile limits; NET_ADMIN; positive control through the proxy.
+and nofile limits; NET_ADMIN; positive control through the proxy; and the
+documented `agentjail audit --class` view after the run, when the jail and
+gateway containers are gone.
 
 Baseline exit 0 means every negative correctly held (the hazard was observed),
 non-zero names a negative that was already denied without a jail. Jailed exit 0
