@@ -16,6 +16,21 @@ Status: `run` works for `network.mode = "none"` and for
 implements `CONNECT` only. `secrets[].delivery = "file"` is refused by `run`.
 Those three sentences are the whole support surface of what follows.
 
+### Before you type a command
+
+- **`agentjail` below means the binary you built.** Nothing publishes it or puts
+  it on your `PATH` yet. From a checkout: `cargo build --release`, then
+  `./target/release/agentjail …` (CI's static build is
+  `target/x86_64-unknown-linux-musl/release/agentjail`). This page writes the
+  command as `agentjail` everywhere; substitute the path once.
+- **No image is published either.** The profiles in `profiles/` carry an all-zero
+  placeholder digest. Validation passes — it is a well-formed pin — and `run`
+  then fails with `image not known`, because no image in your local store has
+  that digest and `--pull=never` means nothing is fetched. A real digest comes
+  from `podman image inspect --format '{{.Digest}}' <image>` after you build the
+  base image (or your own agent image) yourself; see
+  [`images/README.md`](../images/README.md) and step 2 of the checklist.
+
 ## 1. The integration model in one page
 
 ### One command, three inputs
@@ -32,8 +47,8 @@ rewritten. If no command follows `--`, `agent.command`/`agent.args` are used.
 | --- | --- |
 | **An image** that contains your agent, pinned by digest (`image.name` + `image.digest`). Nothing is published for you: build it from `images/base` (`images/README.md`). | **Containment.** Rootless Podman with a read-only rootfs, uid 10000, `--cap-drop=ALL`, `no-new-privileges`, no host home, no host environment, no runtime socket, and the CPU/memory/pids/nofile/tmpfs numbers from the profile. |
 | **A profile**: one TOML file naming that image, the mount targets your agent reads, its literal environment, its secrets by reference, and one network posture. | **Transport.** Pipes, not a TTY; stdin EOF propagated; stderr kept separate from stdout; SIGINT/SIGTERM/SIGQUIT and terminal resize forwarded; the agent's exit code passed through (`docs/cli.md`). |
-| **Secret references** (`source`/`ref`/`target`): where the credential already lives, and the environment variable name the agent should find it in. | **Egress policy.** With `mode = "allowlist"`, a per-run internal network whose only peer is that class's gateway, the gateway as the resolver, and `HTTPS_PROXY`/`ALL_PROXY` pointing at it. With `mode = "none"`, no route out and no resolver at all. |
-| **An egress class** (`model`, `external`, `internal`): which committed allowlist the jail joins, and therefore the ceiling the profile's own `egress` list is checked against. | **Audit.** One line per connection decision and one per DNS query, on two separate streams, read back with `agentjail audit` (`docs/egress-classes.md`). |
+| **Secret references** (`source`/`ref`/`target`): where the credential already lives, and the environment variable name the agent should find it in. | **Egress policy.** With `mode = "allowlist"`, a per-run internal network whose only peer is that class's gateway, the gateway as the resolver, and `HTTPS_PROXY`/`ALL_PROXY` pointing at it. With `mode = "none"`, an empty internal network with no route out. |
+| **An egress class** (`model`, `external`, `internal`): the destinations the jail may actually reach. The class is the runtime grant; the profile's own `egress` list is only a preflight subset (§3, §4). | **Audit.** One line per connection decision and one per DNS query, on two separate streams, read back with `agentjail audit` (`docs/egress-classes.md`). |
 
 `home` and `workdir` are yours to choose but not to populate: `workdir` is
 whatever the image has there, and `home` is a fresh 0700 directory created in
@@ -234,19 +249,36 @@ which checks the class allowlist, resolves once, checks every answer, and tunnel
 to the pin. This is the only remote shape that keeps the single-route invariant
 intact.
 
-Two edits, in this order:
+**One grant, and one preflight note — they are not the same thing.** The runtime
+grant is the class: `run` starts the gateway with `gateway/classes/<class>.toml`
+and nothing else, so that file is what the proxy allows when a request arrives.
+The profile's `[[network.egress]]` list is checked as a subset of the class
+before anything starts, and is not used after that: **a profile cannot narrow the
+run.** In this build a jail on `model` can reach every destination `model.toml`
+lists, including ones its profile does not name (issue
+[#43](https://github.com/Breinich/agentjail/issues/43)). Read the profile list as
+"the subset this profile was written against", never as "what this jail may
+reach".
 
-1. **The class config** — `gateway/classes/<class>.toml`, `allow = [ … ]`. The
-   class file is authority over every profile of that class, so this is a review
-   event. The file that runs is the one bind-mounted read-only from the checkout
-   at run time (`AGENTJAIL_CLASS_DIR` overrides the directory); rebuild the
-   gateway image afterwards so the copy inside it is not stale.
-2. **The profile** — `[[network.egress]]`. A profile may ask for *less* than its
-   class allows and never more; the difference is refused before anything is
-   created.
+To reach a new destination:
+
+1. **The class config** — `gateway/classes/<class>.toml`, `allow = [ … ]`. That is
+   the grant. The class file is authority over every profile of that class, so
+   this is a review event. The file that runs is bind-mounted read-only from the
+   checkout at run time (`AGENTJAIL_CLASS_DIR` overrides the directory); rebuild
+   the gateway image afterwards so the copy inside it is not stale.
+2. **The profile** — add the same entry to `[[network.egress]]`. That is the
+   preflight check, and today it is documentation: the run works without it
+   (the class allows the name) and it cannot take anything away.
+
+If you want a jail that reaches **less** than its class, the only lever today is
+the class file itself, shared by every profile of that class. A fourth, narrower
+class is a code change: `agentjail_core::class::CLASSES` is a three-entry
+constant, so an unlisted `network.class` is refused by validation. That is the
+shape of #43.
 
 The added lines, in the shape of a complete profile (see
-[§4](#one-destination-exactly) for the file around them):
+[§4](#the-smallest-allowlist-profile) for the file around them):
 
 ```toml
 [network]
@@ -313,8 +345,10 @@ nothing else — there is no rate limit. See
 **Not supported today, and the failure is deliberate.** The proxy implements
 `CONNECT` only: a plain `http://` request gets `405`, is refused, and is logged
 as a denial naming the destination it asked for. `protocol = "http"` and
-`protocol = "tcp"` in a profile are schema-valid and do nothing — the same
-reason `dns = "pinned"` is refused rather than silently ignored.
+`protocol = "tcp"` in a profile validate and are **inert** — they change nothing
+at run time; only TLS through `CONNECT` to an allowlisted `host:port` is a
+supported shape. `dns = "pinned"` is refused for the same reason a knob that
+does nothing is refused.
 
 There is no plain-HTTP gateway in this build, so "the gateway speaks plain HTTP"
 is not a configuration you are missing; it is a feature the proxy does not have.
@@ -330,7 +364,9 @@ Your options:
 
 The `internal` class does not change this: its entries are `host:443` like every
 other class, so a LAN MCP endpoint on `http://…:8080` is unreachable until it has
-a TLS front.
+a TLS front. Its three shipped names (`git.internal`, `registry.internal`,
+`wiki.internal`) are **placeholders** — they do not exist on any network — so
+edit them before you use that class for anything real.
 
 ### Trusting a self-signed front
 
@@ -379,10 +415,10 @@ and "the operator forgot" must not look the same in a file.
 | `workdir` | Where the agent starts is a decision, not an inherited accident. |
 | `home` | Owned by the jail, created 0700 per run; defaulting it would hide that the agent got a home. |
 | `network.mode` | `none` (no route out) versus `allowlist` is the whole posture. |
-| `network.dns` | An inherited host search domain can turn an unqualified name into an internal address and quietly defeat an allowlist. |
+| `network.dns` | The DNS strategy has to be written down rather than inherited, because an inherited host search domain can turn an unqualified name into an internal address in `allowlist` mode. (What this field does *not* buy you in `mode = "none"`: see [`mode = "none"` still resolves names](#mode--none-still-resolves-names).) |
 | `agent.command` | Something has to run; a profile that names no executable is a jail with no purpose. |
 | `network.name` (only `mode = "none"`) | `run` attaches to an existing network and creates none; naming it is the check that you meant that one. |
-| `network.class` + non-empty `egress` (only `mode = "allowlist"`) | The class is the ceiling and `egress` is what you ask for; both are policy. |
+| `network.class` + non-empty `egress` (only `mode = "allowlist"`) | The class is the runtime grant; `egress` is the subset this profile was written against and is checked before start. It cannot narrow the run (§3). |
 
 Everything else is defaulted, and every default is the restrictive one:
 `mounts = []`, `env = {}`, `secrets = []`, `read_only = true`,
@@ -424,6 +460,10 @@ Two of these are not visible failures, which is why they get their own rows in
 the common-mistakes list below: a host environment variable the agent expects is
 simply *absent*, and a name with no class entry simply does not resolve.
 
+One message in that table states an intent that the runtime does not keep: in
+`mode = "none"` the jail **does** get a resolver. See
+[below](#mode--none-still-resolves-names).
+
 ### One minimal profile (no egress)
 
 Start here. If the task cannot be done with this file, add one field at a time.
@@ -461,16 +501,33 @@ podman network rm agentjail-minimal                # when you are done
 ```
 
 The example files in `profiles/` carry an all-zero placeholder digest. It is a
-well-formed pin, so validation passes; `run` fails, because no image in your
-local store has that digest. That is the placeholder working as intended.
+well-formed pin, so validation passes; `run` fails with `image not known`,
+because no image in your local store has that digest. That is the placeholder
+working as intended.
 
 `--pull=never` is in the launcher's argv, so nothing is fetched at run time: the
 image must already exist locally and the digest must match it.
 
-### One destination, exactly
+### `mode = "none"` still resolves names
+
+Do not read `dns = "none"` as "no resolver". The validator requires that value
+for this mode (it refuses `dns = "gateway"` here), but the runtime does not
+honour the stronger reading: inside a network created with
+`podman network create --internal` — the quickstart's own command — the jail sees
+Podman's nameserver (for example `nameserver 10.89.6.1`) and the host's search
+domains, because `run` passes no `--dns`/`--dns-search` in this mode and only the
+*allowlist* networks it creates itself are `--disable-dns` (issue
+[#41](https://github.com/Breinich/agentjail/issues/41)).
+
+What protects this posture is therefore not DNS. It is that the network is empty
+— no other peer — and has no route out, so a name that resolves has nowhere to
+connect. Use `mode = "none"` to make reaching anything impossible; do not rely on
+it to make name resolution impossible, because it does not.
+
+### The smallest allowlist profile
 
 The canonical version is [`profiles/allowlist.toml`](../profiles/allowlist.toml);
-the additions that matter are the class and a single entry:
+the additions that matter are the class and one entry:
 
 ```toml
 [network]
@@ -483,9 +540,19 @@ host = "api.anthropic.com"   # port 443 is the only TLS destination that works
 port = 443
 ```
 
-That is a jail whose only route out is a TLS tunnel to one host, opened through a
-gateway that refuses everything else. It is the posture to copy: add a
-destination when a task actually fails, not because an agent might want it.
+Be precise about what this file grants, because the difference costs people an
+afternoon:
+
+- the **class decides**. `model` lists six hosts on 443, and this jail can reach
+  all six, not only `api.anthropic.com`; the profile's list is the subset the
+  file was written against, checked before start and then unused (#43);
+- so "a jail that reaches one destination" means "a class whose allow list is one
+  line". The only lever today is `gateway/classes/<class>.toml`, and every
+  profile of that class inherits the edit — which is exactly why editing it is a
+  review event;
+- the posture worth copying is therefore the *ordering*: start with
+  `mode = "none"`, add a class entry when a real task fails, and never add one
+  because an agent might want it.
 
 ### Common mistakes
 
@@ -510,8 +577,11 @@ destination when a task actually fails, not because an agent might want it.
   agent's own error is "could not resolve host", which looks exactly like a
   broken agent and is really a missing line in `gateway/classes/<class>.toml`
   plus its subset entry in the profile.
-- **Expecting the profile's `egress` list to be sufficient.** It is a request, not
-  a policy: the class file is the policy. Both edits are needed.
+- **Expecting the profile's `egress` list to be a grant — or a narrowing.** It is
+  neither. The class file is the grant; the profile list is the subset preflight.
+  Both entries are needed for the preflight to pass, and the jail still reaches
+  everything its class lists (#43). A narrower jail means a narrower class, and a
+  fourth class is a code change today.
 - **Mounting over `home`.** `target` may not equal `home`; mount a subdirectory
   or somewhere else entirely, and remember `home` itself is scratch.
 - **`source = "~/skills"`.** There is no shell to expand `~`; sources are absolute
@@ -561,20 +631,69 @@ here fails loudly, and every step after it assumes the previous one held.
 | 3 | Write the profile, minimal first | `agentjail profile validate <profile>` and `agentjail profile show <profile>` | `OK`, the image pin, `no egress`, and every default materialised in the JSON |
 | 4 | Prove the jail runs at all | `agentjail run <profile> -- id -u` | `10000` — not `0`, not your uid |
 | 5 | Prove the jail has no host reach | `agentjail run <profile> -- sh -c 'env; ls /home'` | No host variable, no host home: what is there is the image's `ENV` plus what the profile declared. |
-| 6 | Add the destinations the agent actually needs | class file (`gateway/classes/<class>.toml`) **and** the profile's `[[network.egress]]`; rebuild the gateway image | `profile validate` prints the class and its destination count; the subset check passes |
-| 7 | Prove the route works and the policy bites | one real successful agent turn; then `agentjail audit --class <class> --decision deny` after a deliberate attempt, and `agentjail run <profile> -- sh -c 'curl -sS https://example.com'` | An allow line with `resolved=`/`pinned=` for the good turn; `403`/`reason=not-in-class` and a `deny` audit line for the bad one |
+| 6 | Add the destinations the agent actually needs | the class file (`gateway/classes/<class>.toml`) is the grant; add the same entry to the profile's `[[network.egress]]` for the preflight; rebuild the gateway image | `profile validate` prints the class and its destination count and the subset check passes — and you understand the jail can now reach **every** entry in that class, not only the ones in the profile (#43) |
+| 7 | Prove the route works and the policy bites | one real successful agent turn; a CONNECT to a host the class does **not** list (any name outside `gateway/classes/<class>.toml`, e.g. `https://example.com`); and captured streams (see below) | An allow line with `resolved=`/`pinned=` for the good turn; `403`/`reason=not-in-class` and a `deny` audit line for the bad one |
 | 8 | Prove the jail itself before trusting it | `agentjail selftest --baseline`, then `agentjail selftest <profile>` | Both exit `0`; baseline proves each hazard is real, jailed proves each is denied, `positive-control` answers |
 | 9 | Decide about secrets | `agentjail run <profile> --no-secrets -- env` vs the normal run | The secret's target is absent in the first, present in the second |
 | 10 | Record the evidence beside the change | commit the image digest, the profile, the class-file change, and both selftest outputs | A reviewer can reproduce the posture from the commit, not from memory |
 
 Steps 2–4 are the README quickstart; steps 8–10 are `docs/adopting.md` steps 5
-and 6. Step 6 is the one people get wrong, because it is two files.
+and 6. Step 6 is the one people get wrong, because the class and the profile look
+like two halves of one decision and they are not: the class is the grant, the
+profile list is only the preflight.
+
+### Reading the audit and DNS streams afterwards
+
+The shipped class configs send both streams to the runtime's log
+(`audit_log = "-"`, `dns_log = "-"`), and `run` removes the gateway container —
+and its log — on exit. So `agentjail audit --class model` on a **finished** run
+returns zero lines: there is no file to read and no container left to ask (issue
+[#44](https://github.com/Breinich/agentjail/issues/44)). That is known-broken,
+not a flag you are missing, and it is why steps 7 and 8 say *captured* streams.
+
+The recipe that works today is to capture while the run is going, then read the
+capture:
+
+```sh
+# in another shell, while the jail is running
+gw=$(podman ps --format '{{.Names}}' | grep -- '-gateway$' | head -1)
+podman logs -f "$gw" > model-audit.log 2> model-dns.log
+
+# afterwards: one merged, filtered view of what you captured
+agentjail audit --audit model-audit.log --dns model-dns.log --decision deny
+```
+
+`podman logs` keeps the container's stdout and stderr apart, which is why two
+redirections are enough: the audit lines are the gateway's stdout and the DNS
+lines are its stderr. For a quick live look instead of a capture,
+`podman logs "$gw" | agentjail audit --audit -` reads a stream on stdin.
+`agentjail doctor --network <name>` is the other useful check — the outside half
+of the single-route invariant for an existing network.
 
 ### When the agent starts but cannot answer
 
-A missing class entry looks exactly like a broken agent: the process is up, the
-first request hangs or errors, and nothing says "policy". Work down this list in
-order — each row names the evidence that separates it from the row above.
+**The usual cause is a missing class entry for the agent's model host.** The
+symptom is specific: the agent starts, loads, lists its tools, and every model
+call fails — no audit line for the provider, or a `403` if the client does use
+the proxy. Confirm it from inside the jail before touching anything:
+
+```sh
+# a working tunnel answers with the provider's own 4xx (no credential needed)
+agentjail run <profile> -- sh -c \
+  'curl -sS -o /dev/null -w "%{http_code}\n" https://api.anthropic.com'
+```
+
+| What you see | Meaning |
+| --- | --- |
+| A `4xx` (typically `401`/`404`) from the provider | The gateway allowed the tunnel and the provider answered. The model host is fine; look at credentials or the agent's own config. |
+| `403` from the gateway, and `decision=deny reason=not-in-class` on the captured audit stream | The host is not in the class. Add it to `gateway/classes/<class>.toml` (the grant) and to the profile's `[[network.egress]]` (the preflight), then rerun. |
+| `curl` fails with a connect error, and the DNS stream shows `decision=answer` for the host | The client resolved the name, was given `127.0.0.1`, and did not use the proxy. Set `NODE_USE_ENV_PROXY = "1"` for Node 24 or the client's own proxy setting. |
+| The DNS stream shows `decision=nxdomain reason=not-in-class` | No class entry at all — the same fix as the `403` row. |
+
+A missing class entry is indistinguishable from a broken agent by feel: the
+process is up, the first request hangs or errors, and nothing says "policy". The
+rest of the list separates the remaining causes — each row names the evidence
+that rules out the row above it.
 
 | Evidence | Diagnosis | Fix |
 | --- | --- | --- |
@@ -590,12 +709,11 @@ order — each row names the evidence that separates it from the row above.
 | The agent exits immediately, or refuses to run | Nothing network-related: read the exit code and stderr. `run` exits `1` before starting on a profile/preflight refusal, `2` on a usage error, and otherwise passes the agent's own code through. | Fix what the message names; `agentjail profile validate` covers most of them. |
 
 Two useful commands while doing this, because "no lines" and "not captured" look
-identical otherwise: `agentjail audit --class <class> --decision deny --tail 50`
-and `agentjail doctor --network <name>` (the outside half of the single-route
-invariant for an existing network). With the shipped `-` log configuration the
-gateway's streams live in the container's log and are removed with it, so capture
-them during the run (`podman logs <gateway> > audit.log`) if you need the
-evidence afterwards.
+identical otherwise: `agentjail audit --audit model-audit.log --dns model-dns.log`
+on a capture, and `agentjail doctor --network <name>` (the outside half of the
+single-route invariant for an existing network). With the shipped `-` log
+configuration the gateway's streams live in the container's log and are removed
+with it, so capture them during the run if you need the evidence afterwards.
 
 ## 7. What agentjail does not do for you
 
@@ -625,4 +743,19 @@ evidence afterwards.
   does not route IPv6, and does not give your agent a TTY.
 - **It does not make an allowlist optional.** Skipping the class entry does not
   produce a degraded mode; it produces an unreachable destination and a denial in
-  the audit stream. The class file is authority, and editing it is a review event.
+  the audit stream. The class file is what the gateway reads, and editing it is a
+  review event.
+
+### Known-broken in this build, with the issue
+
+Three places where the product's own words and its behaviour disagree. They are
+listed here so nobody spends an afternoon on them:
+
+- **`mode = "none"` does have a resolver** — Podman's nameserver plus the host's
+  search domains; the protection is the empty network, not DNS
+  ([#41](https://github.com/Breinich/agentjail/issues/41)).
+- **The class is the grant; a profile's `egress` list does not narrow the run** —
+  a stock `allowlist.toml` jail can reach every host its class lists
+  ([#43](https://github.com/Breinich/agentjail/issues/43)).
+- **`agentjail audit --class <class>` returns zero lines after a finished run** —
+  capture the gateway's streams while it runs ([#44](https://github.com/Breinich/agentjail/issues/44)).
