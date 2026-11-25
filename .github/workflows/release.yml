@@ -1,0 +1,176 @@
+name: release
+
+# Tag-only, on purpose. This workflow attaches artefacts to a GitHub Release and
+# asks for `contents: write`, so it is deliberately not part of the
+# pull-request path: no `pull_request` trigger, no branch trigger, and it must
+# not be added to a required-status-check list. A required check that only runs
+# on tags is a merge that can never be green. A PR is gated by `ci`; a release is
+# gated by the tag.
+#
+# Quiet on purpose: one job, no matrix, no cache (a tag runs a handful of times a
+# year, so a cold build is cheaper than maintaining a cache for it), and no
+# container registry push. The gateway image is built and attached to the
+# release as an OCI archive instead, which is why `contents` is the only
+# permission this file needs.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # A cancelled release leaves a half-uploaded set of assets; a slow one is fine.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # The only elevated permission in this file, and the only reason it exists:
+    # create the release and upload its assets. No `packages` (nothing is
+    # pushed), no `id-token`, no `attestations`.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      # Same rule as `ci`: rust-toolchain.toml is the single source of the pinned
+      # channel and target, so the runner's own rustup provides both and no
+      # third-party toolchain action is involved. The target check fails loudly
+      # here instead of surfacing on the first cargo call.
+      - name: Rust toolchain (preinstalled rustup + rust-toolchain.toml)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          rustup show
+          rustup target list --installed | grep -qx x86_64-unknown-linux-musl
+          cargo --version
+
+      # The version is single-sourced: the tag must be the workspace version, and
+      # no crate may pin its own. This is what makes `agentjail --version`, the
+      # launcher and the gateway one number, and what stops a `v0.1.0` tag from
+      # shipping `0.0.9` binaries.
+      - name: The tag is the workspace version, and every crate inherits it
+        id: version
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          workspace="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          echo "tag=$tag workspace=$workspace"
+          if [ "$version" != "$workspace" ]; then
+            echo "::error::tag $tag does not match the [workspace.package] version $workspace"
+            exit 1
+          fi
+          for manifest in crates/*/Cargo.toml; do
+            if ! grep -qx 'version.workspace = true' "$manifest"; then
+              echo "::error::$manifest pins its own version instead of inheriting the workspace's"
+              exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Static musl build (whole workspace)
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          cargo build --locked --release --target x86_64-unknown-linux-musl --workspace
+          target=target/x86_64-unknown-linux-musl/release
+          for binary in agentjail agentjail-launcher agentjail-gateway; do
+            file "$target/$binary"
+            if ldd "$target/$binary" 2>&1 | grep -q "=>"; then
+              echo "::error::$target/$binary is dynamically linked"
+              exit 1
+            fi
+          done
+          # Two of the three answer `--version`. The launcher parses nothing by
+          # contract (its whole argv is the agent's), so there is no flag to ask;
+          # its version is the workspace version checked in the step above.
+          for binary in agentjail agentjail-gateway; do
+            reported="$("$target/$binary" --version)"
+            if [ "$reported" != "$binary $version" ]; then
+              echo "::error::$binary --version says '$reported'; the tag says '$version'"
+              exit 1
+            fi
+            echo "$reported"
+          done
+
+      # Builds the image from the tagged tree so the release carries a gateway
+      # that provably builds from this commit, and attaches it as an archive:
+      # no registry, no push credentials, no second permission to grant.
+      - name: Gateway image (built and attached, not pushed)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman >/dev/null
+          podman --version
+          # Rootless podman needs subordinate id ranges for the runner user; the
+          # Debian package does not create them for an existing user.
+          if ! grep -q "^$(id -un):" /etc/subuid 2>/dev/null; then
+            sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+            podman system migrate
+          fi
+          image="$(scripts/gateway-image-tag.sh)"
+          scripts/build-gateway-image.sh \
+            target/x86_64-unknown-linux-musl/release/agentjail-gateway "$image"
+          mkdir -p dist
+          podman save --format oci-archive -o dist/agentjail-gateway-image.tar "$image"
+
+      - name: Attach the binaries, the gateway image and SHA256SUMS
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          target=target/x86_64-unknown-linux-musl/release
+          cp "$target/agentjail" "$target/agentjail-launcher" "$target/agentjail-gateway" dist/
+          (cd dist && sha256sum agentjail agentjail-launcher agentjail-gateway \
+            agentjail-gateway-image.tar > SHA256SUMS)
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          cat dist/SHA256SUMS
+
+          # The release page is cut from the CHANGELOG's section for this version,
+          # so a reader who never opens the repository gets the same honesty: what
+          # the release can do, its limitations in order, and what is not in it.
+          tag="$GITHUB_REF_NAME"
+          awk -v heading="## $tag" '
+            index($0, heading) == 1 { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > dist/notes.md
+          if [ ! -s dist/notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $tag; the notes come from there"
+            exit 1
+          fi
+          # The notes are not allowed to lose the part that limits the claims.
+          grep -q '^### Limitations' dist/notes.md || {
+            echo "::error::the $tag notes carry no Limitations section"
+            exit 1
+          }
+
+          # Create the release only if the tag did not arrive with notes of its
+          # own, and replace assets on a rerun instead of failing on them.
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes-file dist/notes.md
+          fi
+          gh release upload "$tag" \
+            dist/agentjail \
+            dist/agentjail-launcher \
+            dist/agentjail-gateway \
+            dist/agentjail-gateway-image.tar \
+            dist/SHA256SUMS \
+            --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
