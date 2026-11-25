@@ -227,6 +227,9 @@ fn run_with_env(
 ) -> Output {
     let mut command = Command::new(binary());
     command.args(args).current_dir(dir);
+    // Never the developer's real state directory: their own per-run audit files
+    // would shadow the fixture class configs, and these runs would write into it.
+    command.env("AGENTJAIL_STATE_DIR", dir.join("state"));
     match podman {
         Some(path) => {
             command.env("AGENTJAIL_PODMAN", path);
