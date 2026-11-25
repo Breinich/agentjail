@@ -212,4 +212,41 @@ command = "bash"
             serde_json::json!([])
         );
     }
+
+    #[test]
+    fn an_omitted_or_explicitly_empty_egress_list_is_the_same_grant() {
+        let mut explicit = valid_document();
+        let network = explicit["network"].as_table_mut().expect("network");
+        network.insert("mode".into(), toml::Value::String("allowlist".into()));
+        network.insert("dns".into(), toml::Value::String("gateway".into()));
+        network.insert("class".into(), toml::Value::String("model".into()));
+        network.insert("egress".into(), toml::Value::Array(Vec::new()));
+
+        let mut omitted = valid_document();
+        let network = omitted["network"].as_table_mut().expect("network");
+        network.insert("mode".into(), toml::Value::String("allowlist".into()));
+        network.insert("dns".into(), toml::Value::String("gateway".into()));
+        network.insert("class".into(), toml::Value::String("model".into()));
+
+        assert_eq!(validate(&explicit), Vec::<String>::new());
+        assert_eq!(validate(&omitted), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mode_none_still_refuses_an_egress_destination() {
+        let mut document = valid_document();
+        let destination: toml::Value =
+            toml::from_str("host = \"api.example.com\"\nport = 443").expect("egress TOML");
+        document["network"]
+            .as_table_mut()
+            .expect("network")
+            .insert("egress".into(), toml::Value::Array(vec![destination]));
+        let errors = validate(&document);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.starts_with("network.egress")),
+            "{errors:#?}"
+        );
+    }
 }
