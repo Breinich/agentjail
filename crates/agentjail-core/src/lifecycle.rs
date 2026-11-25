@@ -60,6 +60,33 @@ pub fn parse_run_name(name: &str, profile_name: &str) -> Option<RunTag> {
     Some(RunTag { pid, class })
 }
 
+/// Whether a container name belongs to a run whose owning pid is gone, without
+/// being told whose profile it is.
+///
+/// Containers are the one thing a prune may remove across profiles, because the
+/// gateway is no longer started with `--rm`: a killed run leaves its gateway
+/// behind, and if nobody ever runs that profile again it would stay there
+/// forever. The pid in the name is what makes the removal safe -- a live
+/// concurrent run, of any profile, is untouched, and the current run never
+/// prunes itself. Names this module did not make do not parse and are never
+/// touched.
+pub fn orphaned_container(name: &str, current_pid: u32, alive: impl Fn(u32) -> bool) -> bool {
+    let Some(rest) = name.strip_prefix("agentjail-") else {
+        return false;
+    };
+    // `agentjail-<profile>-<pid>-gateway`, or `agentjail-<profile>-<pid>` for the
+    // jail itself; the profile stem may contain '-', so the pid is the segment
+    // immediately before the suffix.
+    let rest = rest.strip_suffix("-gateway").unwrap_or(rest);
+    let Some((_, pid_text)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    let Ok(pid) = pid_text.parse::<u32>() else {
+        return false;
+    };
+    pid != current_pid && !alive(pid)
+}
+
 /// Names owned by runs that no longer exist, and therefore provably dead.
 ///
 /// `current_pid` is never pruned even if `/proc` is unreadable for it, and a
@@ -129,6 +156,47 @@ mod tests {
             parse_run_name("agentjail-profile-abc-model", "profile"),
             None
         );
+    }
+
+    #[test]
+    fn an_orphaned_container_is_found_without_knowing_its_profile() {
+        // A gateway from a profile nobody runs again, and a jail container from
+        // another one: both are removable because their pid is gone.
+        assert!(orphaned_container(
+            "agentjail-other-100-gateway",
+            200,
+            |_| false
+        ));
+        assert!(orphaned_container("agentjail-other-100", 200, |_| false));
+        assert!(orphaned_container(
+            "agentjail-my-profile-100-gateway",
+            200,
+            |_| false
+        ));
+
+        // A live run of any profile is never touched, and neither is this one.
+        assert!(!orphaned_container(
+            "agentjail-other-100-gateway",
+            200,
+            |pid| pid == 100
+        ));
+        assert!(!orphaned_container(
+            "agentjail-other-200-gateway",
+            200,
+            |_| false
+        ));
+
+        // Not ours, or not parseable: a prune that guesses is worse than a
+        // leftover container.
+        for name in [
+            "podman",
+            "postgres",
+            "agentjail-bots",
+            "agentjail-onlyaname",
+            "agentjail-notapid-gateway",
+        ] {
+            assert!(!orphaned_container(name, 200, |_| false), "{name}");
+        }
     }
 
     #[test]

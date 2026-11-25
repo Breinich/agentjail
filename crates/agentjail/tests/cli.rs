@@ -1676,3 +1676,52 @@ fn a_gateway_that_is_alive_and_addressless_is_still_a_timeout() {
         "a running gateway did not refuse anything: {err}"
     );
 }
+
+/// A gateway container whose run is gone must be pruned by *any* later run, not
+/// only by a run of the same profile.
+///
+/// The gateway is no longer started with `--rm` (so a refusal can be read back),
+/// which makes an orphan possible: a run that is killed leaves its gateway, and a
+/// profile nobody runs again would leave it there indefinitely. The pid in the
+/// name is what makes the pruning safe - a live run of any profile is untouched.
+#[test]
+fn an_orphaned_gateway_of_another_profile_is_pruned_by_this_run() {
+    let dir = tmpdir("prune-orphan");
+    // A class-side run: that is where a gateway container exists to be orphaned.
+    let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+    let podman = fake_podman(&dir);
+    let log = dir.join("podman.log");
+    let containers = dir.join("containers.txt");
+
+    // A pid that is certainly not running: high enough to be above anything this
+    // machine has spawned, and checked rather than assumed.
+    let dead = (900_000u32..)
+        .find(|pid| *pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists())
+        .expect("a pid that is not running");
+    let orphan = format!("agentjail-some-other-profile-{dead}-gateway");
+    // A gateway of a different profile whose run is still alive: never touched.
+    let live = format!("agentjail-another-profile-{}-gateway", std::process::id());
+    std::fs::write(&containers, format!("{orphan}\n{live}\npodman\n")).expect("write containers");
+
+    let output = run_with_env(
+        &["run", path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[
+            ("AGENTJAIL_TEST_LOG", log.to_str().unwrap()),
+            ("AGENTJAIL_TEST_CONTAINERS", containers.to_str().unwrap()),
+            ("EXAMPLE_FORGE_TOKEN", "fake-token-value"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let events = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        events.contains(&format!("container-rm {orphan}")),
+        "the orphan of another profile must be pruned: {events}"
+    );
+    assert!(
+        !events.contains(&format!("container-rm {live}")),
+        "a live run of another profile must not be touched: {events}"
+    );
+}

@@ -67,6 +67,12 @@ jobs:
           else
             while IFS= read -r path; do
               [ -n "$path" ] || continue
+              # A doc-only path cannot change an image: a comment fix in
+              # images/README.md must not pay for a rebuild.
+              doc_only=false
+              case "$path" in
+                *.md|*.markdown|*.txt|LICENSE|NOTICE) doc_only=true ;;
+              esac
               case "$path" in
                 *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|rust-toolchain.toml|Makefile|schema/*|profiles/*|images/*|gateway/*|scripts/*|docs/diagrams/*|.github/workflows/*)
                   relevant=true
@@ -76,7 +82,9 @@ jobs:
                 *.md|docs/diagrams/*) diagrams=true ;;
               esac
               case "$path" in
-                images/*|Cargo.lock) image=true ;;
+                images/*|Cargo.lock)
+                  if [ "$doc_only" = false ]; then image=true; fi
+                  ;;
               esac
             done <<< "$changed"
           fi
@@ -163,7 +171,11 @@ jobs:
           else
             echo "diagrams=false" >> "$GITHUB_OUTPUT"
           fi
-          if printf '%s\n' "$changed" | grep -qE '__unknown__|(^|/)images/|(^|/)Cargo\.lock$'; then
+          # A doc-only path cannot change the image either: a comment fix in
+          # images/README.md must not pay for a Rust rebuild. `__unknown__` still
+          # counts, because then nothing is known.
+          image_inputs=$(printf '%s\n' "$changed" | grep -vE '(^|/)(LICENSE|NOTICE)$|\.(md|markdown|txt)$' || true)
+          if printf '%s\n' "$image_inputs" | grep -qE '__unknown__|(^|/)images/|(^|/)Cargo\.lock$'; then
             echo "image=true" >> "$GITHUB_OUTPUT"
           else
             echo "image=false" >> "$GITHUB_OUTPUT"
