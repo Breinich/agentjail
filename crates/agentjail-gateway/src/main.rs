@@ -88,7 +88,7 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<u8, String> {
     let text = std::fs::read_to_string(&cli.config)
         .map_err(|error| format!("cannot read class config {}: {error}", cli.config.display()))?;
-    let mut config = ClassConfig::parse(&text).map_err(|errors| {
+    let config = ClassConfig::parse(&text).map_err(|errors| {
         format!(
             "class config {} is invalid:\n{}",
             cli.config.display(),
@@ -99,11 +99,11 @@ fn run(cli: &Cli) -> Result<u8, String> {
                 .join("\n")
         )
     })?;
-    let config = select_grant(config, cli.grant.as_deref(), cli.class_only, cli.check)?;
+    let mut config = select_grant(config, cli.grant.as_deref(), cli.class_only, cli.check)?;
 
     if let Some(dir) = &cli.audit_dir {
         // Per-run files, owned by `run`: the class config's `-` destinations go
-        // to the container's own log and disappear with `--rm`.
+        // to the container's own log, which is removed with the container.
         let file = |stream: &str| {
             dir.join(agentjail_core::run::audit_file_name(&cli.jail_id, stream))
                 .to_string_lossy()

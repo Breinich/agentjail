@@ -375,8 +375,15 @@ fn run_jailed(
         1000,
         0,
     );
-    let (output, audit, audit_view, jail_id) =
-        run_in_jail(&main_profile, &probe, &child_env, cwd, "selftest-main")?;
+    let (output, audit, audit_view, jail_id) = run_in_jail(
+        &main_profile,
+        &probe,
+        &child_env,
+        cwd,
+        "selftest-main",
+        &classes,
+        &class_digest,
+    )?;
     let observation = parse_probe(&output, "jailed probe")?;
 
     // Two concurrent jails, each with its own home and its own token. Each
@@ -486,25 +493,39 @@ fn run_in_jail(
     env: &std::collections::BTreeMap<String, String>,
     cwd: &Path,
     profile_name: &str,
+    class_dir: &Path,
+    class_digest: &str,
 ) -> Result<(Output, String, String, String), String> {
     let child = spawn_in_jail(profile, probe, env, cwd)?;
     let jail_id = format!("{profile_name}-{}", child.id());
-    // The selftest's only allowlist profile is the `model` class, and `run`
-    // writes this run's decisions under the state directory it was given.
-    let audit_path = run::audit_dir(&paths::state_dir(env), "model")
+    // The selftest's allowlist class is generated per run and pinned by digest,
+    // so its files are under that class name and the state directory `run` got.
+    let audit_path = run::audit_dir(&paths::state_dir(env), "selftest")
         .join(run::audit_file_name(&jail_id, "audit"));
     let output = wait_child(child, "jailed probe")?;
     let audit_file = std::fs::read_to_string(&audit_path).unwrap_or_default();
     // The documented command, run after the jail and gateway are gone. This is
     // in the jailed selftest on purpose: CI already pays for the jail here, so
     // the acceptance check runs on every push instead of only when remembered.
-    let audit_view = read_audit_view(env)?;
+    let audit_view = read_audit_view(env, class_dir, class_digest)?;
     Ok((output, audit_file, audit_view, jail_id))
 }
 
-fn read_audit_view(env: &std::collections::BTreeMap<String, String>) -> Result<String, String> {
+fn read_audit_view(
+    env: &std::collections::BTreeMap<String, String>,
+    class_dir: &Path,
+    class_digest: &str,
+) -> Result<String, String> {
     let output = Command::new(current_exe()?)
-        .args(["audit", "--class", "model"])
+        .args([
+            "audit",
+            "--class",
+            "selftest",
+            "--class-dir",
+            &class_dir.to_string_lossy(),
+            "--class-digest",
+            class_digest,
+        ])
         .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

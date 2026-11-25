@@ -744,12 +744,14 @@ fn audit_class_returns_both_streams_after_the_run_and_gateway_are_gone() {
         String::from_utf8_lossy(&target.stderr)
     );
 
+    let class = "audit-readback";
     let class_dir = dir.join("classes");
     std::fs::create_dir_all(&class_dir).expect("class dir");
+    let class_path = class_dir.join(format!("{class}.toml"));
     std::fs::write(
-        class_dir.join("model.toml"),
+        &class_path,
         format!(
-            r#"class = "model"
+            r#"class = "{class}"
 listen = "0.0.0.0:3128"
 dns = "0.0.0.0:53"
 max_bytes = 268435456
@@ -760,6 +762,8 @@ allow = ["{target_name}:9001"]
         ),
     )
     .expect("class config");
+    let class_digest =
+        agentjail_core::class::file_digest(&class_path).expect("digest the class config");
 
     let profile_path = dir.join("audit-readback.toml");
     std::fs::write(
@@ -774,7 +778,9 @@ name = "localhost/agentjail-base:1"
 digest = "{digest}"
 
 [network]
-class = "model"
+class = "{class}"
+class_dir = "{class_dir}"
+class_digest = "{class_digest}"
 mode = "allowlist"
 dns = "gateway"
 
@@ -784,7 +790,9 @@ port = 9001
 
 [agent]
 command = "bash"
-"#
+"#,
+            class_dir = class_dir.display(),
+            class_digest = class_digest,
         ),
     )
     .expect("write profile");
@@ -818,7 +826,6 @@ echo done"#
             &script,
         ])
         .env_remove("AGENTJAIL_PODMAN")
-        .env("AGENTJAIL_CLASS_DIR", &class_dir)
         .env("AGENTJAIL_EGRESS_NETWORK", &target_net)
         .env("AGENTJAIL_STATE_DIR", &state)
         .stdout(Stdio::piped())
@@ -853,9 +860,16 @@ echo done"#
     );
 
     let audit = Command::new(env!("CARGO_BIN_EXE_agentjail"))
-        .args(["audit", "--class", "model"])
+        .args([
+            "audit",
+            "--class",
+            class,
+            "--class-dir",
+            class_dir.to_str().expect("class dir path"),
+            "--class-digest",
+            &class_digest,
+        ])
         .env_remove("AGENTJAIL_PODMAN")
-        .env("AGENTJAIL_CLASS_DIR", &class_dir)
         .env("AGENTJAIL_STATE_DIR", &state)
         .output()
         .expect("run agentjail audit");
@@ -870,7 +884,7 @@ echo done"#
     for expected in [
         format!("dest={target_name}:9001 decision=allow"),
         "dest=denied.example.invalid:443 decision=deny".to_string(),
-        format!("class=model jail={jail_id}"),
+        format!("class={class} jail={jail_id}"),
         "qname=outside.example.invalid".to_string(),
         "decision=nxdomain".to_string(),
     ] {
