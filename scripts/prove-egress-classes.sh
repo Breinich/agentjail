@@ -47,6 +47,10 @@ work=$(mktemp -d)
 target_net="agentjail-proof-target-$$"
 target_name="agentjail-proof-target-$$"
 failures=0
+# The run writes its audit streams under the state directory, not to the
+# gateway's own container log: keep the proof runs in the temporary work dir.
+AGENTJAIL_STATE_DIR="$work/state"
+export AGENTJAIL_STATE_DIR
 
 cleanup() {
   podman rm -f "$target_name" >/dev/null 2>&1 || true
@@ -289,15 +293,20 @@ run_jail() { # label profile script wait-for-log
     return
   fi
 
-  # Snapshot the gateway's streams on every poll, not only after the wait below:
-  # a run can end - and its gateway container be removed with it - before the
-  # wait finishes, and a proof cannot assert on the logs of a container that is
-  # gone. A failed capture never overwrites the last good one. DNS is on stderr
-  # and the audit stream on stdout, so one call keeps them in two separate files.
+  # Snapshot the run's per-run streams on every poll, not only after the wait
+  # below: a run can end before the wait finishes, and the gateway container is
+  # removed with it. The files outlive the container, so read them directly
+  # instead of `podman logs`. The jail id is <profile>-<pid of agentjail>, which
+  # makes this run's files selectable even while later runs accumulate.
+  jail_prefix="$(basename "$profile" .toml)-$agentjail_pid"
   snapshot() {
-    if podman logs "$gateway" > "$work/$label.audit.tmp" 2> "$work/$label.dns.tmp"; then
-      mv "$work/$label.audit.tmp" "$work/$label.audit"
-      mv "$work/$label.dns.tmp" "$work/$label.dns"
+    audit_file=$(find "$work/state/audit" -type f -name "$jail_prefix.audit.log" 2>/dev/null | head -1)
+    dns_file=$(find "$work/state/audit" -type f -name "$jail_prefix.dns.log" 2>/dev/null | head -1)
+    if [ -n "$audit_file" ]; then
+      cp "$audit_file" "$work/$label.audit.tmp" && mv "$work/$label.audit.tmp" "$work/$label.audit"
+    fi
+    if [ -n "$dns_file" ]; then
+      cp "$dns_file" "$work/$label.dns.tmp" && mv "$work/$label.dns.tmp" "$work/$label.dns"
     fi
   }
   if [ -n "$wait_for" ]; then
