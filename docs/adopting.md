@@ -58,12 +58,14 @@ the whole grant: a field that is not in the file is not in the jail.
     so a JSON-RPC session over fd 0/1 works unchanged; stderr is a separate
     stream and is never merged into stdout.
   - closing stdin propagates EOF into the jail, which is how a host session ends.
-  - SIGINT, SIGTERM and SIGQUIT are forwarded to the agent's process group and
-    SIGWINCH as a resize: that is `agentjail-launcher`'s contract, exercised by
-    `crates/agentjail-launcher/tests/transport.rs`. In today's `run` path the
-    jail's PID 1 is the image's entrypoint (`tini` in the base image), not the
-    launcher, so a signal reaches the agent process and the jail is torn down on
-    every exit path — but processes the agent spawned are not signalled directly.
+  - SIGINT, SIGTERM and SIGQUIT reach the agent through the chain that exists:
+    host-side `agentjail` → the container's PID 1 (`tini` in the base image) →
+    the agent process. Inside the jail `tini` is PID 1, not
+    `agentjail-launcher`, so the launcher's process-group forwarding —
+    implemented and tested in its own right
+    (`crates/agentjail-launcher/tests/transport.rs`) — is **not reachable from
+    `run`**, and processes the agent itself spawns (its grandchildren) are not
+    signalled. The jail is torn down on every exit path regardless.
   - the exit code is the agent's, including `128 + N` when it dies from signal
     `N`; a refusal is `1`, a usage error `2`.
 

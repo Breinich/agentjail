@@ -26,13 +26,18 @@ const EXIT_OK: u8 = 0;
 const EXIT_FAILURE: u8 = 1;
 
 const LAUNCHER_CONTRACT: &str = "\
-Launcher contract (fixed now, implemented in a later increment):
+Launcher contract (implemented; its own tests are in
+crates/agentjail-launcher/tests/transport.rs):
 
   * stdio is pipes, not a TTY: stdin and stdout are a pair of pipes, so a
     JSON-RPC session over fd 0/1 works unchanged. stderr stays a separate
     stream and is never merged into stdout.
-  * SIGINT, SIGTERM and SIGQUIT are forwarded to the agent process, terminal
-    resize events are forwarded, and EOF on stdin is propagated.
+  * SIGINT, SIGTERM and SIGQUIT reach the agent through the chain that exists:
+    host-side agentjail -> the container's PID 1 (the image's tini/entrypoint)
+    -> the agent. Inside the jail tini is PID 1, not agentjail-launcher, so the
+    launcher's process-group forwarding is not reachable from `run`, and
+    processes the agent itself spawns are not signalled. EOF on stdin is
+    propagated.
   * agentjail exits with the agent's exit code; a signal-terminated agent maps
     to 128 + signal number.
   * The container is removed on every exit path, including signal and crash,

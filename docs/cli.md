@@ -5,7 +5,7 @@ Three binaries, one workspace:
 | Binary | Runs where | Job |
 | --- | --- | --- |
 | `agentjail` | host | policy: profile validation, preflight, doctor, launch orchestration |
-| `agentjail-launcher` | inside the jail, as PID 1 | stdio/signal/exit-code plumbing around the agent |
+| `agentjail-launcher` | inside the jail, as the entrypoint of an image that runs it (not in `run`'s path today) | stdio/signal/exit-code plumbing around the agent |
 | `agentjail-gateway` | its own container, the jail's only peer | DNS pinning and CONNECT allowlist |
 
 The launcher and gateway are built static against musl so they can be
@@ -80,8 +80,9 @@ The agent runs with **pipes, not a TTY**:
   corrupt a structured protocol on stdout.
 - EOF on stdin is propagated into the jail (no half-open pipe that keeps the
   agent waiting).
-- terminal resize events are forwarded when the caller has a terminal, and
-  ignored cleanly when it does not.
+- terminal resize events are forwarded by `agentjail-launcher` when the caller
+  has a terminal, and ignored cleanly when it does not; `run` starts the jail
+  without a TTY, so there is no resize in its path.
 
 This is what a host harness needs: a container turns sockets into pipes, so the
 pipes/SIGTERM/exit-code/resize path decides whether adoption is possible at all.
@@ -97,10 +98,14 @@ session **inside the jail**, which needs the run path.
 
 ### Signals and exit codes
 
-`SIGINT`, `SIGTERM`, and `SIGQUIT` received by `agentjail` are forwarded to the
-agent's process group; `SIGWINCH` is forwarded as a resize. The container is
-removed on **every** exit path — normal exit, signal, launcher crash — so no
-jail, network, or tmpfs is orphaned.
+`SIGINT`, `SIGTERM`, and `SIGQUIT` received by `agentjail` reach the agent
+through the chain that exists: host-side `agentjail` → the container's PID 1
+(the image's `tini`/entrypoint) → the agent process. Inside the jail `tini` is
+PID 1, not `agentjail-launcher`, so the launcher's process-group forwarding is
+**not reachable from `run`**, and processes the agent itself spawns (its
+grandchildren) are not signalled. The container is removed on **every** exit
+path — normal exit, signal, launcher crash — so no jail, network, or tmpfs is
+orphaned.
 
 | Situation | Exit code |
 | --- | --- |
@@ -115,8 +120,10 @@ with the profile's literal environment only.
 
 ### `agentjail-launcher`
 
-The launcher is implemented and tested (`crates/agentjail-launcher`). Inside the
-jail it:
+The launcher is implemented and tested (`crates/agentjail-launcher`), and it is
+**not in `run`'s path**: the jail's PID 1 is the image's `tini`/entrypoint, so
+the forwarding below is not what a `run` signal travels through (see "Signals
+and exit codes"). Inside the jail, when an image's entrypoint does run it, it:
 
 1. refuses to run the agent as root (`AGENTJAIL_ALLOW_ROOT=1` exists only for
    tests and image builds);

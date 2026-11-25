@@ -69,13 +69,42 @@ That is a property of the network, so it is verified — never assumed:
 
 ## Quickstart
 
-```sh
-# 1. Validate a profile against the schema and semantic rules (works today).
-cargo run -p agentjail -- profile validate profiles/minimal.toml
+Four steps on a clean clone, in this order. Nothing installs `agentjail` for you
+and no image is in a registry: the binary is the one `cargo` builds here, under
+`target/`, and both images exist only on the host that built them.
 
-# 2. See the effective profile with every default resolved (works today).
-cargo run -p agentjail -- profile show profiles/allowlist.toml
+```sh
+# 1. The jail image, and the digest it was built as. That digest is the pin:
+#    paste it into [image].digest of the profile you are about to run.
+podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
+podman image inspect --format '{{.Digest}}' localhost/agentjail-base:1
+# -> sha256:…  goes into profiles/allowlist.toml, image.digest
+#    (`{{.Id}}` is the local image ID, not the pin: podman then refuses
+#    `name@<id>` with "image not known", which does not hint at the mistake.)
+
+# 2. The gateway image, the jail's only route out. Its tag belongs to this
+#    workspace (`localhost/agentjail-gateway:ws-<8 hex>`), so a fresh clone has
+#    none until this runs; without it `run` refuses, naming that tag and this
+#    script.
+cargo build --locked --release --target x86_64-unknown-linux-musl -p agentjail-gateway
+scripts/build-gateway-image.sh          # prints the tag it built
+
+# 3. Validate the profile: the JSON Schema plus the rules it cannot express.
+#    Expect `OK <profile>` and the pin you pasted echoed back.
+cargo run --locked -p agentjail -- profile validate profiles/allowlist.toml
+
+# 4. Run the jail. The class network, the gateway and the proxy environment are
+#    created for this run and removed when it exits; this prints the jail uid.
+cargo run --locked -p agentjail -- run profiles/allowlist.toml -- id -u
+# -> 10000
 ```
+
+`profiles/allowlist.toml` is the one to start from because it creates everything
+it needs: one destination through the `model` egress class, and the grant is
+that one destination. `profiles/minimal.toml` is the no-egress posture, which
+needs an existing internal network (`podman network create --internal
+agentjail-minimal`) because `run` attaches to a named network instead of
+creating one.
 
 Host diagnostics are real and read-only, including the outside half of the
 single-route invariant for any existing network:
@@ -85,23 +114,11 @@ cargo run -p agentjail -- doctor
 cargo run -p agentjail -- doctor --network podman        # refusal: not internal
 ```
 
-`run` works for the default posture, no egress. It attaches to the internal
-network named in the profile, verifies that network on every start, and `exec`s
-podman so stdio, signals and the exit code pass through:
+`profile show` prints the effective profile with every default resolved **and
+the grant**, so the policy is readable before anything runs:
 
 ```sh
-podman network create --internal agentjail-minimal
-cargo run -p agentjail -- run profiles/minimal.toml -- bash -lc 'id -u'
-podman network rm agentjail-minimal
-```
-
-`network.mode = "allowlist"` profiles are refused until the egress gateway
-lands: the error says so. The selftest runs in both modes (see "Evidence" below).
-
-The gateway parses and prints its allowlist but does not proxy yet:
-
-```sh
-cargo run -p agentjail-gateway -- --config gateway/classes/model.toml --check
+cargo run -p agentjail -- profile show profiles/allowlist.toml
 ```
 
 ## Audit after a run
@@ -165,16 +182,6 @@ Two complete examples live in `profiles/minimal.toml` (no egress) and
 The full reference is `docs/profiles.md`; egress classes are in
 `docs/egress-classes.md`.
 
-```sh
-# Build the only two images a run needs (both are local; nothing is published).
-podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
-cargo build --locked --release --target x86_64-unknown-linux-musl -p agentjail-gateway
-scripts/build-gateway-image.sh          # prints the tag it built
-
-# Run a jail that may reach exactly one destination.
-agentjail run profiles/allowlist.toml -- bash -l
-```
-
 The gateway is tagged per workspace (`localhost/agentjail-gateway:ws-…`, derived
 from the workspace's path), not with one mutable tag shared by the machine: two
 checkouts that build it from different code must not overwrite each other's
@@ -189,7 +196,6 @@ ask for is `NXDOMAIN`), a refusal says which side refused it (`reason=`
 `not-in-profile` or `not-in-class`), and `agentjail profile show` prints the
 grant. A profile that lists no destination gets a gateway that permits nothing,
 and the run says so out loud instead of refusing to start.
-```
 
 The egress class is decided by the internal network the jail joins, and the
 gateway for that class is the jail's only peer. A process that ignores the proxy,
