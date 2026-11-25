@@ -58,14 +58,17 @@ For the jailed process, and assuming a correct rootless Podman installation:
    only at addresses their class policy allows, within a byte budget and a
    connection cap. This is the single-route invariant, stated and enforced
    separately below.
-5. **No inherited DNS search domains.** Whenever the jail has a resolver
-   (`mode = "allowlist"`), the launcher passes `--dns-search .`, an empty search
-   list, so a host search domain cannot turn a short or unqualified name into an
-   internal address. With `mode = "none"` there is no resolver at all — Podman
-   rejects DNS options together with an isolated network, so there is nothing to
-   inherit. This is a security property, not a convenience: a resolver that
-   answers `build-server` from a host search domain silently defeats the
-   allowlist.
+5. **No inherited DNS search domains.** The launcher passes `--dns-search .` — an
+   empty search list — whenever the jail has a resolver, and that includes the
+   case the earlier version of this document got wrong: a `mode = "none"` jail on
+   a named internal network *does* have one. netavark gives it a resolver, and
+   `/etc/resolv.conf` inside the jail then carries the host's search domains
+   (`search dns.podman lan.internal.bajnok.dev bajnok.dev`, measured on the
+   development host), so a short name means whatever the LAN says it means. The
+   search list is emptied there too. What protects that posture is the absence of
+   a route out — an internal network with no upstream gateway — not the absence of
+   a resolver; a resolver that answers from a host search domain would otherwise
+   silently defeat the allowlist.
 6. **Bounded resources.** CPU, memory, pids, open files, tmpfs sizes, and the
    writable layer size are declared in the profile and enforced by the runtime,
    not merely printed. The jail's **egress** is bounded too: a byte budget (both

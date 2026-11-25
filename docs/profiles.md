@@ -276,9 +276,11 @@ is named by the profile, not by whatever the caller's environment holds.
 inherited host search domain can turn an unqualified name into an internal
 address and quietly defeat an allowlist, so the DNS strategy is always explicit.
 When the jail has a resolver (allowlist mode), the launcher additionally passes
-`--dns-search .` so host search domains cannot leak in. With `dns = "none"`
-there is no resolver at all, and Podman rejects DNS options together with an
-isolated network.
+`--dns-search .` so host search domains cannot leak in. With `dns = "none"` the
+jail configures no resolver of its own — but the internal network still carries
+one from netavark, which inherits the host's search domains, so `run` passes
+`--dns-search .` there as well. The posture's protection is the absent route, not
+the absent resolver.
 
 | `mode` | `dns` | Meaning |
 | --- | --- | --- |
