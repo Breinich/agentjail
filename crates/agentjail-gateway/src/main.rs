@@ -64,6 +64,11 @@ struct Cli {
     #[arg(long)]
     class_only: bool,
 
+    /// Write this run's two streams to `<DIR>/<jail-id>.audit.log` and
+    /// `<DIR>/<jail-id>.dns.log` instead of the class config's destinations.
+    #[arg(long, value_name = "DIR")]
+    audit_dir: Option<PathBuf>,
+
     /// Validate the class config and print it; start no listener.
     #[arg(long)]
     check: bool,
@@ -83,7 +88,7 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<u8, String> {
     let text = std::fs::read_to_string(&cli.config)
         .map_err(|error| format!("cannot read class config {}: {error}", cli.config.display()))?;
-    let config = ClassConfig::parse(&text).map_err(|errors| {
+    let mut config = ClassConfig::parse(&text).map_err(|errors| {
         format!(
             "class config {} is invalid:\n{}",
             cli.config.display(),
@@ -95,6 +100,18 @@ fn run(cli: &Cli) -> Result<u8, String> {
         )
     })?;
     let config = select_grant(config, cli.grant.as_deref(), cli.class_only, cli.check)?;
+
+    if let Some(dir) = &cli.audit_dir {
+        // Per-run files, owned by `run`: the class config's `-` destinations go
+        // to the container's own log and disappear with `--rm`.
+        let file = |stream: &str| {
+            dir.join(agentjail_core::run::audit_file_name(&cli.jail_id, stream))
+                .to_string_lossy()
+                .into_owned()
+        };
+        config.audit_log = file("audit");
+        config.dns_log = file("dns");
+    }
 
     if cli.check {
         println!("class: {}", config.class);

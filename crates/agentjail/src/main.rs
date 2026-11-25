@@ -182,13 +182,20 @@ The two gateway streams, read back in one view.
   stream=audit  one line per connection decision: allow, allow-close, deny
   stream=dns    one line per query: answer, nxdomain, refused, drop
 
-Both are `key=value` lines written by the gateway (docs/egress-classes.md). With
-no path given, the streams configured for --class are read. `--audit -` reads
-stdin, which is how a captured `podman logs` is inspected.";
+Both are `key=value` lines written by the gateway. With no path given, the
+per-run files of --class are read from the state directory `agentjail doctor`
+reports (default ~/.local/state/agentjail): audit/<class>/<jail-id>.audit.log
+and audit/<class>/<jail-id>.dns.log. They outlive the gateway container, so the
+command works after a run has finished. Files are read newest run first and the
+merged view is in time order; `run` keeps the newest 20 runs per class and
+prunes older ones at start. If no per-run files exist, the streams configured
+in the class config are read instead. `--audit -` reads stdin, which is how a
+captured `podman logs` is inspected.";
 
 #[derive(clap::Args)]
 struct AuditArgs {
-    /// Egress class: whose configured streams to read, and the class to filter on.
+    /// Egress class: whose per-run files (or configured streams) to read, and
+    /// the class to filter on.
     #[arg(long, value_name = "CLASS")]
     class: Option<String>,
     /// Operator class directory, with --class-digest: where <class>.toml lives.
@@ -251,7 +258,7 @@ fn dispatch(cli: Cli, env: &BTreeMap<String, String>) -> Result<u8, String> {
             ProfileAction::Show { profile } => show_command(&profile, &cli.profile_dirs, env, &cwd),
         },
         Command::Run(args) => run_command(args, &cli.profile_dirs, env, &cwd),
-        Command::Audit(args) => audit_command(args, &cwd),
+        Command::Audit(args) => audit_command(args, env, &cwd),
         Command::Selftest(args) => selftest_command(args, &cli.profile_dirs, env, &cwd),
         Command::Probe(args) => {
             let _ = args.mode;
@@ -515,7 +522,11 @@ fn run_command(
 /// configured as `-` went to podman's log rather than a file, so there is
 /// nothing here to read: say so instead of printing an empty result that looks
 /// like "no activity".
-fn audit_command(args: AuditArgs, cwd: &Path) -> Result<u8, String> {
+fn audit_command(
+    args: AuditArgs,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<u8, String> {
     let streams = match args.stream.as_deref() {
         None => audit::Streams::Both,
         Some("audit") => audit::Streams::Audit,
@@ -528,10 +539,11 @@ fn audit_command(args: AuditArgs, cwd: &Path) -> Result<u8, String> {
     };
 
     let (mut audit_path, mut dns_path) = (args.audit.clone(), args.dns.clone());
+    let mut sources: Vec<(&'static str, String)> = Vec::new();
+
     if audit_path.is_none() && dns_path.is_none() {
         let class = args.class.as_deref().ok_or_else(|| {
-            "give --class <class> to read its configured streams, or --audit/--dns <path>"
-                .to_string()
+            "give --class <class> to read its per-run files, or --audit/--dns <path>".to_string()
         })?;
         let loaded = match (args.class_dir.as_deref(), args.class_digest.as_deref()) {
             (Some(dir), Some(digest)) => class::load_pinned(Path::new(dir), class, digest),
@@ -543,17 +555,39 @@ fn audit_command(args: AuditArgs, cwd: &Path) -> Result<u8, String> {
         };
         let (path, config) = loaded
             .map_err(|error| format!("cannot read the streams of class {class:?}: {error}"))?;
-        eprintln!(
-            "agentjail: streams from {} (audit_log={:?}, dns_log={:?})",
-            path.display(),
-            config.audit_log,
-            config.dns_log
-        );
-        audit_path = Some(config.audit_log);
-        dns_path = Some(config.dns_log);
+        let run_dir = run::audit_dir(&paths::state_dir(env), class);
+        let files = audit::run_files(&run_dir);
+        if files.is_empty() {
+            eprintln!(
+                "agentjail: no per-run files under {}; reading the streams configured in {} \
+                 (audit_log={:?}, dns_log={:?})",
+                run_dir.display(),
+                path.display(),
+                config.audit_log,
+                config.dns_log
+            );
+            audit_path = Some(config.audit_log);
+            dns_path = Some(config.dns_log);
+        } else {
+            eprintln!(
+                "agentjail: {} file(s) from {} (newest run first; the newest {} runs per class \
+                 are kept)",
+                files.len(),
+                run_dir.display(),
+                run::AUDIT_RETAIN_RUNS
+            );
+            for (stream, file) in files {
+                let text = std::fs::read_to_string(&file).map_err(|error| {
+                    format!(
+                        "cannot read the {stream} stream {}: {error}",
+                        file.display()
+                    )
+                })?;
+                sources.push((stream, text));
+            }
+        }
     }
 
-    let mut sources: Vec<(&'static str, String)> = Vec::new();
     for (name, path) in [(audit::AUDIT, audit_path), (audit::DNS, dns_path)] {
         let Some(path) = path else { continue };
         if path == "-" {
@@ -856,6 +890,14 @@ fn start_class_side(
     };
 
     let container = lifecycle::gateway_name(profile_name, run_id);
+    let jail_id = format!("{profile_name}-{run_id}");
+    let audit_dir = run::audit_dir(&paths::state_dir(env), &config.class);
+    std::fs::create_dir_all(&audit_dir).map_err(|error| {
+        format!(
+            "cannot create the audit directory {}: {error}",
+            audit_dir.display()
+        )
+    })?;
     let argv = run::gateway_args(&run::GatewayContext {
         container_name: container.clone(),
         image_id,
@@ -863,13 +905,23 @@ fn start_class_side(
         grant: grant.clone(),
         network: network.clone(),
         egress_network,
-        jail_id: format!("{profile_name}-{run_id}"),
+        jail_id: jail_id.clone(),
+        class: config.class.clone(),
+        audit_dir: Some(audit_dir.to_string_lossy().into_owned()),
         selinux: Path::new("/sys/fs/selinux/enforce").exists(),
     });
     podman::container_start(&argv)?;
     cleanup.container = Some(container.clone());
 
     let gateway_ip = wait_for_ip(&container, &network)?;
+    let pruned = run::prune_audit_runs(&audit_dir, run::AUDIT_RETAIN_RUNS, &jail_id);
+    if !pruned.is_empty() {
+        eprintln!(
+            "agentjail: pruned {} audit file(s) from older runs in {}",
+            pruned.len(),
+            audit_dir.display()
+        );
+    }
     eprintln!(
         "agentjail: egress class {:?}: gateway {container} at {gateway_ip}:{PROXY_PORT} on {network}, \
          grant {} of {} class allowlisted destination(s), audit on its own stream",

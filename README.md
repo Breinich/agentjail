@@ -100,8 +100,34 @@ lands: the error says so. The selftest runs in both modes (see "Evidence" below)
 The gateway parses and prints its allowlist but does not proxy yet:
 
 ```sh
-cargo run -p agentjail-gateway -- --profile profiles/allowlist.toml --check
+cargo run -p agentjail-gateway -- --config gateway/classes/model.toml --check
 ```
+
+## Audit after a run
+
+The gateway's `-` destinations are its container's own stdout/stderr, and the
+run removes the container, so that evidence goes with it. `run` therefore gives
+every run two files under the state directory `agentjail doctor` already
+reports (`$XDG_STATE_HOME/agentjail`, default `~/.local/state/agentjail`):
+
+```text
+<state>/audit/<class>/<jail-id>.audit.log
+<state>/audit/<class>/<jail-id>.dns.log
+```
+
+They are written by the gateway container through a writable bind mount of that
+per-run directory; the class config is untouched. The documented command reads
+them back after the container is gone:
+
+```sh
+agentjail audit --class model
+```
+
+Files are read newest run first and the merged view is in time order. `run`
+keeps the **newest 20 runs per class** and prunes older ones at start, removing
+a run's two files together. Gateway containers also carry
+`io.agentjail.class` and `io.agentjail.jail` labels, so `podman ps` is legible
+while the run is live.
 
 ## Profiles at a glance
 

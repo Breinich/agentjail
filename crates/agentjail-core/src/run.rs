@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::class::{AllowEntry, ClassConfig, PROXY_PORT};
 use crate::profile::{Agent, Mount, NetworkMode, Profile, Secret, SecretDelivery, SecretSource};
@@ -467,6 +468,97 @@ pub fn podman_args(
 /// Where the class config lands inside the gateway container.
 pub const CONTAINER_CLASS_CONFIG: &str = "/etc/agentjail/class.toml";
 
+/// Where the per-run audit directory is mounted inside the gateway container.
+pub const CONTAINER_AUDIT_DIR: &str = "/var/log/agentjail";
+
+/// How many finished runs keep their audit files, per class. `run` prunes older
+/// runs at start; the current run is written in addition and becomes part of
+/// the retained set.
+pub const AUDIT_RETAIN_RUNS: usize = 20;
+
+/// `<state>/audit/<class>`: the per-class directory `run` writes and `audit`
+/// reads. It lives under the state directory `agentjail doctor` already reports,
+/// so there is no second location to find.
+pub fn audit_dir(state_dir: &Path, class: &str) -> PathBuf {
+    state_dir.join("audit").join(class)
+}
+
+/// The gateway's file for one stream of one run: `<jail-id>.<stream>.log`.
+/// The jail id is sanitised here and when the gateway derives the same name.
+pub fn audit_file_name(jail_id: &str, stream: &str) -> String {
+    format!("{}.{stream}.log", sanitize(jail_id))
+}
+
+/// Remove all but the newest `keep` runs from one audit directory. `current` is
+/// always kept; every run owns two files and both go together. Returns what was
+/// removed, so a caller can report it or a test can assert on it.
+pub fn prune_audit_runs(dir: &Path, keep: usize, current: &str) -> Vec<PathBuf> {
+    let keep = keep.max(1);
+    let current_file = sanitize(current);
+    let mut runs: BTreeMap<String, (SystemTime, Vec<PathBuf>)> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name
+            .strip_suffix(".audit.log")
+            .or_else(|| name.strip_suffix(".dns.log"))
+        else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let run = runs
+            .entry(stem.to_string())
+            .or_insert((modified, Vec::new()));
+        run.0 = run.0.max(modified);
+        run.1.push(path);
+    }
+
+    let mut ordered: Vec<(String, SystemTime)> = runs
+        .iter()
+        .map(|(run, (modified, _))| (run.clone(), *modified))
+        .collect();
+    // Newest first; the name breaks a same-millisecond tie deterministically.
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+
+    let current_present = runs.contains_key(&current_file);
+    let history = if current_present {
+        keep.saturating_sub(1)
+    } else {
+        keep
+    };
+    let mut kept = 0;
+    let mut removed = Vec::new();
+    for (run, _) in ordered {
+        let is_current = run == current_file;
+        // The run in progress is always kept; it counts towards `keep` when its
+        // files exist, so an in-progress run can never be pruned by its own
+        // start and the directory ends with at most `keep` runs.
+        let retain = is_current || kept < history;
+        if retain {
+            if !is_current {
+                kept += 1;
+            }
+            continue;
+        }
+        if let Some((_, files)) = runs.get(&run) {
+            for path in files {
+                if std::fs::remove_file(path).is_ok() {
+                    removed.push(path.clone());
+                }
+            }
+        }
+    }
+    removed
+}
+
 /// Everything one gateway container needs to be started.
 pub struct GatewayContext {
     pub container_name: String,
@@ -485,6 +577,9 @@ pub struct GatewayContext {
     /// The gateway's own outbound leg. The jail never gets this network.
     pub egress_network: String,
     pub jail_id: String,
+    pub class: String,
+    /// Host path of this run's audit directory, bind-mounted writable.
+    pub audit_dir: Option<String>,
     pub selinux: bool,
 }
 
@@ -504,6 +599,14 @@ pub fn gateway_args(context: &GatewayContext) -> Vec<String> {
     args.extend(["--name".into(), context.container_name.clone()]);
     args.extend(["--pull=never".into()]);
     args.extend(["--read-only".into()]);
+    args.extend([
+        "--label".into(),
+        format!("io.agentjail.class={}", context.class),
+    ]);
+    args.extend([
+        "--label".into(),
+        format!("io.agentjail.jail={}", context.jail_id),
+    ]);
     // No capabilities except the one that binds :53 as a non-root uid.
     args.extend(["--cap-drop=ALL".into()]);
     args.extend(["--cap-add=NET_BIND_SERVICE".into()]);
@@ -521,6 +624,21 @@ pub fn gateway_args(context: &GatewayContext) -> Vec<String> {
             context.class_config
         ),
     ]);
+    if let Some(audit_dir) = &context.audit_dir {
+        // The image runs as uid 65534; map the host user onto it so the
+        // per-run directory stays owned by the operator, not world-writable.
+        args.extend(["--userns".into(), "keep-id:uid=65534,gid=65534".into()]);
+        let mut audit_option = "rw".to_string();
+        if context.selinux {
+            audit_option.push_str(",Z");
+        }
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,source={audit_dir},destination={CONTAINER_AUDIT_DIR},{audit_option}"
+            ),
+        ]);
+    }
     args.push(context.image_id.clone());
     args.extend([
         "--config".into(),
@@ -530,6 +648,9 @@ pub fn gateway_args(context: &GatewayContext) -> Vec<String> {
         "--grant".into(),
         grant_argument(&context.grant),
     ]);
+    if context.audit_dir.is_some() {
+        args.extend(["--audit-dir".into(), CONTAINER_AUDIT_DIR.to_string()]);
+    }
     args
 }
 
@@ -976,6 +1097,8 @@ args = ["-lc", "echo {workdir}"]
             network: "agentjail-test-1-model".to_string(),
             egress_network: "agentjail-test-1-egress".to_string(),
             jail_id: "test-1".to_string(),
+            class: "model".to_string(),
+            audit_dir: None,
             selinux: false,
         };
 
@@ -1116,5 +1239,77 @@ args = ["-lc", "echo {workdir}"]
     fn container_and_secret_names_are_stable_and_safe() {
         assert_eq!(container_name("my/profile", 7), "agentjail-my-profile-7");
         assert!(secret_prefix("my/profile").starts_with("agentjail-my-profile-"));
+    }
+
+    #[test]
+    fn the_gateway_is_labelled_and_mounts_the_audit_directory() {
+        let context = GatewayContext {
+            container_name: "agentjail-test-1-gateway".to_string(),
+            image_id: "sha256:abc".to_string(),
+            class_config: "/repo/gateway/classes/model.toml".to_string(),
+            grant: Vec::new(),
+            network: "agentjail-test-1-model".to_string(),
+            egress_network: "agentjail-test-1-egress".to_string(),
+            jail_id: "test-1".to_string(),
+            class: "model".to_string(),
+            audit_dir: Some("/state/audit/model".to_string()),
+            selinux: false,
+        };
+        let args = gateway_args(&context);
+        let joined = args.join(" ");
+        for expected in [
+            "--label io.agentjail.class=model",
+            "--label io.agentjail.jail=test-1",
+            "--userns keep-id:uid=65534,gid=65534",
+            "--mount type=bind,source=/state/audit/model,destination=/var/log/agentjail,rw",
+            "--audit-dir /var/log/agentjail",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing {expected:?} in {joined}"
+            );
+        }
+        assert_eq!(audit_file_name("test-1", "audit"), "test-1.audit.log");
+        assert_eq!(audit_file_name("a/b c", "dns"), "a-b-c.dns.log");
+    }
+
+    #[test]
+    fn audit_retention_keeps_the_newest_runs_and_drops_both_files() {
+        let dir =
+            std::env::temp_dir().join(format!("agentjail-audit-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        for run in ["a", "b", "c", "d", "e"] {
+            for stream in ["audit", "dns"] {
+                std::fs::write(
+                    dir.join(audit_file_name(run, stream)),
+                    format!("ts=1 class=model jail={run}\n"),
+                )
+                .expect("write fake audit file");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let removed = prune_audit_runs(&dir, 3, "e");
+        let removed: Vec<String> = removed
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(removed.len(), 4, "{removed:?}");
+        for name in ["a.audit.log", "a.dns.log", "b.audit.log", "b.dns.log"] {
+            assert!(removed.contains(&name.to_string()), "{name}: {removed:?}");
+        }
+        for name in [
+            "c.audit.log",
+            "c.dns.log",
+            "d.audit.log",
+            "d.dns.log",
+            "e.audit.log",
+            "e.dns.log",
+        ] {
+            assert!(dir.join(name).is_file(), "{name} was pruned");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

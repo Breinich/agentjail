@@ -10,6 +10,7 @@
 //! `key=value` pairs, and a filter is an exact match on one of them.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// The audit stream's tag in the merged view.
 pub const AUDIT: &str = "audit";
@@ -54,6 +55,39 @@ impl Line {
     pub fn render(&self) -> String {
         format!("stream={} {}", self.stream, self.raw)
     }
+}
+
+/// The per-run files under one class directory, newest run first. `run` keeps the
+/// newest [`agentjail_core::run::AUDIT_RETAIN_RUNS`] runs, and a run's two files
+/// share a stem, so the stream is the suffix rather than the directory.
+pub fn run_files(dir: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut files: Vec<(&'static str, PathBuf, Option<std::time::SystemTime>)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let stream = if name.ends_with(".audit.log") {
+            AUDIT
+        } else if name.ends_with(".dns.log") {
+            DNS
+        } else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        files.push((stream, path, modified));
+    }
+    files.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+    files
+        .into_iter()
+        .map(|(stream, path, _)| (stream, path))
+        .collect()
 }
 
 /// Parse one line. A line without a `ts` is not a line this gateway wrote, so
