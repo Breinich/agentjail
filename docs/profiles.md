@@ -115,7 +115,7 @@ Defaulted, each because absence is **strictly restrictive or unambiguous**:
 | `mounts` | `[]` | No extra host access. |
 | `env` | `{}` | No extra environment. |
 | `secrets` | `[]` | No credentials. |
-| `network.egress` | `[]` | In `mode = "none"` there is nothing to reach; in `mode = "allowlist"` an empty list is a validation error. |
+| `network.egress` | `[]` | In `mode = "none"` there is nothing to reach; in `mode = "allowlist"` an empty list is legitimate — it is a grant of nothing, the same posture as `mode = "none"`, and `run` says so instead of refusing. |
 | `network.name` | none | **Required by `run` in `mode = "none"`**: there agentjail attaches to an existing internal network and does not create one. Verified on every start. An allowlist profile names no network: its per-run class network is created and verified for you. |
 | `mounts[].read_only` | `true` | Writable access must be requested. |
 | `mounts[].required` | `true` | A missing path fails the launch instead of silently shrinking the jail. |
@@ -244,10 +244,10 @@ needs.
 | Field | Required | Rule |
 | --- | --- | --- |
 | `name` | no | Attach to this existing podman network instead of creating one (`mode = "none"` only; refused with `allowlist`). Verified against the single-route invariant on **every** start; `run` refuses a network that is not internal. Pattern: `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`. |
-| `class` | with `allowlist` | Egress class: `model`, `external`, or `internal`. It names the internal network the jail joins, and therefore which committed allowlist (`gateway/classes/<class>.toml`) applies. The agent cannot change it from inside. Refused with `mode = "none"`. The class config also decides what the profile cannot: the jail's byte budget and connection cap (`max_bytes`, `max_connections`) and which address ranges an allowlisted name may resolve to (`address_policy`). See `docs/egress-classes.md`. |
+| `class` | with `allowlist` | Egress class: `model`, `external`, or `internal`, or an operator class named by `class_dir` + `class_digest` (below). It names the internal network the jail joins, and therefore which allowlist (`gateway/classes/<class>.toml`) is the **ceiling**. The agent cannot change it from inside. Refused with `mode = "none"`. The class config also decides what the profile cannot: the jail's byte budget and connection cap (`max_bytes`, `max_connections`) and which address ranges an allowlisted name may resolve to (`address_policy`). See `docs/egress-classes.md`. |
 | `mode` | yes | `none` or `allowlist`. |
 | `dns` | yes | `none`, `gateway`, or `pinned`. `pinned` parses and is **refused by validation as not implemented**; `gateway` is the only accepted resolver with `mode = "allowlist"`. |
-| `egress` | no | Array of destinations; required non-empty when `mode = "allowlist"`. |
+| `egress` | no | Array of destinations; **optional**. It narrows the class, and the intersection is the grant the gateway is started with (`run` passes it as `--grant`, and `profile show` prints it). Outside the class is refused before start; empty means no route out. |
 | `class_dir` | no | Directory holding an **operator-defined** `<class>.toml`. Absolute, given with `class_digest`, and only with `mode = "allowlist"`. |
 | `class_digest` | no | `sha256:<64 hex>` of that file. Required with `class_dir`; a mismatch refuses the run. |
 
@@ -284,8 +284,8 @@ the absent resolver.
 
 | `mode` | `dns` | Meaning |
 | --- | --- | --- |
-| `none` (safe posture) | `none` | Internal network, no route out, no resolver. `egress` must be empty. |
-| `allowlist` | `gateway` | Joined to the per-run class network; the class gateway is the only peer, the resolver, and the proxy. `egress` must be a subset of the class allowlist. |
+| `none` (safe posture) | `none` | Internal network with no route out; `egress` must be empty. The network still carries a resolver (above), so the protection is the absent route, not an absent resolver. |
+| `allowlist` | `gateway` | Joined to the per-run class network; the class gateway is the only peer, the resolver, and the proxy. `egress` is the grant: the intersection with the class allowlist, empty meaning nothing. |
 | `allowlist` | `pinned` | **Refused by validation** ("not implemented yet"): the launcher always starts the class gateway as the resolver, so this value would be a knob with no enforcement behind it. |
 
 #### `[[network.egress]]`

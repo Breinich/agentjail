@@ -73,7 +73,7 @@
   },
   "allOf": [
     {
-      "description": "network.mode=none means no route at all and no resolver.",
+      "description": "network.mode=none means no route at all and no resolver: no-egress mode cannot carry destinations, which is a different claim from an allowlist profile that asks for nothing.",
       "if": {
         "required": [
           "network"
@@ -109,7 +109,7 @@
       }
     },
     {
-      "description": "network.mode=allowlist requires at least one destination and a DNS strategy that does not hand the agent a general-purpose resolver.",
+      "description": "network.mode=allowlist requires a DNS strategy that does not hand the agent a general-purpose resolver; an omitted egress list and an explicit empty list are the same grant of nothing.",
       "if": {
         "required": [
           "network"
@@ -131,9 +131,6 @@
         "properties": {
           "network": {
             "properties": {
-              "egress": {
-                "minItems": 1
-              },
               "dns": {
                 "enum": [
                   "gateway",
@@ -361,7 +358,7 @@
         },
         "egress": {
           "type": "array",
-          "description": "Destinations the egress gateway may permit.",
+          "description": "Destinations the egress gateway may permit. An omitted list and an explicit empty array are the same grant of nothing: with mode=\"allowlist\" the jail starts and reaches nothing rather than being refused, and with mode=\"none\" an empty list is the only accepted value.",
           "items": {
             "$ref": "#/$defs/egress"
           },
