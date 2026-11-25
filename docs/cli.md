@@ -5,7 +5,7 @@ Three binaries, one workspace:
 | Binary | Runs where | Job |
 | --- | --- | --- |
 | `agentjail` | host | policy: profile validation, preflight, doctor, launch orchestration |
-| `agentjail-launcher` | inside the jail, as PID 1 | stdio/signal/exit-code plumbing around the agent |
+| `agentjail-launcher` | inside the jail, as the entrypoint of an image that runs it (not in `run`'s path today) | stdio/signal/exit-code plumbing around the agent |
 | `agentjail-gateway` | its own container, the jail's only peer | DNS pinning and CONNECT allowlist |
 
 The launcher and gateway are built static against musl so they can be
@@ -13,11 +13,16 @@ bind-mounted into a jail built from any base, including `scratch`.
 
 ## `agentjail run <profile> -- <agent command…>`
 
-Implemented for `network.mode = "none"` (no egress). The build path:
+Implemented for both modes: `network.mode = "none"` (no egress) and
+`"allowlist"` (an egress class plus the profile's grant, which `run` intersects
+and hands to the gateway). What is common and what is mode-specific, in the
+order `run` does it:
 
-- **preflight, every start**: `network.name` is required; the named network is
-  inspected and verified against the single-route invariant with the same code
-  path `doctor` uses. A bridged network is refused before anything is created.
+- **preflight, every start**: with `mode = "none"` the network named by
+  `network.name` is inspected and verified against the single-route invariant
+  with the same code path `doctor` uses; with `mode = "allowlist"` the
+  per-run class network is created and verified the same way (see the allowlist
+  bullet below). A bridged network is refused before anything is created.
 - **argv**: `podman run --rm --interactive --pull=never --read-only
   --userns=keep-id:uid=10000,gid=10000 --cap-drop=ALL
   --security-opt=no-new-privileges`, the profile's `--pids-limit`, `--memory`,
@@ -41,11 +46,13 @@ Implemented for `network.mode = "none"` (no egress). The build path:
     `agentjail` (or a host crash) cannot be caught: those entries remain until
     the next run of the same profile prunes dead-pid entries as a backstop. A
     `source = "store"` entry belongs to the user and is never removed.
-- **exec vs supervise**: with no secrets to clean up, `agentjail` calls
+- **exec vs supervise**: when this run owns nothing to clean up — no
+  secret-store entries, and no gateway or per-run network — `agentjail` calls
   `exec(podman …)`, so stdio, signals, and the exit code pass through with no
-  wrapper. When it created secret-store entries it supervises podman instead:
-  it forwards SIGINT/SIGTERM/SIGQUIT, waits for podman, removes the entries, and
-  exits with the same code (or 128 + signal).
+  wrapper. When it created secret-store entries it supervises podman instead,
+  and so does every `allowlist` run, which always creates a gateway and two
+  networks: it forwards SIGINT/SIGTERM/SIGQUIT, waits for podman, removes what
+  it created, and exits with the same code (or 128 + signal).
 - **home**: the rootfs is read-only, so `run` mounts writable scratch at the
   parent of `home` and the image entrypoint creates `$HOME` with **mode 0700**
   owned by the jail uid. `home` must be a subdirectory (for example
@@ -80,8 +87,9 @@ The agent runs with **pipes, not a TTY**:
   corrupt a structured protocol on stdout.
 - EOF on stdin is propagated into the jail (no half-open pipe that keeps the
   agent waiting).
-- terminal resize events are forwarded when the caller has a terminal, and
-  ignored cleanly when it does not.
+- terminal resize events are forwarded by `agentjail-launcher` when the caller
+  has a terminal, and ignored cleanly when it does not; `run` starts the jail
+  without a TTY, so there is no resize in its path.
 
 This is what a host harness needs: a container turns sockets into pipes, so the
 pipes/SIGTERM/exit-code/resize path decides whether adoption is possible at all.
@@ -97,10 +105,14 @@ session **inside the jail**, which needs the run path.
 
 ### Signals and exit codes
 
-`SIGINT`, `SIGTERM`, and `SIGQUIT` received by `agentjail` are forwarded to the
-agent's process group; `SIGWINCH` is forwarded as a resize. The container is
-removed on **every** exit path — normal exit, signal, launcher crash — so no
-jail, network, or tmpfs is orphaned.
+`SIGINT`, `SIGTERM`, and `SIGQUIT` received by `agentjail` reach the agent
+through the chain that exists: host-side `agentjail` → the container's PID 1
+(the image's `tini`/entrypoint) → the agent process. Inside the jail `tini` is
+PID 1, not `agentjail-launcher`, so the launcher's process-group forwarding is
+**not reachable from `run`**, and processes the agent itself spawns (its
+grandchildren) are not signalled. The container is removed on **every** exit
+path — normal exit, signal, launcher crash — so no jail, network, or tmpfs is
+orphaned.
 
 | Situation | Exit code |
 | --- | --- |
@@ -115,8 +127,10 @@ with the profile's literal environment only.
 
 ### `agentjail-launcher`
 
-The launcher is implemented and tested (`crates/agentjail-launcher`). Inside the
-jail it:
+The launcher is implemented and tested (`crates/agentjail-launcher`), and it is
+**not in `run`'s path**: the jail's PID 1 is the image's `tini`/entrypoint, so
+the forwarding below is not what a `run` signal travels through (see "Signals
+and exit codes"). Inside the jail, when an image's entrypoint does run it, it:
 
 1. refuses to run the agent as root (`AGENTJAIL_ALLOW_ROOT=1` exists only for
    tests and image builds);

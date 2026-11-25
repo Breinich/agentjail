@@ -165,13 +165,6 @@ repeat them. Each one is also written where the guarantee it bounds lives:
    process-group forwarding — implemented and tested in its own right — is not
    reachable from `run`. Processes the agent itself spawns (its grandchildren) are
    not signalled.
-9. **The README quickstart and `run --help` lag this release, and are not
-   current.** The quickstart predates egress classes and the grant: it still says
-   `allowlist` profiles are refused and that the gateway does not proxy, neither
-   of which is true on this tag. `run --help` still calls the launcher contract
-   unimplemented. [`docs/adopting.md`](docs/adopting.md) is the path that works
-   today; correcting the two claims in the tree is a named follow-up, deliberately
-   not part of this release's diff.
 
 Also true of this release, and covered in `docs/threat-model.md`: the jail is a
 container and not a VM; `address_policy = "lan"` (the `internal` class) reaches
@@ -205,5 +198,4 @@ rather than restating them.
 - [`docs/threat-model.md`](docs/threat-model.md) — assets, attacker model,
   guarantees, and the residual risks beside each one.
 - [`docs/adopting.md`](docs/adopting.md) — what an adopter has to supply, one
-  worked profile, which class per role, and what adoption does not buy. This is
-  the path that works today; the README's quickstart is stale (limitation 9).
+  worked profile, which class per role, and what adoption does not buy.
