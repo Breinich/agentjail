@@ -406,7 +406,8 @@ token-shaped, which is the validator working.
 
 The rule behind the table: **a field whose absence could silently produce a
 permissive or ambiguous configuration is required, never defaulted.** "No egress"
-and "the operator forgot" must not look the same in a file.
+and "the operator forgot" must not look the same in a file: `mode` and `dns` say
+the posture, while an omitted or empty `egress` list is the same grant of nothing.
 
 | Field | Required because |
 | --- | --- |
@@ -418,7 +419,7 @@ and "the operator forgot" must not look the same in a file.
 | `network.dns` | The DNS strategy has to be written down rather than inherited, because an inherited host search domain can turn an unqualified name into an internal address in `allowlist` mode. (What this field does *not* buy you in `mode = "none"`: see [`mode = "none"` still resolves names](#mode--none-still-resolves-names).) |
 | `agent.command` | Something has to run; a profile that names no executable is a jail with no purpose. |
 | `network.name` (only `mode = "none"`) | `run` attaches to an existing network and creates none; naming it is the check that you meant that one. |
-| `network.class` + non-empty `egress` (only `mode = "allowlist"`) | The class is the runtime grant; `egress` is the subset this profile was written against and is checked before start. It cannot narrow the run (§3). |
+| `network.class` (only `mode = "allowlist"`) | The class is the runtime grant; `egress` is the subset this profile was written against and is checked before start. It cannot narrow the run (§3). |
 
 Everything else is defaulted, and every default is the restrictive one:
 `mounts = []`, `env = {}`, `secrets = []`, `read_only = true`,
@@ -440,7 +441,6 @@ that catches all of these before anything starts.
 | `mode = "none"` with `dns = "gateway"` | "mode \"none\" has no resolver; set dns = \"none\"" |
 | `mode = "allowlist"` without `class` | "required with mode \"allowlist\"…" |
 | `mode = "allowlist"` with `network.name` | "does not take a network name; the per-run class network is created for you" |
-| `mode = "allowlist"` with no `egress` entries | "needs at least one destination" |
 | `dns = "pinned"` | "not implemented yet… use dns = \"gateway\"" |
 | `host = "*.example.com"` | "wildcards are not allowed; list each destination explicitly" |
 | `host = "https://api.example.com"` | "give a bare DNS name; schemes, paths, and ports belong in other fields" |

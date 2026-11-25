@@ -393,6 +393,70 @@ fn show_prints_an_empty_grant_as_empty_not_as_absent() {
 }
 
 #[test]
+fn explicit_empty_egress_is_the_same_grant_as_an_omitted_list() {
+    let dir = tmpdir("explicit-empty-grant");
+    let omitted_text = ALLOWLIST
+        .replace(
+            "[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n",
+            "",
+        )
+        .replace(
+            "[[secrets]]\nname = \"forge_token\"\nsource = \"env\"\nref = \"EXAMPLE_FORGE_TOKEN\"\ntarget = \"EXAMPLE_FORGE_TOKEN\"\n",
+            "",
+        );
+    let explicit_text =
+        omitted_text.replace("dns = \"gateway\"\n", "dns = \"gateway\"\negress = []\n");
+    let omitted_path = write_profile(&dir, "omitted.toml", &omitted_text);
+    let explicit_path = write_profile(&dir, "explicit.toml", &explicit_text);
+
+    for path in [&explicit_path, &omitted_path] {
+        let output = run(&["profile", "validate", path.to_str().unwrap()], &dir, None);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    }
+
+    let show = |path: &Path| -> serde_json::Value {
+        let output = run(&["profile", "show", path.to_str().unwrap()], &dir, None);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        serde_json::from_str(&stdout(&output)).expect("json")
+    };
+    let explicit = show(&explicit_path);
+    let omitted = show(&omitted_path);
+    assert_eq!(
+        explicit["profile"]["network"]["egress"],
+        serde_json::json!([])
+    );
+    // The two forms are indistinguishable in what the jail would actually get.
+    assert_eq!(explicit["profile"], omitted["profile"]);
+    assert_eq!(explicit["egress"], omitted["egress"]);
+
+    // The explicit form runs, warns, and reaches nothing: the gateway is told
+    // the grant is empty rather than left with the class allowlist.
+    let podman = fake_podman(&dir);
+    let gateway_argv = dir.join("gateway-argv.txt");
+    let output = run_with_env(
+        &["run", explicit_path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[(
+            "AGENTJAIL_TEST_GATEWAY_ARGV",
+            gateway_argv.to_str().unwrap(),
+        )],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("egress grant is empty: this jail has no route out"),
+        "{}",
+        stderr(&output)
+    );
+    let gateway = recorded_argv(&gateway_argv);
+    let index = gateway
+        .iter()
+        .position(|arg| arg == "--grant")
+        .expect("the gateway is always told its grant");
+    assert_eq!(gateway.get(index + 1).map(String::as_str), Some(""));
+}
+
+#[test]
 fn run_execs_podman_and_propagates_its_exit_code() {
     let dir = tmpdir("run-exit");
     let path = write_profile(&dir, "minimal.toml", MINIMAL);
