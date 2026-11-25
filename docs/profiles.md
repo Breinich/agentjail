@@ -115,7 +115,7 @@ Defaulted, each because absence is **strictly restrictive or unambiguous**:
 | `mounts` | `[]` | No extra host access. |
 | `env` | `{}` | No extra environment. |
 | `secrets` | `[]` | No credentials. |
-| `network.egress` | `[]` | In `mode = "none"` there is nothing to reach; in `mode = "allowlist"` an omitted list and an explicit empty list are the same grant of nothing: the jail starts and reaches nothing, and `run` says so. |
+| `network.egress` | `[]` | In `mode = "none"` there is nothing to reach; in `mode = "allowlist"` an empty list is a validation error. |
 | `network.name` | none | **Required by `run` in `mode = "none"`**: there agentjail attaches to an existing internal network and does not create one. Verified on every start. An allowlist profile names no network: its per-run class network is created and verified for you. |
 | `mounts[].read_only` | `true` | Writable access must be requested. |
 | `mounts[].required` | `true` | A missing path fails the launch instead of silently shrinking the jail. |
@@ -247,7 +247,7 @@ needs.
 | `class` | with `allowlist` | Egress class: `model`, `external`, or `internal`. It names the internal network the jail joins, and therefore which committed allowlist (`gateway/classes/<class>.toml`) applies. The agent cannot change it from inside. Refused with `mode = "none"`. The class config also decides what the profile cannot: the jail's byte budget and connection cap (`max_bytes`, `max_connections`) and which address ranges an allowlisted name may resolve to (`address_policy`). See `docs/egress-classes.md`. |
 | `mode` | yes | `none` or `allowlist`. |
 | `dns` | yes | `none`, `gateway`, or `pinned`. `pinned` parses and is **refused by validation as not implemented**; `gateway` is the only accepted resolver with `mode = "allowlist"`. |
-| `egress` | no | Array of destinations; with `mode = "allowlist"` it may be omitted or empty, which is a grant of nothing (the jail starts and reaches nothing). |
+| `egress` | no | Array of destinations; required non-empty when `mode = "allowlist"`. |
 | `class_dir` | no | Directory holding an **operator-defined** `<class>.toml`. Absolute, given with `class_digest`, and only with `mode = "allowlist"`. |
 | `class_digest` | no | `sha256:<64 hex>` of that file. Required with `class_dir`; a mismatch refuses the run. |
 
