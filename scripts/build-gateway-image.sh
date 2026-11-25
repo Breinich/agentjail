@@ -5,12 +5,17 @@
 # needs the binary and the committed class configs, and a repository-wide
 # context would drag `target/` into the daemon.
 #
+# The default tag belongs to this workspace, not to the machine: one shared
+# mutable tag would let a second checkout overwrite the gateway a running jail --
+# or a proof -- talks to. Pass a tag explicitly to publish under another name
+# (`scripts/build-gateway-image.sh "$bin" localhost/agentjail-gateway:1`).
+#
 #   scripts/build-gateway-image.sh [<binary> [<tag>]]
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary=${1:-$root/target/x86_64-unknown-linux-musl/release/agentjail-gateway}
-tag=${2:-localhost/agentjail-gateway:1}
+tag=${2:-$("$root/scripts/gateway-image-tag.sh" "$root")}
 
 if [ ! -x "$binary" ]; then
   echo "missing static gateway binary: $binary" >&2

@@ -64,6 +64,9 @@ struct Gateway {
     /// The gateway's own stderr: startup lines, then DNS lines (audit defaults
     /// to stdout). Ports are chosen by the kernel and read from here.
     stderr: BufReader<std::process::ChildStderr>,
+    /// Everything the gateway printed on stderr before it listened, which is
+    /// where the grant it was started with is reported.
+    startup: String,
     proxy_port: u16,
     dns_port: u16,
     dir: PathBuf,
@@ -95,6 +98,20 @@ impl Gateway {
     }
 
     fn start_with(name: &str, allow: &str, extra: &str, limits: Limits) -> Gateway {
+        Gateway::start_granted(name, allow, extra, limits, None)
+    }
+
+    /// `grant` is what `run` hands a jail: the intersection of the class
+    /// allowlist and the profile's `network.egress`. `Some("")` is a jail that
+    /// was granted nothing; `None` starts a class-level gateway, which the
+    /// gateway only accepts with `--class-only`.
+    fn start_granted(
+        name: &str,
+        allow: &str,
+        extra: &str,
+        limits: Limits,
+        grant: Option<&str>,
+    ) -> Gateway {
         let dir = tmpdir(name);
         let config = format!(
             r#"class = "test"
@@ -118,9 +135,15 @@ allow = [
         let config_path = dir.join("class.toml");
         std::fs::write(&config_path, config).expect("write class config");
 
-        let mut child = Command::new(binary())
+        let mut command = Command::new(binary());
+        command
             .args(["--config", config_path.to_str().expect("path")])
-            .args(["--jail-id", "jail-42"])
+            .args(["--jail-id", "jail-42"]);
+        match grant {
+            Some(grant) => command.args(["--grant", grant]),
+            None => command.arg("--class-only"),
+        };
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -149,6 +172,7 @@ allow = [
         Gateway {
             child,
             stderr,
+            startup: seen,
             proxy_port,
             dns_port,
             dir,
@@ -811,6 +835,239 @@ fn dns_answers_only_this_class_names_and_logs_on_its_own_stream() {
         "a DNS line leaked into the audit stream: {:?}",
         gateway.audit()
     );
+}
+
+// ----------------------------------------------------------------------
+// The profile is the grant, not a preflight promise.
+//
+// These two tests are the assessment's reproduction, inverted: the class allows
+// both destinations, the profile lists one, and the gateway that `run` starts is
+// handed the intersection. Before the grant was enforced, a jail that listed one
+// destination reached every destination its class listed.
+
+#[test]
+fn a_jail_reaches_exactly_the_destinations_its_profile_asked_for() {
+    let (asked_port, _asked) = one_shot_server("asked");
+    let (other_port, _other) = one_shot_server("other");
+    let (neither_port, _neither) = one_shot_server("neither");
+    // The class allows the first two; the profile asked for the first only.
+    let class_allow = format!("  \"localhost:{asked_port}\",\n  \"localhost:{other_port}\",\n");
+    let gateway = Gateway::start_granted(
+        "grant",
+        &class_allow,
+        "",
+        Limits::default(),
+        Some(&format!("localhost:{asked_port}")),
+    );
+
+    // The destination the profile listed is the one that works.
+    let (status, body) = gateway.connect(&format!("localhost:{asked_port}"));
+    assert_eq!(status, "HTTP/1.1 200 Connection established", "{body}");
+    assert!(body.contains("hello from asked"), "{body}");
+
+    // The other class destination is refused, and the reason says the profile
+    // is what refused it: it is in the class.
+    let (status, _body) = gateway.connect(&format!("localhost:{other_port}"));
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "a destination the profile did not ask for must be refused, got {status}"
+    );
+
+    // A destination in neither list is a different fact, with a different reason.
+    let (status, _body) = gateway.connect(&format!("localhost:{neither_port}"));
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "a destination the class does not allow must be refused, got {status}"
+    );
+
+    let not_in_profile = format!("dest=localhost:{other_port} decision=deny reason=not-in-profile");
+    let not_in_class = format!("dest=localhost:{neither_port} decision=deny reason=not-in-class");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(gateway.audit().contains(&not_in_profile) && gateway.audit().contains(&not_in_class)) {
+        assert!(
+            Instant::now() < deadline,
+            "missing a denial line: {:?}",
+            gateway.audit()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let audit = gateway.audit();
+    assert!(audit.contains(&not_in_profile), "{audit}");
+    assert!(audit.contains(&not_in_class), "{audit}");
+}
+
+#[test]
+fn a_grant_of_nothing_reaches_nothing_and_says_so_per_reason() {
+    let (port, _server) = target_server("empty-grant");
+    // The profile asked for nothing: the gateway is started with an empty grant,
+    // which is a grant of nothing and not "no grant given".
+    let gateway = Gateway::start_granted(
+        "empty-grant",
+        &format!("  \"localhost:{port}\","),
+        "",
+        Limits::default(),
+        Some(""),
+    );
+
+    let (status, _body) = gateway.connect(&format!("localhost:{port}"));
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "an empty grant must reach nothing, got {status}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gateway.audit().contains("reason=not-in-profile") {
+        assert!(
+            Instant::now() < deadline,
+            "no denial line for an empty grant: {:?}",
+            gateway.audit()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The class allows it, so the profile is the reason, and the gateway says so
+    // while it starts up.
+    let startup = &gateway.startup;
+    assert!(
+        startup.contains("grant is 0 of 1 class destination(s)"),
+        "{startup}"
+    );
+    assert!(startup.contains("this jail has no route out"), "{startup}");
+}
+
+#[test]
+fn a_name_the_profile_did_not_ask_for_does_not_resolve() {
+    // Two class destinations, one of them granted; plus one in neither list.
+    let mut gateway = Gateway::start_granted(
+        "grant-dns",
+        "  \"localhost:1\",\n  \"elsewhere.example:443\",\n",
+        "",
+        Limits::default(),
+        Some("localhost:1"),
+    );
+
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind client");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    for (name, expected_answers) in [("localhost", 1u16), ("elsewhere.example", 0)] {
+        let packet = query(0x4243, name, 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            socket
+                .send_to(&packet, ("127.0.0.1", gateway.dns_port))
+                .expect("send query");
+            let mut buffer = [0u8; 512];
+            match socket.recv_from(&mut buffer) {
+                Ok((len, _)) => {
+                    let response = &buffer[..len];
+                    let answers = u16::from_be_bytes([response[6], response[7]]);
+                    assert_eq!(answers, expected_answers, "{name}: {response:?}");
+                    let rcode = response[3] & 0x0f;
+                    assert_eq!(rcode, if expected_answers == 0 { 3 } else { 0 }, "{name}");
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no DNS reply for {name}: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    // The DNS stream names the same distinction as the audit stream: the name is
+    // in the class and this jail was not granted it.
+    let mut dns_lines = String::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        assert!(gateway.stderr.read_line(&mut line).expect("read stderr") > 0);
+        dns_lines.push_str(&line);
+    }
+    assert!(
+        dns_lines
+            .contains("qname=elsewhere.example qtype=1 decision=nxdomain reason=not-in-profile"),
+        "{dns_lines}"
+    );
+}
+
+/// A gateway that is not told what to enforce must not start.
+///
+/// The default used to be the class allowlist, which is the fail-open this whole
+/// change exists to remove: a `run` regression that stopped passing `--grant`
+/// would hand the jail every destination its class lists, and the jail would look
+/// normal. Both modes are now explicit flags, so a missing grant is a startup
+/// error that names both.
+#[test]
+fn a_gateway_started_with_neither_grant_nor_class_only_refuses_to_start() {
+    let dir = tmpdir("no-grant");
+    let config = dir.join("class.toml");
+    std::fs::write(
+        &config,
+        "class = \"test\"\nlisten = \"127.0.0.1:3128\"\ndns = \"127.0.0.1:53\"\n\
+         max_bytes = 1048576\nmax_connections = 4\nallow = [\"localhost:1\"]\n",
+    )
+    .expect("write");
+    let output = Command::new(binary())
+        .args(["--config", config.to_str().expect("path")])
+        .args(["--jail-id", "jail-42"])
+        .output()
+        .expect("run gateway");
+    assert_eq!(output.status.code(), Some(1), "it must not start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in ["--grant", "--class-only"] {
+        assert!(
+            stderr.contains(expected),
+            "the refusal must name {expected}: {stderr}"
+        );
+    }
+    // It never listened, so nothing is enforcing anything.
+    assert!(
+        !stderr.contains("listening on"),
+        "it bound a listener before refusing: {stderr}"
+    );
+}
+
+#[test]
+fn grant_and_class_only_together_are_refused_rather_than_guessed_at() {
+    let dir = tmpdir("both-grant-modes");
+    let config = dir.join("class.toml");
+    std::fs::write(
+        &config,
+        "class = \"test\"\nlisten = \"127.0.0.1:3128\"\ndns = \"127.0.0.1:53\"\n\
+         max_bytes = 1048576\nmax_connections = 4\nallow = [\"localhost:1\"]\n",
+    )
+    .expect("write");
+    let output = Command::new(binary())
+        .args(["--config", config.to_str().expect("path")])
+        .args(["--grant", "localhost:1", "--class-only", "--check"])
+        .output()
+        .expect("run gateway");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mutually exclusive"), "{stderr}");
+}
+
+/// `--check` reads a class and starts no listener, so it enforces nothing and
+/// needs neither mode. This is what `scripts/prove-egress-classes.sh` probes the
+/// image with.
+#[test]
+fn check_needs_neither_mode_because_it_enforces_nothing() {
+    let dir = tmpdir("check-no-grant");
+    let config = dir.join("class.toml");
+    std::fs::write(
+        &config,
+        "class = \"test\"\nlisten = \"127.0.0.1:3128\"\ndns = \"127.0.0.1:53\"\n\
+         max_bytes = 1048576\nmax_connections = 4\nallow = [\"localhost:1\"]\n",
+    )
+    .expect("write");
+    let output = Command::new(binary())
+        .args(["--config", config.to_str().expect("path"), "--check"])
+        .output()
+        .expect("run gateway");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("class: test"), "{stdout}");
 }
 
 fn query(id: u16, name: &str, qtype: u16) -> Vec<u8> {

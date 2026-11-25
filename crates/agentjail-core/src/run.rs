@@ -16,11 +16,64 @@
 //! `secrets[].delivery = "file"` is not offered because secrets are injected as
 //! environment variables only.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
-use crate::class::{ClassConfig, PROXY_PORT};
+use crate::class::{AllowEntry, ClassConfig, PROXY_PORT};
 use crate::profile::{Agent, Mount, NetworkMode, Profile, Secret, SecretDelivery, SecretSource};
+
+/// Environment variable that names the gateway image explicitly.
+pub const GATEWAY_IMAGE_ENV: &str = "AGENTJAIL_GATEWAY_IMAGE";
+
+/// The gateway image reference this run uses: `AGENTJAIL_GATEWAY_IMAGE` when it
+/// is set, otherwise the tag derived from the workspace.
+///
+/// The default used to be the single mutable tag `localhost/agentjail-gateway:1`,
+/// shared by every checkout on a machine. Two workspaces that build it from
+/// different code overwrite each other, and a run -- or a proof -- silently
+/// executes another workspace's binary. A per-workspace tag makes that
+/// impossible, and `scripts/build-gateway-image.sh` derives the same one.
+pub fn gateway_image_reference(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<String, String> {
+    if let Some(value) = env.get(GATEWAY_IMAGE_ENV).filter(|value| !value.is_empty()) {
+        return Ok(value.clone());
+    }
+    let root = workspace_root(cwd).ok_or_else(|| {
+        format!(
+            "cannot tell which workspace this is, so it has no gateway image tag: no directory \
+             holding gateway/classes was found from {} or from this binary. Set {GATEWAY_IMAGE_ENV} \
+             to the tag scripts/build-gateway-image.sh printed",
+            cwd.display()
+        )
+    })?;
+    Ok(gateway_image_tag(&root))
+}
+
+/// The tag `scripts/build-gateway-image.sh` builds by default, derived from the
+/// workspace root's physical path so two checkouts never share it. The shell half
+/// of this rule is `scripts/gateway-image-tag.sh`; a test keeps the two in step.
+pub fn gateway_image_tag(root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let physical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(physical.to_string_lossy().as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("localhost/agentjail-gateway:ws-{}", &digest[..8])
+}
+
+/// The workspace this process belongs to: the directory whose `gateway/classes`
+/// holds the committed class configs, found the same way a built-in class is.
+pub fn workspace_root(cwd: &Path) -> Option<PathBuf> {
+    for classes in crate::class::config_search_dirs(cwd) {
+        if classes.is_dir() {
+            // `<workspace>/gateway/classes` -> `<workspace>`
+            return classes.parent()?.parent().map(Path::to_path_buf);
+        }
+    }
+    None
+}
 
 /// Name of the container for one run of one profile.
 pub fn container_name(profile_name: &str, pid: u32) -> String {
@@ -39,6 +92,41 @@ pub fn secret_prefix(profile_name: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     format!("agentjail-{stem}-")
+}
+
+/// The effective grant for one jail: the destinations the profile's
+/// `network.egress` asks for, matched with the class's own host/port rules (a
+/// class `*.suffix` covers a name the profile spells out). This is what the
+/// gateway is told to enforce, so the class allowlist is a ceiling the gateway
+/// cannot exceed rather than a preflight promise: a class that grows later does
+/// not widen a jail that already runs, and a name the profile did not ask for
+/// does not resolve.
+///
+/// An empty grant is legitimate and means "no route out": a profile that asks
+/// for nothing gets nothing, the same posture as `mode = "none"`.
+pub fn effective_grant(profile: &Profile, class: &ClassConfig) -> Vec<AllowEntry> {
+    let grant: BTreeSet<AllowEntry> = profile
+        .network
+        .egress
+        .iter()
+        .filter(|entry| class.class_allows(&entry.host, entry.port))
+        .map(|entry| AllowEntry {
+            host: entry.host.to_ascii_lowercase(),
+            port: entry.port,
+        })
+        .collect();
+    grant.into_iter().collect()
+}
+
+/// Renders a grant the way the gateway takes it: comma-separated `host:port`.
+/// An empty grant renders as the empty string, which is a grant of nothing and
+/// not "no grant given".
+pub fn grant_argument(grant: &[AllowEntry]) -> String {
+    grant
+        .iter()
+        .map(|entry| format!("{}:{}", entry.host, entry.port))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Destinations a profile asks for that its egress class does not permit.
@@ -385,8 +473,13 @@ pub struct GatewayContext {
     /// The gateway image **by ID** (`sha256:…`), never by tag: the tag is a name
     /// and this process is the jail's only route out.
     pub image_id: String,
-    /// Host path of the committed class config, bind-mounted read-only.
+    /// Host path of the committed class config, bind-mounted read-only. This is
+    /// the class's own list, not the grant: it is how a refusal says which side
+    /// refused the destination.
     pub class_config: String,
+    /// The effective grant for this jail: `class allow ∩ profile egress`.
+    /// Always passed, so an empty grant is "nothing", not "no narrowing".
+    pub grant: Vec<AllowEntry>,
     /// The per-run internal network the jail and the gateway share.
     pub network: String,
     /// The gateway's own outbound leg. The jail never gets this network.
@@ -400,8 +493,14 @@ pub struct GatewayContext {
 /// The gateway is dual-homed on purpose: the internal network is where the jail
 /// can reach it, and the egress network is how it reaches the destinations the
 /// class allows. The jail is single-homed, so a bypass has nowhere to go.
+///
+/// Deliberately no `--rm`: a gateway that refuses to start exits immediately, and
+/// its exit code and output are how `run` reports the refusal instead of a
+/// timeout -- a removed container has neither. `run`'s cleanup guard removes it
+/// on every path where this process still runs, and a killed run is pruned by the
+/// next run of the same profile.
 pub fn gateway_args(context: &GatewayContext) -> Vec<String> {
-    let mut args: Vec<String> = vec!["run".into(), "--detach".into(), "--rm".into()];
+    let mut args: Vec<String> = vec!["run".into(), "--detach".into()];
     args.extend(["--name".into(), context.container_name.clone()]);
     args.extend(["--pull=never".into()]);
     args.extend(["--read-only".into()]);
@@ -428,6 +527,8 @@ pub fn gateway_args(context: &GatewayContext) -> Vec<String> {
         CONTAINER_CLASS_CONFIG.to_string(),
         "--jail-id".into(),
         context.jail_id.clone(),
+        "--grant".into(),
+        grant_argument(&context.grant),
     ]);
     args
 }
@@ -756,6 +857,143 @@ args = ["-lc", "echo {workdir}"]
             "no resolver is configured: {joined}"
         );
         assert!(!joined.contains("HTTPS_PROXY"), "{joined}");
+    }
+
+    fn allowlist_profile(egress: &str) -> Profile {
+        let text = PROFILE
+            .replace("mode = \"none\"", "mode = \"allowlist\"")
+            .replace("dns = \"none\"", "dns = \"gateway\"")
+            .replace("name = \"agentjail-test\"\n", "")
+            .replace(
+                "[[mounts]]",
+                &format!("class = \"model\"\n{egress}\n[[mounts]]"),
+            );
+        parse_and_validate(&text).expect("valid allowlist profile")
+    }
+
+    fn model_class(allow: &str) -> ClassConfig {
+        ClassConfig::parse(&format!(
+            "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+             max_bytes = 1048576\nmax_connections = 4\nallow = [{allow}]\n"
+        ))
+        .expect("class config")
+    }
+
+    #[test]
+    fn the_gateway_image_tag_belongs_to_one_workspace_and_is_never_the_shared_one() {
+        let first = gateway_image_tag(Path::new("/tmp/workspace-a"));
+        assert_eq!(first, gateway_image_tag(Path::new("/tmp/workspace-a")));
+        assert_ne!(first, gateway_image_tag(Path::new("/tmp/workspace-b")));
+        assert!(
+            first.starts_with("localhost/agentjail-gateway:ws-"),
+            "{first}"
+        );
+        assert!(
+            !first.ends_with(":1"),
+            "one shared mutable tag is what two workspaces fight over: {first}"
+        );
+
+        // An explicit reference wins, which is how a caller publishes under a
+        // name of its own (`:1` still works when it is passed, not defaulted).
+        let env = BTreeMap::from([(
+            GATEWAY_IMAGE_ENV.to_string(),
+            "localhost/agentjail-gateway:1".to_string(),
+        )]);
+        assert_eq!(
+            gateway_image_reference(&env, Path::new("/nonexistent")).expect("explicit"),
+            "localhost/agentjail-gateway:1"
+        );
+
+        // Otherwise it is derived from the workspace, found the same way a
+        // built-in class is.
+        let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = workspace_root(cwd).expect("this checkout has gateway/classes");
+        assert_eq!(
+            gateway_image_reference(&BTreeMap::new(), cwd).expect("derived"),
+            gateway_image_tag(&root)
+        );
+    }
+
+    #[test]
+    fn the_grant_is_the_intersection_of_the_class_and_the_profile() {
+        let profile =
+            allowlist_profile("[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n");
+        // Both destinations are in the class; the profile asked for one.
+        let class = model_class("\"api.anthropic.com:443\", \"api.openai.com:443\"");
+        let grant = effective_grant(&profile, &class);
+        assert_eq!(
+            grant,
+            vec![AllowEntry {
+                host: "api.anthropic.com".to_string(),
+                port: 443,
+            }]
+        );
+        assert_eq!(grant_argument(&grant), "api.anthropic.com:443");
+        // The class still allows the other destination: the grant is the narrower
+        // list, and the gateway enforces that one.
+        assert!(class.class_allows("api.openai.com", 443));
+        assert!(!grant
+            .iter()
+            .any(|entry| entry.matches_host("api.openai.com")));
+    }
+
+    #[test]
+    fn a_profile_that_asks_for_nothing_gets_a_grant_of_nothing() {
+        let profile = allowlist_profile("");
+        let class = model_class("\"api.anthropic.com:443\"");
+        let grant = effective_grant(&profile, &class);
+        assert!(grant.is_empty());
+        // Empty, not absent: the argument says "nothing", never "no narrowing".
+        assert_eq!(grant_argument(&grant), "");
+    }
+
+    #[test]
+    fn the_grant_uses_the_class_own_matching_rules() {
+        // A class wildcard covers a name the profile spells out, and the grant is
+        // the profile's spelling (the narrower of the two), not the wildcard.
+        let profile =
+            allowlist_profile("[[network.egress]]\nhost = \"deb.example.org\"\nport = 443\n");
+        let class = model_class("\"*.example.org:443\"");
+        assert_eq!(
+            grant_argument(&effective_grant(&profile, &class)),
+            "deb.example.org:443"
+        );
+        // Ports are part of the match, exactly as in the class config.
+        let profile =
+            allowlist_profile("[[network.egress]]\nhost = \"deb.example.org\"\nport = 8443\n");
+        assert!(effective_grant(&profile, &class).is_empty());
+    }
+
+    #[test]
+    fn the_gateway_is_started_with_the_grant_and_never_with_only_the_class() {
+        let class = model_class("\"api.anthropic.com:443\", \"api.openai.com:443\"");
+        let context = |grant| GatewayContext {
+            container_name: "agentjail-test-1-gateway".to_string(),
+            image_id: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            class_config: "/repo/gateway/classes/model.toml".to_string(),
+            grant,
+            network: "agentjail-test-1-model".to_string(),
+            egress_network: "agentjail-test-1-egress".to_string(),
+            jail_id: "test-1".to_string(),
+            selinux: false,
+        };
+
+        let asked =
+            allowlist_profile("[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n");
+        let args = gateway_args(&context(effective_grant(&asked, &class))).join(" ");
+        assert!(
+            args.contains("--grant api.anthropic.com:443"),
+            "the gateway must get the grant, not the class allowlist: {args}"
+        );
+        assert!(!args.contains("api.openai.com"), "{args}");
+
+        // An empty grant is passed as an empty argument, so the gateway narrows
+        // to nothing instead of falling back to the class allowlist.
+        let nothing = allowlist_profile("");
+        let args = gateway_args(&context(effective_grant(&nothing, &class)));
+        let index = args.iter().position(|arg| arg == "--grant").expect("grant");
+        assert_eq!(args.get(index + 1).map(String::as_str), Some(""));
     }
 
     #[test]

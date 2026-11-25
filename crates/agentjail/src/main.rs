@@ -319,10 +319,11 @@ fn validate_command(
     println!("   {}", loaded.profile.summary());
     if let Some((path, class)) = resolve_class(&loaded.profile, cwd)? {
         println!(
-            "   egress class {:?} from {}: {} allowlisted destination(s), deny by default",
+            "   egress class {:?} from {}: grant of {} destination(s) out of {} the class allows, deny by default",
             class.class,
             path.display(),
-            class.allow.len()
+            run::effective_grant(&loaded.profile, &class).len(),
+            class.class_allow.len()
         );
     }
     Ok(EXIT_OK)
@@ -335,10 +336,26 @@ fn show_command(
     cwd: &Path,
 ) -> Result<u8, String> {
     let loaded = load_profile(reference, extra_dirs, env, cwd)?;
-    let document = serde_json::json!({
+    let mut document = serde_json::json!({
         "name": loaded.profile_name(),
         "source": loaded.path.display().to_string(),
         "profile": loaded.profile.effective_json(),
+    });
+    // What the jail actually gets, not what the file says: the intersection of
+    // the class allowlist and this profile's `network.egress`.
+    let (class, grant) = match resolve_class(&loaded.profile, cwd)? {
+        Some((_, class)) => {
+            let grant = run::effective_grant(&loaded.profile, &class);
+            (Some(class), grant)
+        }
+        None => (None, Vec::new()),
+    };
+    document["egress"] = serde_json::json!({
+        "class": class.as_ref().map(|class| class.class.clone()),
+        "grant": grant
+            .iter()
+            .map(|entry| format!("{}:{}", entry.host, entry.port))
+            .collect::<Vec<_>>(),
     });
     println!(
         "{}",
@@ -793,15 +810,19 @@ fn start_class_side(
 ) -> Result<(String, String), String> {
     let (config_path, config) = resolve_class(profile, cwd)?
         .ok_or_else(|| "class side requested for a profile with no egress class".to_string())?;
+    let grant = run::effective_grant(profile, &config);
+    if grant.is_empty() {
+        // Legitimate, and loud: a profile that asks for nothing gets nothing,
+        // the same posture as `mode = "none"`.
+        eprintln!("agentjail: egress grant is empty: this jail has no route out");
+    }
 
     // Resolve the tag to an image ID now, and start the container by that ID.
     // The tag is what an operator builds; the ID is what runs, so a retag between
-    // here and `podman run` cannot swap the process the jail talks to.
-    let image_ref = env
-        .get("AGENTJAIL_GATEWAY_IMAGE")
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "localhost/agentjail-gateway:1".to_string());
+    // here and `podman run` cannot swap the process the jail talks to. The tag
+    // itself is per workspace, so a second checkout building its own gateway
+    // cannot retag this one's.
+    let image_ref = run::gateway_image_reference(env, cwd)?;
     let image_id = podman::image_id(&image_ref)?;
     eprintln!("agentjail: gateway image {image_ref:?} is {image_id} (pinned by ID)");
 
@@ -839,6 +860,7 @@ fn start_class_side(
         container_name: container.clone(),
         image_id,
         class_config: config_path.to_string_lossy().into_owned(),
+        grant: grant.clone(),
         network: network.clone(),
         egress_network,
         jail_id: format!("{profile_name}-{run_id}"),
@@ -850,9 +872,10 @@ fn start_class_side(
     let gateway_ip = wait_for_ip(&container, &network)?;
     eprintln!(
         "agentjail: egress class {:?}: gateway {container} at {gateway_ip}:{PROXY_PORT} on {network}, \
-         {} allowlisted destination(s), audit on its own stream",
+         grant {} of {} class allowlisted destination(s), audit on its own stream",
         config.class,
-        config.allow.len()
+        grant.len(),
+        config.class_allow.len()
     );
     Ok((network, gateway_ip))
 }
@@ -871,23 +894,81 @@ fn prune_dead_resources(profile_name: &str, run_id: u32) {
     }
 }
 
-/// The gateway's address is read from podman once it is running; an address
-/// that never appears fails the run before the jail starts.
+/// The gateway's address is read from podman once it is running.
+///
+/// A gateway that **exited** is a decision, not a slow start: it refused to start
+/// (there is no `--grant`/`--class-only`, or the grant does not match the class),
+/// so it is reported as that refusal, with its exit code and its last output.
+/// Reporting it as "no address after 15s" would read as a slow container, and the
+/// retry somebody then adds is exactly what removes the guarantee. "Still
+/// starting" is only ever said about a container that is still alive.
 fn wait_for_ip(container: &str, network: &str) -> Result<String, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        match podman::container_ip(container, network) {
-            Ok(address) if !address.is_empty() => return Ok(address),
-            Ok(_) | Err(_) => {}
+        let state = podman::container_state(container);
+        if let podman::ContainerState::Exited { code } = state {
+            return Err(gateway_refused(container, code));
+        }
+        if state == podman::ContainerState::Running {
+            match podman::container_ip(container, network) {
+                Ok(address) if !address.is_empty() => return Ok(address),
+                Ok(_) | Err(_) => {}
+            }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "gateway {container:?} has no address on {network:?} after 15s; the class network \
-                 is empty of peers and the run is refused"
-            ));
+            return Err(match state {
+                podman::ContainerState::Running => format!(
+                    "gateway {container:?} is running but has no address on {network:?} after 15s; \
+                     the class network is empty of peers and the run is refused"
+                ),
+                _ => format!(
+                    "gateway {container:?} is gone: no container by that name and no address on \
+                     {network:?}; it was removed or never created, and the run is refused"
+                ),
+            });
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// The refusal a gateway left behind: what a security path's failure must look
+/// like. The exit code says it decided, and its own last lines say why (the
+/// gateway names the missing flag), so nobody has to guess or retry.
+fn gateway_refused(container: &str, code: i32) -> String {
+    let output = gateway_output(container);
+    let output = if output.is_empty() {
+        "  (it printed nothing)".to_string()
+    } else {
+        output
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "the egress gateway {container:?} refused to start and exited with code {code}, so the \
+         jail was not started. A gateway that exits is a policy refusal, not a container that is \
+         slow to come up. Its last output:\n{output}"
+    )
+}
+
+/// Read the gateway's last lines, waiting briefly for them to exist.
+///
+/// The exit is visible to `podman inspect` a moment before the container's output
+/// is flushed to its log, so a single read can return nothing -- and a refusal
+/// published without its reason is the failure mode this whole path exists to
+/// avoid. Bounded: one second, then report whatever there is.
+fn gateway_output(container: &str) -> String {
+    for attempt in 0..10 {
+        let output = podman::container_output(container, 10);
+        if !output.is_empty() {
+            return output;
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    String::new()
 }
 
 /// The outside half of the single-route invariant, shared with `doctor`.

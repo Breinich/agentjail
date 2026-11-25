@@ -142,10 +142,26 @@ The full reference is `docs/profiles.md`; egress classes are in
 # Build the only two images a run needs (both are local; nothing is published).
 podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/base
 cargo build --locked --release --target x86_64-unknown-linux-musl -p agentjail-gateway
-scripts/build-gateway-image.sh
+scripts/build-gateway-image.sh          # prints the tag it built
 
 # Run a jail that may reach exactly one destination.
 agentjail run profiles/allowlist.toml -- bash -l
+```
+
+The gateway is tagged per workspace (`localhost/agentjail-gateway:ws-…`, derived
+from the workspace's path), not with one mutable tag shared by the machine: two
+checkouts that build it from different code must not overwrite each other's
+gateway. `run` derives the same tag; `AGENTJAIL_GATEWAY_IMAGE` names one
+explicitly, which is what an installed layout or a published image uses.
+
+`run` hands the gateway the **intersection** of the class allowlist and the
+profile's `network.egress`, and that intersection is the grant: a profile that
+lists one destination reaches that one, not everything its class happens to
+allow. The same grant is the jail's DNS answer set (a name the profile did not
+ask for is `NXDOMAIN`), a refusal says which side refused it (`reason=`
+`not-in-profile` or `not-in-class`), and `agentjail profile show` prints the
+grant. A profile that lists no destination gets a gateway that permits nothing,
+and the run says so out loud instead of refusing to start.
 ```
 
 The egress class is decided by the internal network the jail joins, and the
@@ -165,7 +181,7 @@ Spelled out plainly:
 | CLI wiring, exit codes, help text, launcher/selftest contracts | **implemented** |
 | `agentjail-launcher`: pipes, SIGINT/SIGTERM/SIGQUIT + resize forwarding, exit codes, root refusal, 3-turn JSON-RPC over pipes | **implemented** and tested |
 | `run` with `network.mode = "none"` (hardened podman argv, secret-store injection, outside network check, `exec` passthrough) | **implemented** |
-| `run` with `network.mode = "allowlist"`: per-run class network, class gateway container, `HTTPS_PROXY`/`ALL_PROXY` + `--dns <gateway>` + `--dns-search .`, profile-vs-class subset check, both removed on every exit path | **implemented** |
+| `run` with `network.mode = "allowlist"`: per-run class network, class gateway container, `HTTPS_PROXY`/`ALL_PROXY` + `--dns <gateway>` + `--dns-search .`, the gateway is started with the profile's grant (`class allowlist ∩ network.egress`), both removed on every exit path | **implemented** |
 | Egress gateway: DNS (`A` → loopback for class names, NXDOMAIN for the rest), CONNECT allowlist, resolve-once/check-every-answer/connect-pinned, per-jail byte budget and connection cap, one audit line per decision and per query on two separate streams (an allow at establishment with the resolved set, its byte counts when it closes or the budget cuts it) | **implemented** |
 | `agentjail audit`: both gateway streams read back, merged in time order and filtered by jail, class, decision | **implemented** |
 | Egress classes `model` / `external` / `internal` as three committed configs, one binary, one container per run | **implemented** |

@@ -265,13 +265,76 @@ pub fn container_ip(container: &str, network: &str) -> Result<String, String> {
     podman_stdout(&["container", "inspect", "--format", &format, container])
 }
 
+/// What a container is doing, as far as waiting for an address needs to know.
+///
+/// `Exited` is the one that matters: a gateway that exits has already decided
+/// (it refused to start), and calling that "still starting" turns a refusal into
+/// a retry. `Gone` only means the inspection itself failed -- a container that
+/// exists but has no address yet is `Running`, whatever podman calls its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    Running,
+    Exited { code: i32 },
+    Gone,
+}
+
+/// Read a container's state. Any status podman reports other than an exit is
+/// treated as "not exited yet": an unexpected status must not be reported as a
+/// crash, and it must not be reported as gone either.
+pub fn container_state(container: &str) -> ContainerState {
+    let raw = match podman_stdout(&[
+        "container",
+        "inspect",
+        "--format",
+        "{{.State.Status}} {{.State.ExitCode}}",
+        container,
+    ]) {
+        Ok(raw) => raw,
+        Err(_) => return ContainerState::Gone,
+    };
+    let mut fields = raw.split_whitespace();
+    let status = fields.next().unwrap_or_default();
+    if !matches!(status, "exited" | "stopped") {
+        return ContainerState::Running;
+    }
+    ContainerState::Exited {
+        code: fields
+            .next()
+            .and_then(|code| code.parse::<i32>().ok())
+            .unwrap_or(-1),
+    }
+}
+
+/// The last `lines` lines a container printed. Empty when the container or its
+/// log is gone: this is only ever used to explain a failure, never to decide.
+///
+/// `podman logs` writes the container's stdout to its own stdout and its stderr to
+/// its own stderr, and a refusal is printed on stderr -- so both are returned,
+/// stdout first.
+pub fn container_output(container: &str, lines: usize) -> String {
+    let output = match podman(&["logs", "--tail", &lines.to_string(), container]) {
+        Ok(output) => output,
+        Err(_) => return String::new(),
+    };
+    let mut text = output.stdout.trim_end().to_string();
+    let stderr = output.stderr.trim_end();
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr);
+    }
+    text
+}
+
 /// Resolve an image reference (usually a tag) to the image ID it currently
 /// means, and refuse anything that is not an ID.
 ///
-/// A tag is a name, not a thing: whatever carries
-/// `localhost/agentjail-gateway:1` when the run starts is the process the jail
-/// talks to. Resolving once, then starting the container by ID, means a retag
-/// between the check and the start cannot substitute a different binary.
+/// A tag is a name, not a thing: whatever carries the tag when the run starts
+/// is the process the jail talks to. Resolving once, then starting the container
+/// by ID, means a retag between the check and the start cannot substitute a
+/// different binary. (`run` picks the tag per workspace for the same reason: a
+/// shared one could be retagged by another checkout.)
 pub fn image_id(reference: &str) -> Result<String, String> {
     let raw = podman_stdout(&["image", "inspect", "--format", "{{.Id}}", reference]).map_err(
         |error| {
