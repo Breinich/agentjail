@@ -167,11 +167,13 @@ agentjail audit --class model                          # both streams of a class
 agentjail audit --class model --jail proof-1 --decision deny --tail 50
 agentjail audit --audit a.log --dns d.log --stream dns
 podman logs agentjail-proof-1-gateway | agentjail audit --audit -   # captured stream
+agentjail audit --class bot --class-dir /srv/classes --class-digest sha256:1f0c…
 ```
 
 | Flag | Meaning |
 | --- | --- |
 | `--class <class>` | read the streams configured for that class (`audit_log`, `dns_log`) and filter on that class |
+| `--class-dir <dir>` + `--class-digest <sha256:…>` | read them from an operator class file in `<dir>`, pinned by digest — the same pair a profile uses |
 | `--audit <path>` / `--dns <path>` | read these files instead; `--audit -` reads stdin |
 | `--jail <id>` | only lines whose `jail=` field is exactly this |
 | `--decision <d>` | only lines with this decision: `allow`, `allow-close`, `deny` (audit) or `answer`, `nxdomain`, `refused`, `drop` (DNS) |

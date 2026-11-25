@@ -90,6 +90,33 @@ podman image exists localhost/agentjail-gateway:1 || {
   echo "missing gateway image; run: scripts/build-gateway-image.sh" >&2
   exit 1
 }
+# The tag can point at an image older than the flags these proofs exercise: a
+# stale `:1` then fails every proof at "the class config is invalid" or "the
+# gateway has no address", while CI (which builds the image in the same job) stays
+# green. Assert the image understands the config shape used below, once, here.
+gateway_probe=$(mktemp "${TMPDIR:-/tmp}/agentjail-gateway-probe.XXXXXX")
+cat > "$gateway_probe" <<'PROBE'
+class = "probe"
+listen = "0.0.0.0:3128"
+dns = "0.0.0.0:53"
+max_bytes = 4096
+max_connections = 1
+address_policy = "lan"
+allow = ["example.com:443"]
+PROBE
+# The gateway container runs unprivileged: the probe file must be readable by it.
+chmod 644 "$gateway_probe"
+if ! podman run --rm --pull=never --read-only --cap-drop=ALL \
+    -v "$gateway_probe:/class.toml:ro,Z" \
+    localhost/agentjail-gateway:1 --config /class.toml --check >/dev/null 2>"$gateway_probe.err"; then
+  echo "the gateway image localhost/agentjail-gateway:1 is too old for the class" >&2
+  echo "config these proofs use (max_bytes/max_connections/address_policy):" >&2
+  sed 's/^/  /' "$gateway_probe.err" >&2
+  echo "rebuild it: scripts/build-gateway-image.sh (and re-tag :1 if you build another tag)" >&2
+  rm -f "$gateway_probe" "$gateway_probe.err"
+  exit 1
+fi
+rm -f "$gateway_probe" "$gateway_probe.err"
 digest=$(podman image inspect --format '{{.Digest}}' "$JAIL_IMAGE")
 
 # ------------------------------------------------------------------ fixtures
@@ -114,9 +141,26 @@ class_config() { # path class max-bytes max-connections address-policy allow-ent
   } > "$path"
 }
 
-profile_for() { # path name class egress-host egress-port
+# Empty until the generated classes exist: a profile built before that names a
+# class this build ships, which is what proof 1 is about.
+class_dir=""
+
+class_digest() { # class-file
+  printf 'sha256:%s' "$(sha256sum "$1" | cut -d' ' -f1)"
+}
+
+profile_for() { # path name class egress-host egress-port [class-dir]
   path=$1
   class=$3
+  dir=${6:-$class_dir}
+  if [ -n "$dir" ]; then
+    # An operator class: named by a directory and pinned by digest, so a proof
+    # cannot silently run against a policy nobody reviewed. An empty dir means a
+    # class this build ships, resolved from gateway/classes.
+    class_lines=$(printf 'class_dir = "%s"\nclass_digest = "%s"\n' "$dir" "$(class_digest "$dir/$class.toml")")
+  else
+    class_lines=""
+  fi
   cat > "$path" <<EOF
 version = 1
 # The proof jail is a stock slim image: /work only exists in images/base, and
@@ -130,6 +174,7 @@ digest = "$digest"
 
 [network]
 class = "$class"
+$class_lines
 mode = "allowlist"
 dns = "gateway"
 
@@ -259,8 +304,9 @@ run_jail() { # label profile script wait-for-log
 
 # ------------------------------------------------------- proof 1: the class wins
 
-profile_for "$work/proof-model.toml" proof-model model api.anthropic.com 443
-profile_for "$work/proof-external.toml" proof-external external github.com 443
+committed_classes=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gateway/classes
+profile_for "$work/proof-model.toml" proof-model model api.anthropic.com 443 ""
+profile_for "$work/proof-external.toml" proof-external external github.com 443 ""
 
 run_jail model-committed "$work/proof-model.toml" "$PROXY_LIB
 echo \"github-connect=\$(connect 3 github.com:443)\"
@@ -336,12 +382,12 @@ done
 echo "target $target_name at $target_ip:9001 (model) and :9002 (external)"
 
 mkdir -p "$work/classes"
-class_config "$work/classes/model.toml" model 268435456 8 lan "$target_name:9001"
-class_config "$work/classes/external.toml" external 268435456 8 lan "$target_name:9002"
-class_config "$work/classes/internal.toml" internal 268435456 8 lan "$target_name:9001"
-profile_for "$work/proof-target.toml" proof-target model "$target_name" 9001
+class_dir=$work/classes
+class_config "$work/classes/proof-model.toml" proof-model 268435456 8 lan "$target_name:9001"
+class_config "$work/classes/proof-external.toml" proof-external 268435456 8 lan "$target_name:9002"
+class_config "$work/classes/proof-internal.toml" proof-internal 268435456 8 lan "$target_name:9001"
+profile_for "$work/proof-target.toml" proof-target proof-model "$target_name" 9001
 
-export AGENTJAIL_CLASS_DIR=$work/classes
 export AGENTJAIL_EGRESS_NETWORK=$target_net
 
 run_jail target "$work/proof-target.toml" "$PROXY_LIB
@@ -359,7 +405,7 @@ expect "$work/target.out" 'allowed=HTTP/1.1 200 Connection established' \
   'proof 3: an allowed destination answers through the proxy'
 expect "$work/target.audit" "dest=$target_name:9001 decision=allow" \
   'proof 3: the audit stream records it with the jail id and the class'
-expect "$work/target.audit" 'class=model jail=proof-target-' \
+expect "$work/target.audit" 'class=proof-model jail=proof-target-' \
   'proof 3: the audit line carries class and jail id'
 
 expect "$work/target.out" 'denied=HTTP/1.1 403 Forbidden' \
@@ -395,8 +441,8 @@ read_tunnel() { # target
 '
 
 say "proof 6: the byte budget cuts a connection"
-class_config "$work/classes/model.toml" model 4096 8 lan "$target_name:9003"
-profile_for "$work/proof-budget.toml" proof-budget model "$target_name" 9003
+class_config "$work/classes/proof-model.toml" proof-model 4096 8 lan "$target_name:9003"
+profile_for "$work/proof-budget.toml" proof-budget proof-model "$target_name" 9003
 run_jail budget "$work/proof-budget.toml" "$PROXY_LIB$BUDGET_FN
 echo \"budget-bytes=\$(read_tunnel $target_name:9003)\"
 echo done" "reason=byte-budget"
@@ -438,8 +484,8 @@ two_tunnels() { # target
 # Port 9004 is the fixture that stays open, so the first tunnel is still holding
 # its slot when the second is attempted.
 say "proof 7: the connection cap refuses a second tunnel"
-class_config "$work/classes/model.toml" model 268435456 1 lan "$target_name:9004"
-profile_for "$work/proof-cap.toml" proof-cap model "$target_name" 9004
+class_config "$work/classes/proof-model.toml" proof-model 268435456 1 lan "$target_name:9004"
+profile_for "$work/proof-cap.toml" proof-cap proof-model "$target_name" 9004
 run_jail cap "$work/proof-cap.toml" "$PROXY_LIB$CAP_FN
 two_tunnels $target_name:9004
 echo done" "reason=connection-cap"
@@ -468,8 +514,8 @@ expect "$work/cap.out" 'HTTP/1.1 200 Connection established' \
 # policy differs. The target is a container on an RFC1918 network, so `public`
 # (what `model` and `external` ship) must refuse the answer and name the range.
 say "proof 8: a name that resolves into internal space is refused"
-class_config "$work/classes/model.toml" model 268435456 8 public "$target_name:9001"
-profile_for "$work/proof-blocked.toml" proof-blocked model "$target_name" 9001
+class_config "$work/classes/proof-model.toml" proof-model 268435456 8 public "$target_name:9001"
+profile_for "$work/proof-blocked.toml" proof-blocked proof-model "$target_name" 9001
 run_jail blocked "$work/proof-blocked.toml" "$PROXY_LIB
 echo \"blocked=\$(connect 3 $target_name:9001)\"
 echo done" "reason=blocked-private"
@@ -482,12 +528,12 @@ expect "$work/blocked.audit" "address=$target_ip" \
   'proof 8: the refusal names the address it was about'
 
 # Restore the class config the later proofs use.
-class_config "$work/classes/model.toml" model 268435456 8 lan "$target_name:9001"
+class_config "$work/classes/proof-model.toml" proof-model 268435456 8 lan "$target_name:9001"
 
 # ------------------------------------------------------------ proof 5: lifecycle
 
 say "lifecycle: a failed run leaves nothing behind"
-profile_for "$work/proof-fail.toml" proof-fail model "$target_name" 9001
+profile_for "$work/proof-fail.toml" proof-fail proof-model "$target_name" 9001
 set +e
 "$agentjail" run "$work/proof-fail.toml" -- bash -lc 'exit 7' >/dev/null 2>&1
 fail_exit=$?
@@ -515,8 +561,8 @@ stale=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-' |
   || fail 'lifecycle: expected a SIGKILLed run to leave its network behind (it did not, so this proof proves nothing)'
 
 # Another profile must not touch it.
-class_config "$work/classes/internal.toml" internal 268435456 8 lan "$target_name:9001"
-profile_for "$work/proof-other.toml" proof-other model "$target_name" 9001
+class_config "$work/classes/proof-internal.toml" proof-internal 268435456 8 lan "$target_name:9001"
+profile_for "$work/proof-other.toml" proof-other proof-model "$target_name" 9001
 "$agentjail" run "$work/proof-other.toml" -- bash -lc 'true' >/dev/null 2>&1 || true
 still_there=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-' || true)
 [ "$still_there" = "$stale" ] && ok 'lifecycle: another profile does not prune it (no profile-prefix pruning)' \
@@ -532,7 +578,7 @@ after=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-' |
 # The proof target is this script's own fixture, not the run path's.
 podman rm -f "$target_name" >/dev/null 2>&1 || true
 podman network rm -f "$target_net" >/dev/null 2>&1 || true
-unset AGENTJAIL_CLASS_DIR AGENTJAIL_EGRESS_NETWORK || true
+unset AGENTJAIL_EGRESS_NETWORK || true
 
 say "lifecycle: nothing of ours is left behind"
 ours=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-' || true)
