@@ -20,9 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentjail_core::lifecycle;
+use agentjail_core::paths;
 use agentjail_core::podman;
 use agentjail_core::profile::Profile;
+use agentjail_core::run;
 use serde_json::{json, Value};
 
 const SELFTEST_IMAGE: &str = "docker.io/library/node";
@@ -354,6 +355,10 @@ fn run_jailed(
         "AGENTJAIL_SELFTEST_SECRET".to_string(),
         "host-secret-value".to_string(),
     );
+    child_env.insert(
+        "AGENTJAIL_STATE_DIR".to_string(),
+        dir.join("state").to_string_lossy().into_owned(),
+    );
 
     let probe = probe_args(
         "main",
@@ -481,10 +486,13 @@ fn run_in_jail(
     profile_name: &str,
 ) -> Result<(Output, String), String> {
     let child = spawn_in_jail(profile, probe, env, cwd)?;
-    let gateway = lifecycle::gateway_name(profile_name, child.id());
-    let watcher = watch_gateway(gateway);
+    let jail_id = format!("{profile_name}-{}", child.id());
+    // The selftest's only allowlist profile is the `model` class, and `run`
+    // writes this run's decisions under the state directory it was given.
+    let audit_path = run::audit_dir(&paths::state_dir(env), "model")
+        .join(run::audit_file_name(&jail_id, "audit"));
     let output = wait_child(child, "jailed probe")?;
-    let gateway_log = watcher.finish();
+    let gateway_log = std::fs::read_to_string(&audit_path).unwrap_or_default();
     Ok((output, gateway_log))
 }
 
@@ -522,41 +530,6 @@ fn wait_child(child: Child, label: &str) -> Result<Output, String> {
         ));
     }
     Ok(output)
-}
-
-struct GatewayWatch {
-    stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<String>,
-}
-
-impl GatewayWatch {
-    fn finish(self) -> String {
-        self.stop.store(true, Ordering::SeqCst);
-        self.handle.join().unwrap_or_default()
-    }
-}
-
-fn watch_gateway(name: String) -> GatewayWatch {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_for_thread = stop.clone();
-    let handle = std::thread::spawn(move || {
-        let mut last = String::new();
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            if let Ok(output) = podman::podman(&["logs", &name]) {
-                if !output.stdout.trim().is_empty() {
-                    last = output.stdout;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if let Ok(output) = podman::podman(&["logs", &name]) {
-            if !output.stdout.trim().is_empty() {
-                last = output.stdout;
-            }
-        }
-        last
-    });
-    GatewayWatch { stop, handle }
 }
 
 fn wait_for_target_ip(name: &str) -> Result<String, String> {
