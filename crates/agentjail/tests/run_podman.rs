@@ -474,6 +474,9 @@ args = ["-lc", "printf 'started\n'; sleep 30"]"#,
 fn four_way_concurrent_runs_create_distinct_networks_and_clean_all_of_them() {
     let dir = tmpdir("fourway");
     let digest = image_digest();
+    let class_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../gateway/classes");
+    let class_digest = agentjail_core::class::file_digest(&class_dir.join("model.toml"))
+        .expect("digest the committed model class");
     let profile_path = dir.join("fourway.toml");
     std::fs::write(
         &profile_path,
@@ -488,6 +491,8 @@ digest = "{digest}"
 
 [network]
 class = "model"
+class_dir = "{class_dir}"
+class_digest = "{class_digest}"
 mode = "allowlist"
 dns = "gateway"
 
@@ -498,17 +503,17 @@ port = 443
 [agent]
 command = "sh"
 args = ["-lc", "printf 'started\n'; sleep 60"]
-"#
+"#,
+            class_dir = class_dir.display(),
+            class_digest = class_digest,
         ),
     )
     .expect("write profile");
 
-    let class_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../gateway/classes");
     let spawn = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_agentjail"))
             .args(["run", profile_path.to_str().expect("path")])
             .env_remove("AGENTJAIL_PODMAN")
-            .env("AGENTJAIL_CLASS_DIR", &class_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

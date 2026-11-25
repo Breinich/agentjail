@@ -17,6 +17,7 @@
 //! env, secret, or egress lists; read-only mounts; conservative resource caps).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
@@ -169,6 +170,16 @@ pub struct Network {
     /// the agent cannot change it from inside.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    /// Directory holding an operator-defined `<class>.toml`. Policy named by a
+    /// profile, pinned by `class_digest`, instead of an environment variable
+    /// that could point anywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_dir: Option<PathBuf>,
+    /// `sha256:<64 hex>` of the class file `class_dir` names. Required whenever
+    /// `class_dir` is set: a directory that can change under a reviewed profile
+    /// is not a pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_digest: Option<String>,
     pub mode: NetworkMode,
     /// Required with no default: an inherited host search domain can silently
     /// resolve internal names and defeat the allowlist.
@@ -363,6 +374,8 @@ impl Profile {
             "network": {
                 "name": self.network.name,
                 "class": self.network.class,
+                "class_dir": self.network.class_dir,
+                "class_digest": self.network.class_digest,
                 "mode": self.network.mode.as_str(),
                 "dns": self.network.dns.as_str(),
                 "egress": egress,
@@ -630,6 +643,8 @@ fn partial_semantic_errors(value: &toml::Value) -> Vec<String> {
         &section::<Network>(value, "network").unwrap_or(Network {
             name: None,
             class: None,
+            class_dir: None,
+            class_digest: None,
             mode: NetworkMode::None,
             dns: DnsStrategy::None,
             egress: Vec::new(),
@@ -836,6 +851,105 @@ fn secret_errors(secrets: &[Secret], tmpfs: &BTreeMap<String, String>) -> Vec<St
     errors
 }
 
+/// Which class a profile may name, and — for an operator class — where its file
+/// comes from and what pins it. All or nothing: a class name with no policy file
+/// behind it, a directory with no digest, or a digest with no directory are each
+/// a launch nobody can audit.
+fn class_selection_errors(network: &Network) -> Vec<String> {
+    let mut errors = Vec::new();
+    let class = network.class.as_deref();
+    let (dir, digest) = (
+        network.class_dir.as_deref(),
+        network.class_digest.as_deref(),
+    );
+
+    if let (None, Some(_)) | (Some(_), None) = (dir, digest) {
+        errors.push(
+            "network.class_dir and network.class_digest: give both or neither. A directory without a \
+             digest is policy that can change under a reviewed profile; a digest without a directory \
+             pins nothing."
+                .to_string(),
+        );
+    }
+
+    // Built-in class: no directory, and the name has to be one this build ships.
+    let Some(dir) = dir else {
+        match class {
+            None => errors.push(
+                "network.class: required with mode \"allowlist\"; it names which egress class \
+                 (and therefore which committed allowlist) the jail joins"
+                    .to_string(),
+            ),
+            Some(class) if !crate::class::CLASSES.contains(&class) => errors.push(format!(
+                "network.class: {class:?} is not an egress class this build ships ({}); an operator \
+                 class needs network.class_dir and network.class_digest",
+                crate::class::CLASSES.join(", ")
+            )),
+            Some(_) => {}
+        }
+        return errors;
+    };
+
+    // Operator class.
+    let dir_text = dir.display().to_string();
+    if !dir.is_absolute() {
+        errors.push(format!(
+            "network.class_dir: {dir_text:?} is relative; the class directory is a host path, give an absolute one"
+        ));
+    }
+    if let Some(digest) = digest {
+        if !is_class_digest(digest) {
+            errors.push(format!(
+                "network.class_digest: {digest:?} must be sha256: followed by 64 lowercase hex characters \
+                 (network.class_dir/{}.toml)",
+                class.unwrap_or("<class>")
+            ));
+        }
+    }
+    match class {
+        None => errors.push(
+            "network.class: required with network.class_dir; it names <class>.toml inside the directory"
+                .to_string(),
+        ),
+        Some(class) if !crate::class::is_operator_class_name(class) => errors.push(format!(
+            "network.class: {class:?} cannot name an operator class: it is either one of the built-in \
+             classes ({}) or not lowercase alphanumerics/'-'. An operator class must not shadow a \
+             built-in one, so the same name never means two policies.",
+            crate::class::CLASSES.join(", ")
+        )),
+        Some(_) => {}
+    }
+    // The class file is bind-mounted into the gateway container, so its directory
+    // follows the same rules as any other mount source.
+    if dir_text.contains(',') || dir_text.contains('=') {
+        errors.push(format!(
+            "network.class_dir: {dir_text:?} contains ',' or '=', which podman reads as --mount option syntax; a path must be only a path"
+        ));
+    }
+    if JAIL_RUNTIME_PATHS.contains(&dir_text.as_str()) {
+        errors.push(format!(
+            "network.class_dir: refusing {dir_text:?}; it is part of the jail's own runtime surface, not a directory of class files"
+        ));
+    }
+    if let Some(kind) = fuse_kind(&dir_text) {
+        errors.push(format!(
+            "network.class_dir: {dir_text:?} is {kind}; the class file is bind-mounted into the gateway container, so it must be a normal directory"
+        ));
+    }
+    errors
+}
+
+fn is_class_digest(value: &str) -> bool {
+    value
+        .strip_prefix(crate::class::DIGEST_PREFIX)
+        .is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        })
+}
+
 fn network_errors(network: &Network) -> Vec<String> {
     let mut errors = Vec::new();
     let mut seen: BTreeSet<(&str, u16, Protocol)> = BTreeSet::new();
@@ -855,6 +969,12 @@ fn network_errors(network: &Network) -> Vec<String> {
                     "network.class: {class:?} needs mode = \"allowlist\"; mode \"none\" has no route out"
                 ));
             }
+            if network.class_dir.is_some() || network.class_digest.is_some() {
+                errors.push(
+                    "network.class_dir/class_digest: only with mode = \"allowlist\"; mode \"none\" has no egress class"
+                        .to_string(),
+                );
+            }
             if !network.egress.is_empty() {
                 errors.push(format!(
                     "network.egress: mode \"none\" means no egress; {} destination(s) are declared but would never be reachable",
@@ -868,18 +988,7 @@ fn network_errors(network: &Network) -> Vec<String> {
             }
         }
         NetworkMode::Allowlist => {
-            match network.class.as_deref() {
-                None => errors.push(
-                    "network.class: required with mode \"allowlist\"; it names which egress class \
-                     (and therefore which committed allowlist) the jail joins"
-                        .to_string(),
-                ),
-                Some(class) if !crate::class::CLASSES.contains(&class) => errors.push(format!(
-                    "network.class: {class:?} is not an egress class this build ships ({})",
-                    crate::class::CLASSES.join(", ")
-                )),
-                Some(_) => {}
-            }
+            errors.extend(class_selection_errors(network));
             if network.name.is_some() {
                 errors.push(
                     "network.name: mode \"allowlist\" does not take a network name; the per-run \

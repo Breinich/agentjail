@@ -1063,11 +1063,27 @@ fn audit_reads_the_streams_configured_for_a_class() {
     )
     .expect("class config");
 
+    let digest = format!(
+        "sha256:{}",
+        agentjail_core::class::file_digest(&classes.join("model.toml"))
+            .expect("digest the fixture class")
+            .trim_start_matches("sha256:")
+    );
     let output = run_with_env(
-        &["audit", "--class", "model", "--jail", "proof-2"],
+        &[
+            "audit",
+            "--class",
+            "model",
+            "--class-dir",
+            classes.to_str().unwrap(),
+            "--class-digest",
+            &digest,
+            "--jail",
+            "proof-2",
+        ],
         &dir,
         None,
-        &[("AGENTJAIL_CLASS_DIR", classes.to_str().unwrap())],
+        &[],
     );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let text = stdout(&output);
@@ -1108,6 +1124,224 @@ fn audit_reads_a_captured_stream_from_stdin() {
     assert_eq!(text.lines().count(), 2, "{text}");
     assert!(
         text.lines().all(|line| line.starts_with("stream=audit ")),
+        "{text}"
+    );
+}
+
+// ------------------------------------------- operator-defined class directory
+
+/// A class file a profile may name by directory, plus the digest that pins it.
+fn operator_class(dir: &Path, name: &str) -> String {
+    std::fs::create_dir_all(dir).expect("class dir");
+    let path = dir.join(format!("{name}.toml"));
+    std::fs::write(
+        &path,
+        format!(
+            "class = \"{name}\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+             max_bytes = 1048576\nmax_connections = 4\naddress_policy = \"lan\"\n\
+             allow = [\n  \"api.anthropic.com:443\",\n]\n"
+        ),
+    )
+    .expect("write class");
+    agentjail_core::class::file_digest(&path).expect("digest")
+}
+
+fn operator_profile(operator_dir: &Path, class: &str, digest: &str) -> String {
+    ALLOWLIST
+        .replace("class = \"model\"", &format!("class = \"{class}\""))
+        .replace(
+            "mode = \"allowlist\"",
+            &format!(
+                "class_dir = \"{}\"\nclass_digest = \"{digest}\"\nmode = \"allowlist\"",
+                operator_dir.display()
+            ),
+        )
+}
+
+#[test]
+fn an_operator_class_is_validated_and_digest_pinned() {
+    let dir = tmpdir("operator-ok");
+    let classes = dir.join("classes");
+    let digest = operator_class(&classes, "bot");
+    let profile = dir.join("operator.toml");
+    std::fs::write(&profile, operator_profile(&classes, "bot", &digest)).expect("write");
+
+    let output = run_with_env(
+        &["profile", "validate", profile.to_str().expect("path")],
+        &dir,
+        None,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("bot.toml"), "the class file is named: {text}");
+    assert!(
+        text.contains("egress class \"bot\""),
+        "the operator class is reported: {text}"
+    );
+}
+
+#[test]
+fn an_operator_class_whose_file_changed_under_the_digest_is_refused() {
+    let dir = tmpdir("operator-drift");
+    let classes = dir.join("classes");
+    let digest = operator_class(&classes, "bot");
+    let profile = dir.join("operator.toml");
+    std::fs::write(&profile, operator_profile(&classes, "bot", &digest)).expect("write");
+    // Same path, different policy: the pin is what makes that a review event.
+    std::fs::write(
+        classes.join("bot.toml"),
+        "class = \"bot\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+         max_bytes = 1048576\nmax_connections = 4\naddress_policy = \"lan\"\n\
+         allow = [\n  \"api.anthropic.com:443\",\n  \"github.com:443\",\n]\n",
+    )
+    .expect("rewrite class");
+
+    let output = run_with_env(
+        &["profile", "validate", profile.to_str().expect("path")],
+        &dir,
+        None,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("does not match the digest this profile pins"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_operator_class_may_not_shadow_a_built_in_class() {
+    let dir = tmpdir("operator-shadow");
+    let classes = dir.join("classes");
+    let digest = operator_class(&classes, "model");
+    let profile = dir.join("shadow.toml");
+    std::fs::write(&profile, operator_profile(&classes, "model", &digest)).expect("write");
+
+    let output = run_with_env(
+        &["profile", "validate", profile.to_str().expect("path")],
+        &dir,
+        None,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("must not shadow a") && text.contains("built-in"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_operator_class_needs_both_a_directory_and_a_digest() {
+    let dir = tmpdir("operator-half");
+    let classes = dir.join("classes");
+    let digest = operator_class(&classes, "bot");
+    let profile = dir.join("half.toml");
+    std::fs::write(
+        &profile,
+        ALLOWLIST
+            .replace("class = \"model\"", "class = \"bot\"")
+            .replace(
+                "mode = \"allowlist\"",
+                &format!(
+                    "class_dir = \"{}\"\nmode = \"allowlist\"",
+                    classes.display()
+                ),
+            ),
+    )
+    .expect("write");
+
+    let output = run_with_env(
+        &["profile", "validate", profile.to_str().expect("path")],
+        &dir,
+        None,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("give both or neither"),
+        "{}",
+        stderr(&output)
+    );
+    // …and the digest alone pins nothing either.
+    std::fs::write(
+        &profile,
+        ALLOWLIST
+            .replace("class = \"model\"", "class = \"bot\"")
+            .replace(
+                "mode = \"allowlist\"",
+                &format!("class_digest = \"{digest}\"\nmode = \"allowlist\""),
+            ),
+    )
+    .expect("write");
+    let output = run_with_env(
+        &["profile", "validate", profile.to_str().expect("path")],
+        &dir,
+        None,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("give both or neither"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn an_operator_class_directory_must_be_absolute() {
+    let dir = tmpdir("operator-relative");
+    let digest = operator_class(&dir.join("classes"), "bot");
+    let profile = dir.join("relative.toml");
+    std::fs::write(
+        &profile,
+        ALLOWLIST
+            .replace("class = \"model\"", "class = \"bot\"")
+            .replace(
+                "mode = \"allowlist\"",
+                &format!(
+                    "class_dir = \"classes\"\nclass_digest = \"{digest}\"\nmode = \"allowlist\""
+                ),
+            ),
+    )
+    .expect("write");
+
+    let output = run_with_env(
+        &["profile", "validate", profile.to_str().expect("path")],
+        &dir,
+        None,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is relative"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_class_name_outside_the_built_ins_needs_an_operator_directory() {
+    let dir = tmpdir("operator-unknown");
+    let profile = dir.join("unknown.toml");
+    std::fs::write(
+        &profile,
+        ALLOWLIST.replace("class = \"model\"", "class = \"bot\""),
+    )
+    .expect("write");
+
+    let output = run_with_env(
+        &["profile", "validate", profile.to_str().expect("path")],
+        &dir,
+        None,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("needs network.class_dir and network.class_digest"),
         "{text}"
     );
 }

@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 # No default features: the validator must not carry an HTTP resolver.
+sha2 = "0.10"
 jsonschema = { version = "0.62", default-features = false }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
