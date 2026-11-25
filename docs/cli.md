@@ -13,11 +13,16 @@ bind-mounted into a jail built from any base, including `scratch`.
 
 ## `agentjail run <profile> -- <agent command…>`
 
-Implemented for `network.mode = "none"` (no egress). The build path:
+Implemented for both modes: `network.mode = "none"` (no egress) and
+`"allowlist"` (an egress class plus the profile's grant, which `run` intersects
+and hands to the gateway). What is common and what is mode-specific, in the
+order `run` does it:
 
-- **preflight, every start**: `network.name` is required; the named network is
-  inspected and verified against the single-route invariant with the same code
-  path `doctor` uses. A bridged network is refused before anything is created.
+- **preflight, every start**: with `mode = "none"` the network named by
+  `network.name` is inspected and verified against the single-route invariant
+  with the same code path `doctor` uses; with `mode = "allowlist"` the
+  per-run class network is created and verified the same way (see the allowlist
+  bullet below). A bridged network is refused before anything is created.
 - **argv**: `podman run --rm --interactive --pull=never --read-only
   --userns=keep-id:uid=10000,gid=10000 --cap-drop=ALL
   --security-opt=no-new-privileges`, the profile's `--pids-limit`, `--memory`,
@@ -41,11 +46,13 @@ Implemented for `network.mode = "none"` (no egress). The build path:
     `agentjail` (or a host crash) cannot be caught: those entries remain until
     the next run of the same profile prunes dead-pid entries as a backstop. A
     `source = "store"` entry belongs to the user and is never removed.
-- **exec vs supervise**: with no secrets to clean up, `agentjail` calls
+- **exec vs supervise**: when this run owns nothing to clean up — no
+  secret-store entries, and no gateway or per-run network — `agentjail` calls
   `exec(podman …)`, so stdio, signals, and the exit code pass through with no
-  wrapper. When it created secret-store entries it supervises podman instead:
-  it forwards SIGINT/SIGTERM/SIGQUIT, waits for podman, removes the entries, and
-  exits with the same code (or 128 + signal).
+  wrapper. When it created secret-store entries it supervises podman instead,
+  and so does every `allowlist` run, which always creates a gateway and two
+  networks: it forwards SIGINT/SIGTERM/SIGQUIT, waits for podman, removes what
+  it created, and exits with the same code (or 128 + signal).
 - **home**: the rootfs is read-only, so `run` mounts writable scratch at the
   parent of `home` and the image entrypoint creates `$HOME` with **mode 0700**
   owned by the jail uid. `home` must be a subdirectory (for example
