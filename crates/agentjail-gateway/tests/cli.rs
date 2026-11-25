@@ -10,7 +10,7 @@
 //! 3. a raw `IP:port` is refused even when a name for the same address is
 //!    allowlisted, and a name is answered only for this class.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -155,31 +155,116 @@ allow = [
         }
     }
 
-    /// Send one CONNECT and return (status line, body read after the head).
-    fn connect(&self, target: &str) -> (String, String) {
+    /// One CONNECT, with the two ways a refusal can legitimately arrive.
+    ///
+    /// The gateway answers a refusal with a status line, but it may also have
+    /// already cut the connection by the time the client finishes writing its
+    /// request, and then the write or the read fails with a reset. That is the
+    /// same decision arriving a different way — a race, not a different
+    /// behaviour — so a test must be able to see it without swallowing it. Any
+    /// other I/O error is a real failure and panics here, never silently.
+    fn connect_attempt(&self, target: &str) -> Attempt {
         let mut stream =
             TcpStream::connect(("127.0.0.1", self.proxy_port)).expect("connect to proxy");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
-        write!(
-            stream,
-            "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"
-        )
-        .expect("write");
+        let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+        if let Err(error) = stream.write_all(request.as_bytes()) {
+            return closed_or_panic(error, "writing the request");
+        }
         let mut reader = BufReader::new(stream);
         let mut status = String::new();
-        reader.read_line(&mut status).expect("status line");
+        match reader.read_line(&mut status) {
+            Ok(0) => {
+                return Attempt::Closed {
+                    why: "closed before a status line".to_string(),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => return closed_or_panic(error, "reading the status line"),
+        }
         let mut line = String::new();
-        while reader.read_line(&mut line).expect("header") > 2 {}
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(n) if n > 2 => line.clear(),
+                Ok(_) => break,
+                Err(error) => {
+                    return closed_or_panic(error, "reading the headers");
+                }
+            }
+        }
         let mut body = String::new();
         let _ = reader.read_to_string(&mut body);
-        (status.trim_end().to_string(), body)
+        Attempt::Answered {
+            status: status.trim_end().to_string(),
+            body,
+        }
+    }
+
+    /// Send one CONNECT and return (status line, body read after the head).
+    /// Strict: a caller that wants the refusal-as-close behaviour uses
+    /// `connect_attempt` instead.
+    fn connect(&self, target: &str) -> (String, String) {
+        match self.connect_attempt(target) {
+            Attempt::Answered { status, body } => (status, body),
+            Attempt::Closed { why } => {
+                panic!("the gateway closed the connection instead of answering: {why}")
+            }
+        }
     }
 
     fn audit(&self) -> String {
         std::fs::read_to_string(self.dir.join("audit.log")).unwrap_or_default()
     }
+}
+
+/// How a CONNECT attempt ended. Both variants can be a refusal; which one a test
+/// accepts is the test's decision, and the audit line is what proves a refusal
+/// was a decision rather than a crash.
+enum Attempt {
+    Answered { status: String, body: String },
+    Closed { why: String },
+}
+
+fn closed_or_panic(error: std::io::Error, stage: &str) -> Attempt {
+    match error.kind() {
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+            Attempt::Closed {
+                why: format!("reset {stage}: {error}"),
+            }
+        }
+        _ => panic!("{stage} failed for a reason that is not a refusal: {error}"),
+    }
+}
+
+/// The mapping that keeps a refusal visible and a real failure loud. The socket
+/// path is timing-dependent under load, so this covers it deterministically.
+#[test]
+fn a_connection_level_error_is_a_refusal_and_anything_else_is_not() {
+    for kind in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::BrokenPipe,
+    ] {
+        match closed_or_panic(std::io::Error::from(kind), "writing the request") {
+            Attempt::Closed { why } => assert!(why.contains("writing the request"), "{why}"),
+            Attempt::Answered { status, .. } => {
+                panic!("{kind:?} was reported as an answer: {status}")
+            }
+        }
+    }
+    let caught = std::panic::catch_unwind(|| {
+        closed_or_panic(
+            std::io::Error::from(ErrorKind::PermissionDenied),
+            "writing the request",
+        )
+    });
+    assert!(
+        caught.is_err(),
+        "a non-connection error must not be swallowed as a refusal"
+    );
 }
 
 fn port_after(line: &str, marker: &str) -> Option<u16> {
@@ -329,6 +414,9 @@ fn a_connection_that_exceeds_the_byte_budget_is_cut_and_logged() {
         "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
     )
     .expect("write");
+    // The cut can arrive as EOF or as a reset; both end the read, and the
+    // budget assertion below is made on what was delivered plus the audit line,
+    // never on how the socket ended.
     let mut received = Vec::new();
     let _ = stream.read_to_end(&mut received);
     let body = String::from_utf8_lossy(&received);
@@ -386,13 +474,34 @@ fn a_second_connection_over_the_cap_is_refused_and_logged() {
     .expect("write");
     let mut reader = BufReader::new(holder.try_clone().expect("clone"));
     let mut status = String::new();
-    reader.read_line(&mut status).expect("status");
+    reader.read_line(&mut status).expect("status line");
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let mut line = String::new();
+    while reader.read_line(&mut line).expect("header") > 2 {}
 
-    let (status, _body) = gateway.connect(&format!("localhost:{port}"));
+    // The refusal may arrive as a 429, or as a reset if the gateway cut this
+    // connection before the request finished going out. Both are the cap
+    // decision; the audit line below is what distinguishes a refusal from a
+    // crash, and this test asserts that line either way.
+    match gateway.connect_attempt(&format!("localhost:{port}")) {
+        Attempt::Answered { status, .. } => assert!(
+            status.starts_with("HTTP/1.1 429"),
+            "a second connection over the cap must be refused, got {status}"
+        ),
+        Attempt::Closed { why } => {
+            eprintln!("cap refusal arrived as a closed connection ({why}); the audit line decides")
+        }
+    }
+
+    // The first tunnel is untouched by the refusal: the fixture's greeting is
+    // still readable through it. This also proves the slot was really held.
+    let mut greeting = String::new();
+    reader
+        .read_line(&mut greeting)
+        .expect("read the greeting through the held tunnel");
     assert!(
-        status.starts_with("HTTP/1.1 429"),
-        "a second connection over the cap must be refused, got {status}"
+        greeting.contains("hello from capped"),
+        "the held tunnel stopped working: {greeting:?}"
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);

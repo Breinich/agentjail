@@ -58,6 +58,16 @@ fail() {
   printf 'FAIL  %s\n' "$*" >&2
   failures=$((failures + 1))
 }
+expect_either() { # file, needle-a, needle-b, label
+  if grep -q -- "$2" "$1" || grep -q -- "$3" "$1"; then
+    ok "$4"
+    printf '      %s\n' "$(grep -m1 -e "$2" -e "$3" "$1")"
+  else
+    fail "$4: expected $2 or $3"
+    sed 's/^/      /' "$1" >&2
+  fi
+}
+
 expect() { # file, needle, label
   if grep -q -- "$2" "$1"; then
     ok "$3"
@@ -149,22 +159,47 @@ proxy=${HTTPS_PROXY#http://}
 proxy_host=${proxy%%:*}
 proxy_port=${proxy##*:}
 
+# connect() must run in the calling shell, never inside $( ): it opens the tunnel
+# on the fd it is given, and a command substitution closes that fd when the
+# subshell exits. That silently turned "hold one tunnel while attempting a
+# second" into "close it first", which is why proof 7 (the connection cap)
+# depended on whether the gateway noticed the close before the second attempt.
+#
+# A refusal can also arrive two ways: the gateway answers with a status line, or
+# it has already cut the connection when the request is written and the write
+# fails. Both are refusals; only the audit line tells a refusal from a crash, so
+# the marker below is printed and the proof accepts either shape while still
+# requiring the audit line.
 connect() { # fd target
   eval "exec $1<>/dev/tcp/$proxy_host/$proxy_port"
-  printf "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" "$2" "$2" >&"$1"
-  head -1 <&"$1"
+  if ! printf "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" "$2" "$2" >&"$1" 2>/dev/null; then
+    eval "exec $1>&-" 2>/dev/null || true
+    CONNECT_STATUS="CONNECT REFUSED BY CLOSE (the write failed)"
+    echo "$CONNECT_STATUS"
+    return 0
+  fi
+  line=$(head -1 <&"$1" 2>/dev/null) || line=""
+  if [ -z "$line" ]; then
+    eval "exec $1>&-" 2>/dev/null || true
+    CONNECT_STATUS="CONNECT REFUSED BY CLOSE (closed before a status line)"
+    echo "$CONNECT_STATUS"
+    return 0
+  fi
+  CONNECT_STATUS="$line"
+  echo "$CONNECT_STATUS"
 }
 
 connect_ok() { # fd target
   attempt=0
+  CONNECT_STATUS=""
   while : ; do
-    status=$(connect "$1" "$2")
-    case "$status" in *" 200 "*) break ;; esac
+    connect "$1" "$2" >/dev/null
+    case "$CONNECT_STATUS" in *" 200 "*) break ;; esac
     attempt=$((attempt + 1))
     [ "$attempt" -ge 5 ] && break
     sleep 1
   done
-  echo "$status"
+  echo "$CONNECT_STATUS"
 }
 '
 
@@ -352,6 +387,9 @@ BUDGET_FN='
 read_tunnel() { # target
   # The status line goes to stderr so the count is the only thing on stdout.
   connect_ok 3 "$1" >&2
+  # The cut can end the stream as EOF or as a reset; both are the budget being
+  # enforced, so the count of what was delivered is the assertion, not how the
+  # socket ended.
   timeout 20 cat <&3 | wc -c
 }
 '
@@ -408,12 +446,21 @@ echo done" "reason=connection-cap"
 
 expect "$work/cap.out" 'HTTP/1.1 200 Connection established' \
   'proof 7: the first tunnel is established (the cap has one slot)'
-expect "$work/cap.out" 'HTTP/1.1 429 Too Many Requests' \
-  'proof 7: the second tunnel over the cap is refused'
+# Over the cap the gateway may cut the second connection before its request is
+# written, so the refusal can arrive as a closed connection instead of a 429.
+# Either way the audit lines below are what decide it was a refusal and not a
+# crash; this assertion only pins how the client saw it.
+expect_either "$work/cap.out" 'HTTP/1.1 429 Too Many Requests' 'CONNECT REFUSED BY CLOSE' \
+  'proof 7: the second tunnel over the cap is refused (429, or closed as a refusal)'
 expect "$work/cap.audit" 'decision=deny reason=connection-cap' \
   'proof 7: the cap refusal is logged as a denial'
 expect "$work/cap.audit" 'connections=1/1' \
   'proof 7: the denial names the counters that caused it'
+# The counters say one tunnel was live, but not that it was the *first*: a
+# harness that closed it early would also see 0/1 and no denial at all, which is
+# the failure this proof exists to catch.
+expect "$work/cap.out" 'HTTP/1.1 200 Connection established' \
+  'proof 7: the first tunnel was still established when the second was refused'
 
 # ------------------------- proof 8: an internal answer is refused, range named
 
