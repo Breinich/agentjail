@@ -8,7 +8,9 @@
 //!
 //! With `network.mode = "allowlist"` the jail joins a per-run internal network
 //! whose only other peer is that class's gateway, and gets `HTTPS_PROXY` /
-//! `ALL_PROXY` plus `--dns <gateway>` and `--dns-search .`.
+//! `ALL_PROXY` plus `--dns <gateway>` and `--dns-search .`; a `mode = "none"`
+//! jail with a named network gets `--dns-search .` too, because netavark gives it
+//! a resolver that would otherwise inherit the host's search domains.
 //!
 //! Deliberate limit, refused rather than half-implemented:
 //! `secrets[].delivery = "file"` is not offered because secrets are injected as
@@ -266,6 +268,15 @@ pub fn podman_args(
         for name in ["HTTPS_PROXY", "ALL_PROXY", "https_proxy", "all_proxy"] {
             args.extend(["--env".into(), format!("{name}={proxy}")]);
         }
+    } else if profile.network.name.is_some() {
+        // An internal network still has a resolver: netavark gives it one, and
+        // `/etc/resolv.conf` inside the jail then carries the *host's* search
+        // domains (`search dns.podman lan.internal.bajnok.dev bajnok.dev`,
+        // measured). There is no route out, so a name that resolves goes
+        // nowhere — but an inherited search domain still decides what a short
+        // name means, and the jail should not inherit the LAN's naming. Empty
+        // the search list here for the same reason allowlist mode does.
+        args.extend(["--dns-search".into(), ".".into()]);
     }
 
     // Bounded writable scratch only: /tmp and /run always, with profile sizes
@@ -713,6 +724,38 @@ args = ["-lc", "echo {workdir}"]
                 "missing {expected:?} in {joined}"
             );
         }
+    }
+
+    /// #41: a `mode = "none"` jail on a named internal network inherits a resolver
+    /// and, with it, the host's search domains. The search list is emptied; the
+    /// absence of a route out is what makes the posture safe, not the absence of
+    /// a resolver.
+    #[test]
+    fn a_named_network_without_egress_still_empties_the_search_list() {
+        let profile = crate::profile::parse_and_validate(
+            "version = 1\nworkdir = \"/work\"\nhome = \"/home/agent\"\n\
+             [image]\nname = \"localhost/agentjail-base:1\"\n\
+             digest = \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"\n\
+             [network]\nname = \"agentjail-bots\"\nmode = \"none\"\ndns = \"none\"\n\
+             [agent]\ncommand = \"bash\"\n",
+        )
+        .expect("profile");
+        let context = RunContext {
+            container_name: "agentjail-test-2".to_string(),
+            network: "agentjail-bots".to_string(),
+            gateway_ip: None,
+            selinux: false,
+            term: None,
+        };
+        let args = podman_args(&profile, &context, &[], &[]).expect("argv");
+        let joined = args.join(" ");
+        assert!(joined.contains("--network agentjail-bots"), "{joined}");
+        assert!(joined.contains("--dns-search ."), "{joined}");
+        assert!(
+            !joined.contains("--dns "),
+            "no resolver is configured: {joined}"
+        );
+        assert!(!joined.contains("HTTPS_PROXY"), "{joined}");
     }
 
     #[test]

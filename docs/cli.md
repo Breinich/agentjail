@@ -26,7 +26,9 @@ Implemented for `network.mode = "none"` (no egress). The build path:
   SELinux is enforcing), an **environment allowlist** (`HOME`, `TERM`, profile
   literals; no host environment), `--workdir`, the digest-pinned image, and the
   agent command. There is no `-t`, no host home, no runtime socket, and no
-  implicit mount.
+  implicit mount. `--dns-search .` is passed in both modes — the allowlist gateway
+  and a named internal network — because both give the jail a resolver that would
+  otherwise inherit the host's search domains.
 - **secrets**: references are resolved before start (an unset or unreadable
   reference fails closed, naming the reference and never a value), then written
   to podman's secret store and passed as `--secret source=…,type=env,target=…`,
