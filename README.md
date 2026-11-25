@@ -169,6 +169,7 @@ Spelled out plainly:
 | Egress gateway: DNS (`A` → loopback for class names, NXDOMAIN for the rest), CONNECT allowlist, resolve-once/check-every-answer/connect-pinned, per-jail byte budget and connection cap, one audit line per decision and per query on two separate streams (an allow at establishment with the resolved set, its byte counts when it closes or the budget cuts it) | **implemented** |
 | `agentjail audit`: both gateway streams read back, merged in time order and filtered by jail, class, decision | **implemented** |
 | Egress classes `model` / `external` / `internal` as three committed configs, one binary, one container per run | **implemented** |
+| Operator-defined classes: `network.class_dir` + `network.class_digest`, validated with the same rules, pinned by sha256, refused when a built-in name would be shadowed; no environment override | **implemented** |
 | Network lifecycle: `Drop` guard on network + gateway, dead-pid pruning only, never by profile prefix | **implemented** |
 | Proofs (class beats ACL text both ways, raw IP refused, allow audited, deny logged, byte budget cuts a tunnel, connection cap refuses one) | **implemented**, run in the normal `ci` job |
 | `selftest` (negative set + positive control), baseline and jailed in `ci` | **implemented** (`--baseline` proves each negative holds without a jail; jailed proves it is denied) |

@@ -352,9 +352,11 @@ scripts/build-gateway-image.sh                 # localhost/agentjail-gateway:1
 ```
 
 `run` refuses to start a class side when the image is absent, and says how to
-build it. The class config is bind-mounted read-only from the checkout (or from
-`AGENTJAIL_CLASS_DIR`), so what runs is what is committed, not a copy baked into
-an image that may be older than the file.
+build it. The class config is bind-mounted read-only from the checkout — or from
+the directory a profile names in `network.class_dir`, in which case the profile
+also pins the file's digest in `network.class_digest`. Either way what runs is a
+file under review, not a copy baked into an image that may be older than the file,
+and not a directory that changed since the profile was reviewed.
 
 ### The image is pinned by ID, not by tag
 

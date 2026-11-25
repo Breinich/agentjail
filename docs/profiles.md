@@ -248,6 +248,29 @@ needs.
 | `mode` | yes | `none` or `allowlist`. |
 | `dns` | yes | `none`, `gateway`, or `pinned`. `pinned` parses and is **refused by validation as not implemented**; `gateway` is the only accepted resolver with `mode = "allowlist"`. |
 | `egress` | no | Array of destinations; required non-empty when `mode = "allowlist"`. |
+| `class_dir` | no | Directory holding an **operator-defined** `<class>.toml`. Absolute, given with `class_digest`, and only with `mode = "allowlist"`. |
+| `class_digest` | no | `sha256:<64 hex>` of that file. Required with `class_dir`; a mismatch refuses the run. |
+
+A class is either one this build ships (`model`, `external`, `internal`, read from
+`gateway/classes/<class>.toml` next to the checkout or the installed binary) **or**
+an operator-defined one, which a profile names by directory and pins by digest:
+
+```toml
+[network]
+class = "bot"
+class_dir = "/srv/agentjail/classes"
+class_digest = "sha256:1f0c…"   # sha256sum /srv/agentjail/classes/bot.toml
+mode = "allowlist"
+dns = "gateway"
+```
+
+The rules are the same fail-closed shape as a built-in class, plus three of its
+own: the file is parsed with the identical semantic rules (budgets and connection
+caps required, no raw addresses, no duplicates); the digest must match the file
+**exactly**, so a policy change is a review event rather than a quiet widening; and
+an operator class may not reuse a built-in class name, so one name never means two
+policies. There is no environment variable for any of this: policy a run depends on
+is named by the profile, not by whatever the caller's environment holds.
 
 `dns` has **no default**: leaving it out is an error, not a silent choice. An
 inherited host search domain can turn an unqualified name into an internal

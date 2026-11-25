@@ -320,13 +320,16 @@ fn run_jailed(
     // reach it. Loopback, link-local, CGNAT and the mapped spellings stay
     // refused, exactly as in a committed class.
     let class_config = format!(
-        "class = \"model\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+        "class = \"selftest\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
          max_bytes = 67108864\nmax_connections = 8\naddress_policy = \"lan\"\n\
          allow = [\n  \"{}:{}\",\n]\n",
         target_name, TARGET_PORT_ALLOWED
     );
-    std::fs::write(classes.join("model.toml"), class_config)
+    let class_path = classes.join("selftest.toml");
+    std::fs::write(&class_path, class_config)
         .map_err(|error| format!("cannot write selftest class config: {error}"))?;
+    let class_digest = agentjail_core::class::file_digest(&class_path)
+        .map_err(|error| format!("cannot digest the selftest class config: {error}"))?;
 
     let main_profile = dir.join("selftest-main.toml");
     std::fs::write(
@@ -337,15 +340,12 @@ fn run_jailed(
             Some((&target_name, TARGET_PORT_ALLOWED)),
             None,
             None,
+            Some((&classes, &class_digest)),
         ),
     )
     .map_err(|error| format!("cannot write selftest profile: {error}"))?;
 
     let mut child_env = env.clone();
-    child_env.insert(
-        "AGENTJAIL_CLASS_DIR".to_string(),
-        classes.to_string_lossy().into_owned(),
-    );
     child_env.insert(
         "AGENTJAIL_EGRESS_NETWORK".to_string(),
         egress_network.clone(),
@@ -407,12 +407,12 @@ fn run_jailed(
     // per container, so two live mounts of one file would fight over the label.
     std::fs::write(
         &profile_a,
-        profile_text(target, &probe_a, None, Some(&peer_a), Some(&token_a)),
+        profile_text(target, &probe_a, None, Some(&peer_a), Some(&token_a), None),
     )
     .map_err(|error| format!("cannot write peer profile: {error}"))?;
     std::fs::write(
         &profile_b,
-        profile_text(target, &probe_b, None, Some(&peer_b), Some(&token_b)),
+        profile_text(target, &probe_b, None, Some(&peer_b), Some(&token_b), None),
     )
     .map_err(|error| format!("cannot write peer profile: {error}"))?;
 
@@ -880,6 +880,7 @@ fn profile_text(
     egress: Option<(&str, u16)>,
     isolated_network: Option<&str>,
     token: Option<&str>,
+    operator_class: Option<(&Path, &str)>,
 ) -> String {
     let mut text = String::new();
     text.push_str("version = 1\n");
@@ -894,7 +895,17 @@ fn profile_text(
     text.push_str("[network]\n");
     match egress {
         Some((host, port)) => {
-            text.push_str("class = \"model\"\n");
+            text.push_str("class = \"selftest\"\n");
+            // The selftest's class is generated per run, so it is an operator
+            // class: named by a directory and pinned by digest, exactly as a
+            // profile would have to name it.
+            if let Some((dir, digest)) = operator_class {
+                text.push_str(&format!(
+                    "class_dir = \"{}\"\n",
+                    escape(&dir.to_string_lossy())
+                ));
+                text.push_str(&format!("class_digest = \"{}\"\n", escape(digest)));
+            }
             text.push_str("mode = \"allowlist\"\n");
             text.push_str("dns = \"gateway\"\n\n");
             text.push_str("[[network.egress]]\n");

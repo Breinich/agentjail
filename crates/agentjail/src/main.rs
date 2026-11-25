@@ -191,6 +191,12 @@ struct AuditArgs {
     /// Egress class: whose configured streams to read, and the class to filter on.
     #[arg(long, value_name = "CLASS")]
     class: Option<String>,
+    /// Operator class directory, with --class-digest: where <class>.toml lives.
+    #[arg(long, value_name = "DIR")]
+    class_dir: Option<String>,
+    /// sha256:<64 hex> pin for the class file --class-dir names.
+    #[arg(long, value_name = "DIGEST")]
+    class_digest: Option<String>,
     /// Audit stream: a file, or `-` for stdin.
     #[arg(long, value_name = "PATH")]
     audit: Option<String>,
@@ -245,7 +251,7 @@ fn dispatch(cli: Cli, env: &BTreeMap<String, String>) -> Result<u8, String> {
             ProfileAction::Show { profile } => show_command(&profile, &cli.profile_dirs, env, &cwd),
         },
         Command::Run(args) => run_command(args, &cli.profile_dirs, env, &cwd),
-        Command::Audit(args) => audit_command(args, env, &cwd),
+        Command::Audit(args) => audit_command(args, &cwd),
         Command::Selftest(args) => selftest_command(args, &cli.profile_dirs, env, &cwd),
         Command::Probe(args) => {
             let _ = args.mode;
@@ -311,7 +317,7 @@ fn validate_command(
     println!("OK {}", loaded.path.display());
     println!("   image: {}", loaded.profile.image_ref());
     println!("   {}", loaded.profile.summary());
-    if let Some((path, class)) = resolve_class(&loaded.profile, env, cwd)? {
+    if let Some((path, class)) = resolve_class(&loaded.profile, cwd)? {
         println!(
             "   egress class {:?} from {}: {} allowlisted destination(s), deny by default",
             class.class,
@@ -492,11 +498,7 @@ fn run_command(
 /// configured as `-` went to podman's log rather than a file, so there is
 /// nothing here to read: say so instead of printing an empty result that looks
 /// like "no activity".
-fn audit_command(
-    args: AuditArgs,
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
-) -> Result<u8, String> {
+fn audit_command(args: AuditArgs, cwd: &Path) -> Result<u8, String> {
     let streams = match args.stream.as_deref() {
         None => audit::Streams::Both,
         Some("audit") => audit::Streams::Audit,
@@ -514,7 +516,15 @@ fn audit_command(
             "give --class <class> to read its configured streams, or --audit/--dns <path>"
                 .to_string()
         })?;
-        let (path, config) = class::load(class, &class::config_search_dirs(env, cwd))
+        let loaded = match (args.class_dir.as_deref(), args.class_digest.as_deref()) {
+            (Some(dir), Some(digest)) => class::load_pinned(Path::new(dir), class, digest),
+            (None, None) => class::load(class, &class::config_search_dirs(cwd)),
+            _ => Err(
+                "--class-dir and --class-digest go together: a directory without a digest is policy that can change under the command that reads it"
+                    .to_string(),
+            ),
+        };
+        let (path, config) = loaded
             .map_err(|error| format!("cannot read the streams of class {class:?}: {error}"))?;
         eprintln!(
             "agentjail: streams from {} (audit_log={:?}, dns_log={:?})",
@@ -736,11 +746,7 @@ fn selftest_command(
 
 /// The class config this profile names, if it has one, with the classes it asks
 /// for checked against it. `None` for `mode = "none"`.
-fn resolve_class(
-    profile: &Profile,
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
-) -> Result<Option<(PathBuf, ClassConfig)>, String> {
+fn resolve_class(profile: &Profile, cwd: &Path) -> Result<Option<(PathBuf, ClassConfig)>, String> {
     if profile.network.mode != NetworkMode::Allowlist {
         return Ok(None);
     }
@@ -749,7 +755,18 @@ fn resolve_class(
             "profile names no egress class; profile validation should have refused it".to_string(),
         );
     };
-    let (path, config) = class::load(class, &class::config_search_dirs(env, cwd))?;
+    let loaded = match profile.network.class_dir.as_deref() {
+        // Operator class: a directory the profile names, pinned by digest.
+        Some(dir) => {
+            let digest = profile.network.class_digest.as_deref().ok_or_else(|| {
+                "network.class_dir without network.class_digest; profile validation should have refused it"
+                    .to_string()
+            })?;
+            class::load_operator(dir, class, digest)?
+        }
+        None => class::load(class, &class::config_search_dirs(cwd))?,
+    };
+    let (path, config) = loaded;
     let outside = run::egress_outside_class(profile, &config);
     if !outside.is_empty() {
         return Err(format!(
@@ -774,7 +791,7 @@ fn start_class_side(
     cwd: &Path,
     cleanup: &mut RunCleanup,
 ) -> Result<(String, String), String> {
-    let (config_path, config) = resolve_class(profile, env, cwd)?
+    let (config_path, config) = resolve_class(profile, cwd)?
         .ok_or_else(|| "class side requested for a profile with no egress class".to_string())?;
 
     // Resolve the tag to an image ID now, and start the container by that ID.

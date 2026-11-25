@@ -6,16 +6,20 @@
 //! class name below is what appears in the audit log; the network name is the
 //! identity the agent cannot change from inside.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::address::AddressPolicy;
 
-/// The classes this build ships. `run` refuses anything else, so a profile
-/// cannot invent a class whose allowlist nobody reviewed.
+/// The classes this build ships. A profile may name one of these, or an operator
+/// class from a directory it pins by digest (`load_operator`) — never an
+/// invented name with no policy file behind it.
 pub const CLASSES: [&str; 3] = ["model", "external", "internal"];
+
+/// Digest prefix for `network.class_digest`, the same shape as `image.digest`.
+pub const DIGEST_PREFIX: &str = "sha256:";
 
 /// The gateway's CONNECT port inside its own network.
 pub const PROXY_PORT: u16 = 3128;
@@ -39,16 +43,14 @@ impl AllowEntry {
     }
 }
 
-/// Environment override for the directory holding `<class>.toml`.
-pub const CLASS_DIR_ENV: &str = "AGENTJAIL_CLASS_DIR";
-
-/// Where to look for class configs, in order: the override, the checked-out
+/// Where to look for the built-in class configs, in order: the checked-out
 /// repository, then the one next to the installed binary.
-pub fn config_search_dirs(env: &BTreeMap<String, String>, cwd: &Path) -> Vec<PathBuf> {
+///
+/// There is deliberately no environment override: policy a run depends on is
+/// named by a profile (and pinned by digest when it is an operator class), not
+/// by whatever the caller's environment happens to contain.
+pub fn config_search_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(dir) = env.get(CLASS_DIR_ENV).filter(|value| !value.is_empty()) {
-        dirs.push(PathBuf::from(dir));
-    }
     dirs.push(cwd.join("gateway").join("classes"));
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(Path::to_path_buf);
@@ -63,6 +65,84 @@ pub fn config_search_dirs(env: &BTreeMap<String, String>, cwd: &Path) -> Vec<Pat
     dirs
 }
 
+/// A class name an operator may use: lowercase alphanumerics or `-`, and not one
+/// of the built-in names. Shadowing a built-in class by pointing a directory at
+/// it would make the same name mean two policies.
+pub fn is_operator_class_name(name: &str) -> bool {
+    !name.is_empty()
+        && !CLASSES.contains(&name)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// `sha256:<64 lowercase hex>` of the class file's bytes.
+pub fn file_digest(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("cannot read class config {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{DIGEST_PREFIX}{:x}", hasher.finalize()))
+}
+
+/// Load an operator-supplied class: `<dir>/<class>.toml`, parsed with the same
+/// rules as a built-in class, and pinned by the digest the profile declares.
+///
+/// Fail closed on every axis: the file must exist, parse, declare the class it
+/// was loaded for, and hash to exactly the digest in the profile. A directory
+/// that can change under a reviewed profile is not a pin.
+pub fn load_operator(
+    dir: &Path,
+    class: &str,
+    digest: &str,
+) -> Result<(PathBuf, ClassConfig), String> {
+    if !is_operator_class_name(class) {
+        return Err(format!(
+            "class {class:?} is not an operator class name: lowercase alphanumerics or '-', and not one of the built-in classes ({})",
+            CLASSES.join(", ")
+        ));
+    }
+    if !digest.starts_with(DIGEST_PREFIX) {
+        return Err(format!(
+            "class_digest {digest:?} must be {DIGEST_PREFIX}<64 lowercase hex characters>"
+        ));
+    }
+    load_pinned(dir, class, digest)
+}
+
+/// Load `<dir>/<class>.toml` and require its digest to match. No name rule: this
+/// is the mechanism, and `load_operator` adds the profile-side rule that an
+/// operator class may not shadow a built-in one. `audit` uses it directly, to
+/// read the streams of a class file it is told about explicitly.
+pub fn load_pinned(
+    dir: &Path,
+    class: &str,
+    digest: &str,
+) -> Result<(PathBuf, ClassConfig), String> {
+    if !digest.starts_with(DIGEST_PREFIX) {
+        return Err(format!(
+            "class_digest {digest:?} must be {DIGEST_PREFIX}<64 lowercase hex characters>"
+        ));
+    }
+    let path = dir.join(format!("{class}.toml"));
+    if !path.is_file() {
+        return Err(format!(
+            "no class config at {}; network.class_dir must contain <class>.toml",
+            path.display()
+        ));
+    }
+    let actual = file_digest(&path)?;
+    if actual != digest.to_ascii_lowercase() {
+        return Err(format!(
+            "class config {} does not match the digest this profile pins: expected {digest}, found {actual}. \
+             Re-read the file before changing the digest: the pin exists so a policy change is a review event.",
+            path.display()
+        ));
+    }
+    load_from_path(&path, class)
+}
+
 /// Load the committed config for one class. A missing file is an error that
 /// names every directory searched: a class without its policy file is not a
 /// class.
@@ -74,34 +154,38 @@ pub fn load(class: &str, dirs: &[PathBuf]) -> Result<(PathBuf, ClassConfig), Str
         if !candidate.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(&candidate).map_err(|error| {
-            format!("cannot read class config {}: {error}", candidate.display())
-        })?;
-        let config = ClassConfig::parse(&text).map_err(|errors| {
-            format!(
-                "class config {} is invalid:\n{}",
-                candidate.display(),
-                errors
-                    .iter()
-                    .map(|error| format!("  - {error}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        })?;
-        if config.class != class {
-            return Err(format!(
-                "class config {} declares class {:?}, but it was loaded for class {class:?}",
-                candidate.display(),
-                config.class
-            ));
-        }
-        return Ok((candidate, config));
+        return load_from_path(&candidate, class);
     }
     Err(format!(
-        "no class config for {class:?}; searched:\n  {}\nset {} to point at the gateway/classes directory",
+        "no class config for {class:?}; searched:\n  {}\na class is either one this build ships ({}) or an operator class named by network.class_dir with a pinned network.class_digest",
         searched.join("\n  "),
-        CLASS_DIR_ENV
+        CLASSES.join(", ")
     ))
+}
+
+/// Parse one class file and check it declares the class it was loaded for.
+fn load_from_path(candidate: &Path, class: &str) -> Result<(PathBuf, ClassConfig), String> {
+    let text = std::fs::read_to_string(candidate)
+        .map_err(|error| format!("cannot read class config {}: {error}", candidate.display()))?;
+    let config = ClassConfig::parse(&text).map_err(|errors| {
+        format!(
+            "class config {} is invalid:\n{}",
+            candidate.display(),
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })?;
+    if config.class != class {
+        return Err(format!(
+            "class config {} declares class {:?}, but it was loaded for class {class:?}",
+            candidate.display(),
+            config.class
+        ));
+    }
+    Ok((candidate.to_path_buf(), config))
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
