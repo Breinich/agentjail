@@ -1,13 +1,38 @@
 @startuml run-lifecycle
-' UML state machine diagram: what `run` is allowed to do, in order.
-' Source of record for docs/diagrams/run-lifecycle.svg. Do not edit the SVG.
-title run: validate, verify, exec, reap
+' UML sequence diagram: one `run`, from preflight to reap.
+' Source of record for docs/diagrams/run-lifecycle.svg. Do not edit the SVG:
+' render it with the pinned PlantUML image (docs/adopting.md).
+' &#45;&#45; is a literal "--": PlantUML reads --text-- as strikeout.
+title run: preflight, per-run network, gateway with the grant, jail, reap
 
-[*] --> Validated : profile parses and validates
-Validated --> Refused : single-route invariant fails
-Validated --> NetworkReady : internal network verified
-NetworkReady --> Running : container starts, agent exec'd
-Running --> Reaped : agent exits or dies from signal
-Reaped --> [*] : container removed, exit code returned
-Refused --> [*] : exit 1, nothing started
+actor "operator" as H
+participant "agentjail\nrun" as C
+participant "podman" as P
+participant "gateway container\nclass, dual-homed" as G
+participant "jail container\nuid 10000" as J
+
+H -> C : agentjail run <profile> &#45;&#45; <agent command…>
+C -> C : load, validate, run the blockers,\nresolve the class, compute the grant
+C -> P : image inspect the gateway tag,\nthen start the container by ID, never by tag
+C -> P : prune containers and networks whose owning pid is dead\n(never by profile prefix alone)
+C -> P : network create &#45;&#45;internal <profile>-<pid>-<class>\nnetwork create <profile>-<pid>-egress
+C -> P : network inspect
+note over C
+  The same verification function `doctor &#45;&#45;network` calls: internal=true,
+  a subnet, IPv4 only. A network that changed under you fails before anything
+  starts, and a refusal is not a warning.
+end note
+C -> P : run -d gateway on both networks\n&#45;&#45;grant <profile egress ∩ class allowlist>\n&#45;&#45;audit-dir <state>/audit/<class>
+note right of G
+  An empty grant is announced ("this jail has no route out"),
+  not refused: the gateway starts and permits nothing.
+end note
+C -> P : read the gateway's address on the class network,\nand fail the run if it never appears
+C -> P : run jail &#45;&#45;network class &#45;&#45;dns <gateway>\n&#45;&#45;dns-search . &#45;&#45;env HTTPS_PROXY/ALL_PROXY=http://<gateway>:3128
+J -> G : CONNECT host:port, the jail has no other peer
+H -> C : SIGINT, SIGTERM, SIGQUIT
+C -> P : forward the signal to podman, then wait
+P --> C : exit code, or 128 + signal
+C -> P : remove the gateway, then the egress network,\nthen the class network, on every exit path
+C --> H : exit with the agent's own code
 @enduml

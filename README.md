@@ -5,8 +5,9 @@ secrets, no host network, its own home, and an enforced egress allowlist.
 
 ![agentjail: one jail, one route out](docs/diagrams/deployment.svg)
 
-The diagram source is `docs/diagrams/deployment.puml`; the SVG is rendered by CI
-from the pinned PlantUML image (`docs/adopting.md`).
+The diagram sources are in `docs/diagrams/` and the SVGs are rendered by CI from
+the pinned PlantUML image (`docs/adopting.md`); [Diagrams](#diagrams) lists them
+all.
 
 An agent is a process. agentjail does not know or care whether that process is
 pi, Claude Code, Codex, OpenCode, or something you wrote — it takes a command
@@ -184,6 +185,20 @@ checked but not authenticated, IPv6 egress off rather than implemented, and the
 gateway image pinned by ID rather than attested. What remains reachable if the
 gateway itself is compromised is stated in one place,
 `docs/threat-model.md#if-the-gateway-itself-is-compromised`.
+
+## Diagrams
+
+Every diagram is a PlantUML source in `docs/diagrams/` with its rendered SVG
+committed next to it. CI renders it with the digest-pinned PlantUML image and
+fails on invalid syntax or on an SVG that no longer matches its source, so a
+diagram here describes this commit and not an earlier design.
+
+- [`deployment.svg`](docs/diagrams/deployment.svg) — the host, the per-run internal network, the jail, and the dual-homed class gateway.
+- [`run-lifecycle.svg`](docs/diagrams/run-lifecycle.svg) — one `run` from the preflight to the reap: per-run network, gateway with the grant and the audit destination, jail, teardown.
+- [`egress-decision.svg`](docs/diagrams/egress-decision.svg) — the grant as `profile egress ∩ class allowlist`, and why one connection is denied `not-in-profile` or `not-in-class`.
+- [`audit-readback.svg`](docs/diagrams/audit-readback.svg) — the per-run audit and DNS files, and reading them back after the container is gone.
+- [`launcher-sequence.svg`](docs/diagrams/launcher-sequence.svg) — the launcher transport: pipes, signals, exit code.
+- [`selftest-flip.svg`](docs/diagrams/selftest-flip.svg) — the same probe failing without a jail and passing with one.
 
 ## Documentation
 
