@@ -9,9 +9,9 @@
 #            stream records the connection with its byte counts;
 #   proof 4  a denied destination is refused and logged as a denial.
 #   proof 5  lifecycle: a normal, a failed and a signal-terminated run each leave
-#            no network and no gateway behind, a SIGKILLed run is cleaned up by
-#            the next run of the same profile, and no other profile's resources
-#            are touched;
+#            no network and no gateway behind; a SIGKILLed run leaves its network
+#            and gateway container, its network is pruned by the next run of the
+#            same profile, and its container by any later run at all;
 #   proof 6  the per-jail byte budget cuts a connection and logs the refusal with
 #            the counter that caused it;
 #   proof 7  the per-jail connection cap refuses a second tunnel and logs it;
@@ -598,12 +598,16 @@ leftover=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-
 [ -z "$leftover" ] && ok 'lifecycle: a failed run leaves no network' \
   || fail "lifecycle: a failed run left $leftover"
 
-say "lifecycle: SIGKILLed run is pruned by the next run of the same profile only"
+say "lifecycle: a SIGKILLed run is pruned by the next run, whoever runs it"
 "$agentjail" run "$work/proof-fail.toml" -- bash -lc 'sleep 60' >/dev/null 2>&1 &
 killed_pid=$!
+# Wait for the gateway container, not only for the network: the container is what
+# survives a SIGKILL now that the gateway is not started with `--rm`, and the
+# assertion below is about it.
+orphan_gateway="agentjail-proof-fail-${killed_pid}-gateway"
 deadline=$(( $(date +%s) + 30 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  podman network ls --format '{{.Name}}' | grep -q '^agentjail-proof-fail-' && break
+  podman ps -a --format '{{.Names}}' | grep -qx "$orphan_gateway" && break
   sleep 0.5
 done
 kill -9 "$killed_pid" 2>/dev/null || true
@@ -612,13 +616,26 @@ sleep 0.5
 stale=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-' || true)
 [ -n "$stale" ] && ok "lifecycle: a SIGKILLed run leaves $stale (uncatchable, by design)" \
   || fail 'lifecycle: expected a SIGKILLed run to leave its network behind (it did not, so this proof proves nothing)'
+if podman ps -a --format '{{.Names}}' | grep -qx "$orphan_gateway"; then
+  ok "lifecycle: a SIGKILLed run leaves its gateway container behind"
+else
+  fail "lifecycle: expected $orphan_gateway to survive a SIGKILL (this proof would prove nothing)"
+fi
 
-# Another profile must not touch it.
+# Another profile: it prunes the orphaned container by the pid in its name, and
+# leaves this profile's network alone (a network name is what concurrent runs of
+# one profile share, so networks stay profile-scoped). Before this, a profile
+# nobody ran again left its gateway container behind indefinitely.
 class_config "$work/classes/proof-internal.toml" proof-internal 268435456 8 lan "$target_name:9001"
 profile_for "$work/proof-other.toml" proof-other proof-model "$target_name" 9001
 "$agentjail" run "$work/proof-other.toml" -- bash -lc 'true' >/dev/null 2>&1 || true
+if podman ps -a --format '{{.Names}}' | grep -qx "$orphan_gateway"; then
+  fail "lifecycle: another profile did not prune the orphaned gateway $orphan_gateway"
+else
+  ok 'lifecycle: another profile prunes an orphaned gateway (pruned by pid, not by profile)'
+fi
 still_there=$(podman network ls --format '{{.Name}}' | grep '^agentjail-proof-fail-' || true)
-[ "$still_there" = "$stale" ] && ok 'lifecycle: another profile does not prune it (no profile-prefix pruning)' \
+[ "$still_there" = "$stale" ] && ok 'lifecycle: another profile leaves this network alone (networks stay profile-scoped)' \
   || fail "lifecycle: another profile's run touched $stale"
 
 # Same profile again: only the dead pid is pruned.

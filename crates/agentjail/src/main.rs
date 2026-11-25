@@ -934,11 +934,21 @@ fn start_class_side(
     Ok((network, gateway_ip))
 }
 
-/// Remove resources of this profile whose run is gone. Never by profile alone.
+/// Remove resources whose run is gone.
+///
+/// Containers are pruned **by pid, across profiles**: the gateway is no longer
+/// started with `--rm` (so a refusal can be read back), which means a killed run
+/// leaves its gateway behind, and a profile nobody runs again would leave it
+/// there indefinitely. Networks stay profile-scoped: a network name is what a
+/// concurrent run of the same profile shares, and `agentjail-*` is also a shape a
+/// user's own network can have.
 fn prune_dead_resources(profile_name: &str, run_id: u32) {
     if let Ok(names) = podman::container_list() {
-        for name in lifecycle::stale_names(&names, profile_name, run_id, pid_alive) {
-            let _ = podman::container_remove(&name);
+        for name in names
+            .iter()
+            .filter(|name| lifecycle::orphaned_container(name, run_id, pid_alive))
+        {
+            let _ = podman::container_remove(name);
         }
     }
     if let Ok(names) = podman::network_list() {
