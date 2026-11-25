@@ -702,3 +702,203 @@ fn numeric_proc_entries(path: &Path) -> usize {
         .filter(|name| name.to_string_lossy().chars().all(|c| c.is_ascii_digit()))
         .count()
 }
+
+/// A finished run's audit trail is readable with the documented command.
+///
+/// The class config ships `audit_log = "-"`, and the gateway container runs with
+/// `--rm`, so `agentjail audit --class model` used to print zero lines once the
+/// run was over. `run` now gives every run two files in the profile state
+/// directory and the gateway writes them through a writable bind mount.
+///
+/// This is the acceptance test, not a file-existence test: it makes one allowed
+/// and one denied CONNECT plus a DNS query outside the grant, lets the run finish,
+/// confirms the containers are gone, and only then runs the command an operator
+/// would type.
+#[test]
+#[ignore = "requires rootless podman, the base and gateway images, ~1 min"]
+fn audit_class_returns_both_streams_after_the_run_and_gateway_are_gone() {
+    let dir = tmpdir("audit-readback");
+    let digest = image_digest();
+    let target_net = network_name("audit-target");
+    let target_name = format!("audit-target-{}", std::process::id());
+    create_network(&target_net, true);
+
+    // A target that answers one CONNECT and closes. The gateway reaches it over
+    // the egress leg the test pins below, so the allowed name resolves.
+    let target = podman(&[
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        &target_name,
+        "--network",
+        &target_net,
+        IMAGE,
+        "node",
+        "-e",
+        "const net=require('net');net.createServer(s=>s.end('hello\\n')).listen(9001,'0.0.0.0')",
+    ]);
+    assert!(
+        target.status.success(),
+        "target container failed: {}",
+        String::from_utf8_lossy(&target.stderr)
+    );
+
+    let class = "audit-readback";
+    let class_dir = dir.join("classes");
+    std::fs::create_dir_all(&class_dir).expect("class dir");
+    let class_path = class_dir.join(format!("{class}.toml"));
+    std::fs::write(
+        &class_path,
+        format!(
+            r#"class = "{class}"
+listen = "0.0.0.0:3128"
+dns = "0.0.0.0:53"
+max_bytes = 268435456
+max_connections = 8
+address_policy = "lan"
+allow = ["{target_name}:9001"]
+"#
+        ),
+    )
+    .expect("class config");
+    let class_digest =
+        agentjail_core::class::file_digest(&class_path).expect("digest the class config");
+
+    let profile_path = dir.join("audit-readback.toml");
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"version = 1
+workdir = "/work"
+home = "/home/agent"
+
+[image]
+name = "localhost/agentjail-base:1"
+digest = "{digest}"
+
+[network]
+class = "{class}"
+class_dir = "{class_dir}"
+class_digest = "{class_digest}"
+mode = "allowlist"
+dns = "gateway"
+
+[[network.egress]]
+host = "{target_name}"
+port = 9001
+
+[agent]
+command = "bash"
+"#,
+            class_dir = class_dir.display(),
+            class_digest = class_digest,
+        ),
+    )
+    .expect("write profile");
+
+    // The script is passed after `--`, not through the profile: `${...}` is a
+    // profile placeholder and would be refused there.
+    let script = format!(
+        r#"proxy=${{HTTPS_PROXY#http://}}
+ph=${{proxy%%:*}}
+pp=${{proxy##*:}}
+connect() {{
+  exec 3<>/dev/tcp/$ph/$pp
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >&3
+  head -1 <&3
+  exec 3<&- 3>&- 2>/dev/null || true
+}}
+connect {target_name}:9001
+connect denied.example.invalid:443
+python3 -c 'import socket; socket.gethostbyname("outside.example.invalid")' 2>/dev/null || true
+echo done"#
+    );
+    let state = dir.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentjail"))
+        .args([
+            "run",
+            profile_path.to_str().expect("path"),
+            "--",
+            "bash",
+            "-lc",
+            &script,
+        ])
+        .env_remove("AGENTJAIL_PODMAN")
+        .env("AGENTJAIL_EGRESS_NETWORK", &target_net)
+        .env("AGENTJAIL_STATE_DIR", &state)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentjail");
+    let run_id = child.id();
+    let status = child.wait().expect("wait for agentjail");
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    {
+        use std::io::Read;
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        status.success(),
+        "run failed: stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("done"), "jail output: {stdout}");
+
+    // The container is gone before the audit read: this is the part the finding
+    // was about, not the files on disk.
+    let jail_prefix = format!("agentjail-audit-readback-{run_id}");
+    assert!(
+        no_agentjail_containers(&jail_prefix),
+        "the run left a container behind"
+    );
+
+    let audit = Command::new(env!("CARGO_BIN_EXE_agentjail"))
+        .args([
+            "audit",
+            "--class",
+            class,
+            "--class-dir",
+            class_dir.to_str().expect("class dir path"),
+            "--class-digest",
+            &class_digest,
+        ])
+        .env_remove("AGENTJAIL_PODMAN")
+        .env("AGENTJAIL_STATE_DIR", &state)
+        .output()
+        .expect("run agentjail audit");
+    let audit_out = String::from_utf8_lossy(&audit.stdout);
+    let audit_err = String::from_utf8_lossy(&audit.stderr);
+    assert!(
+        audit.status.success(),
+        "audit failed: stdout={audit_out}\nstderr={audit_err}"
+    );
+
+    let jail_id = format!("audit-readback-{run_id}");
+    for expected in [
+        format!("dest={target_name}:9001 decision=allow"),
+        "dest=denied.example.invalid:443 decision=deny".to_string(),
+        format!("class={class} jail={jail_id}"),
+        "qname=outside.example.invalid".to_string(),
+        "decision=nxdomain".to_string(),
+    ] {
+        assert!(
+            audit_out.contains(&expected),
+            "missing {expected:?} after the run; stdout=\n{audit_out}\nstderr=\n{audit_err}"
+        );
+    }
+    assert!(
+        audit_out.contains("stream=dns"),
+        "the DNS stream is missing from the view:\n{audit_out}"
+    );
+
+    println!("audit after a finished run:\n{audit_out}");
+    let _ = podman(&["rm", "-f", &target_name]);
+    remove_network(&target_net);
+}

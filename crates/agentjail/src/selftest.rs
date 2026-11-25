@@ -20,9 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentjail_core::lifecycle;
+use agentjail_core::paths;
 use agentjail_core::podman;
 use agentjail_core::profile::Profile;
+use agentjail_core::run;
 use serde_json::{json, Value};
 
 const SELFTEST_IMAGE: &str = "docker.io/library/node";
@@ -354,6 +355,10 @@ fn run_jailed(
         "AGENTJAIL_SELFTEST_SECRET".to_string(),
         "host-secret-value".to_string(),
     );
+    child_env.insert(
+        "AGENTJAIL_STATE_DIR".to_string(),
+        dir.join("state").to_string_lossy().into_owned(),
+    );
 
     let probe = probe_args(
         "main",
@@ -370,7 +375,15 @@ fn run_jailed(
         1000,
         0,
     );
-    let (output, audit) = run_in_jail(&main_profile, &probe, &child_env, cwd, "selftest-main")?;
+    let (output, audit, audit_view, jail_id) = run_in_jail(
+        &main_profile,
+        &probe,
+        &child_env,
+        cwd,
+        "selftest-main",
+        &classes,
+        &class_digest,
+    )?;
     let observation = parse_probe(&output, "jailed probe")?;
 
     // Two concurrent jails, each with its own home and its own token. Each
@@ -467,6 +480,7 @@ fn run_jailed(
         evaluate("resource-limits", "jailed", &observation, None),
         evaluate("net-admin", "jailed", &observation, None),
         evaluate("positive-control", "jailed", &observation, Some(&audit)),
+        evaluate_audit_after_run(&audit_view, &jail_id),
     ];
 
     drop(cleanup);
@@ -479,13 +493,52 @@ fn run_in_jail(
     env: &std::collections::BTreeMap<String, String>,
     cwd: &Path,
     profile_name: &str,
-) -> Result<(Output, String), String> {
+    class_dir: &Path,
+    class_digest: &str,
+) -> Result<(Output, String, String, String), String> {
     let child = spawn_in_jail(profile, probe, env, cwd)?;
-    let gateway = lifecycle::gateway_name(profile_name, child.id());
-    let watcher = watch_gateway(gateway);
+    let jail_id = format!("{profile_name}-{}", child.id());
+    // The selftest's allowlist class is generated per run and pinned by digest,
+    // so its files are under that class name and the state directory `run` got.
+    let audit_path = run::audit_dir(&paths::state_dir(env), "selftest")
+        .join(run::audit_file_name(&jail_id, "audit"));
     let output = wait_child(child, "jailed probe")?;
-    let gateway_log = watcher.finish();
-    Ok((output, gateway_log))
+    let audit_file = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    // The documented command, run after the jail and gateway are gone. This is
+    // in the jailed selftest on purpose: CI already pays for the jail here, so
+    // the acceptance check runs on every push instead of only when remembered.
+    let audit_view = read_audit_view(env, class_dir, class_digest)?;
+    Ok((output, audit_file, audit_view, jail_id))
+}
+
+fn read_audit_view(
+    env: &std::collections::BTreeMap<String, String>,
+    class_dir: &Path,
+    class_digest: &str,
+) -> Result<String, String> {
+    let output = Command::new(current_exe()?)
+        .args([
+            "audit",
+            "--class",
+            "selftest",
+            "--class-dir",
+            &class_dir.to_string_lossy(),
+            "--class-digest",
+            class_digest,
+        ])
+        .envs(env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("cannot run agentjail audit: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "agentjail audit exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn spawn_in_jail(
@@ -522,41 +575,6 @@ fn wait_child(child: Child, label: &str) -> Result<Output, String> {
         ));
     }
     Ok(output)
-}
-
-struct GatewayWatch {
-    stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<String>,
-}
-
-impl GatewayWatch {
-    fn finish(self) -> String {
-        self.stop.store(true, Ordering::SeqCst);
-        self.handle.join().unwrap_or_default()
-    }
-}
-
-fn watch_gateway(name: String) -> GatewayWatch {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_for_thread = stop.clone();
-    let handle = std::thread::spawn(move || {
-        let mut last = String::new();
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            if let Ok(output) = podman::podman(&["logs", &name]) {
-                if !output.stdout.trim().is_empty() {
-                    last = output.stdout;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if let Ok(output) = podman::podman(&["logs", &name]) {
-            if !output.stdout.trim().is_empty() {
-                last = output.stdout;
-            }
-        }
-        last
-    });
-    GatewayWatch { stop, handle }
 }
 
 fn wait_for_target_ip(name: &str) -> Result<String, String> {
@@ -783,6 +801,25 @@ fn hazard(name: &str, observation: &Value, audit: Option<&str>) -> bool {
     }
 }
 
+fn evaluate_audit_after_run(view: &str, jail_id: &str) -> CaseResult {
+    let allow = view.contains("decision=allow");
+    let deny = view.contains("decision=deny");
+    let jail = view.contains(&format!("jail={jail_id}"));
+    CaseResult {
+        name: "audit-after-run",
+        mode: "jailed",
+        expected:
+            "the documented audit command returns the finished run's allow and deny decisions"
+                .to_string(),
+        observed: format!("allow={allow} deny={deny} jail={jail}"),
+        verdict: if allow && deny && jail {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+    }
+}
+
 fn evaluate_isolation(observation: &Value) -> CaseResult {
     let owner = &observation["owner"];
     let prober = &observation["prober"];
@@ -835,6 +872,7 @@ fn setup_failures(mode: &'static str, error: &str) -> Vec<CaseResult> {
             "resource-limits",
             "net-admin",
             "positive-control",
+            "audit-after-run",
         ][..]
     };
     let mut results: Vec<CaseResult> = names
