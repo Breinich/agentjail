@@ -186,6 +186,9 @@ gateway itself is compromised is stated in one place,
 
 ## Documentation
 
+- [`docs/integration.md`](docs/integration.md) — integrating an agent: the
+  integration model, skills (baked vs mounted), MCP server shapes, composing a
+  profile, per-agent recipes, and the deployment checklist.
 - [`docs/threat-model.md`](docs/threat-model.md) — assets, attacker model,
   guarantees, out-of-scope, accepted residual risks. Read this before trusting
   anything else here.
