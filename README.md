@@ -254,7 +254,8 @@ diagram here describes this commit and not an earlier design.
   audit, and every validation rule.
 - [`docs/cli.md`](docs/cli.md) — launcher and gateway contracts, the selftest
   design, exit codes.
-- [`docs/adopting.md`](docs/adopting.md) — adoption path (stub in this increment).
+- [`docs/adopting.md`](docs/adopting.md) — the adoption note: what to supply,
+  one worked profile, which class per role, and what adoption does not buy.
 - [`images/README.md`](images/README.md) — building the base image and adding a
   runtime.
 
@@ -298,7 +299,7 @@ podman build -f images/base/Containerfile -t localhost/agentjail-base:1 images/b
 CI is a single job with no matrix: one runner boot, cargo cache, cheapest steps
 first, `pull_request` and manual runs only, and the diagram/image steps gated on
 changed paths. The repository is private, so billed minutes are a design
-constraint (`docs/adopting.md`).
+constraint (`.github/workflows/ci.yml`).
 
 Runtime dependencies: none for the launcher, and no HTTP client anywhere — the
 JSON Schema validator is built without its network resolver. All three binaries
