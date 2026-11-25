@@ -996,11 +996,10 @@ fn network_errors(network: &Network) -> Vec<String> {
                         .to_string(),
                 );
             }
-            if network.egress.is_empty() {
-                errors.push(
-                    "network.egress: mode \"allowlist\" needs at least one destination".to_string(),
-                );
-            }
+            // An empty `egress` list is allowed on purpose: a profile that asks
+            // for nothing gets a gateway that permits nothing, which is the same
+            // guarantee as `mode = "none"` with the class side started. `run`
+            // prints that the grant is empty rather than refusing.
             match network.dns {
                 DnsStrategy::Gateway => {}
                 DnsStrategy::None => errors.push(
@@ -1719,12 +1718,17 @@ args = ["-lc", "true"]
     }
 
     #[test]
-    fn allowlist_without_destination_is_rejected() {
+    fn an_allowlist_profile_may_ask_for_nothing() {
+        // A grant of nothing is legitimate: the jail starts, and reaches
+        // nothing. It is not a validation error, because a profile that asks
+        // for nothing is the same posture as `mode = "none"`, only with the
+        // class gateway started for it. `run` says so out loud instead.
         let text = allowlist().replace(
             "[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n",
             "",
         );
-        assert_error(&text, "needs at least one destination");
+        let profile = parse_and_validate(&text).expect("an empty egress list is valid");
+        assert!(profile.network.egress.is_empty());
     }
 
     #[test]

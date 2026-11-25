@@ -116,12 +116,40 @@ case "$1" in
     ;;
   container)
     case "$2" in
-      inspect) echo "${AGENTJAIL_TEST_GATEWAY_IP:-10.89.0.2}" ;;
+      inspect)
+        case "$*" in
+          *State.Status*)
+            # AGENTJAIL_TEST_GATEWAY_EXITED=<code> is a gateway that refused to
+            # start: the state says so, and the address never appears.
+            if [ -n "${AGENTJAIL_TEST_GATEWAY_EXITED:-}" ]; then
+              echo "exited ${AGENTJAIL_TEST_GATEWAY_EXITED}"
+            else
+              echo "running 0"
+            fi
+            ;;
+          *IPAddress*)
+            if [ -n "${AGENTJAIL_TEST_GATEWAY_EXITED:-}" ] || [ -n "${AGENTJAIL_TEST_GATEWAY_NO_ADDRESS:-}" ]; then
+              echo ""
+            else
+              echo "${AGENTJAIL_TEST_GATEWAY_IP:-10.89.0.2}"
+            fi
+            ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      logs)
+        cat "${AGENTJAIL_TEST_GATEWAY_LOGS:-/dev/null}"
+        ;;
       *) exit 1 ;;
     esac
     ;;
   ps)
     cat "${AGENTJAIL_TEST_CONTAINERS:-/dev/null}"
+    ;;
+  logs)
+    # `podman logs` puts the container's stdout on its stdout and its stderr on
+    # its stderr; a gateway refusal is on stderr, which is the case that matters.
+    cat "${AGENTJAIL_TEST_GATEWAY_LOGS:-/dev/null}" >&2
     ;;
   rm)
     echo "container-rm $3" >> "$log"
@@ -332,6 +360,36 @@ fn show_resolves_defaults_and_prints_json() {
         "EXAMPLE_FORGE_TOKEN"
     );
     assert_eq!(document["profile"]["resources"]["nofile"], 1024);
+    // What the jail actually gets, not only what the file says: the intersection
+    // of the class allowlist and this profile's egress list.
+    assert_eq!(document["egress"]["class"], "model");
+    assert_eq!(document["egress"]["grant"][0], "api.anthropic.com:443");
+    assert_eq!(
+        document["egress"]["grant"]
+            .as_array()
+            .map(|grant| grant.len()),
+        Some(1)
+    );
+}
+
+#[test]
+fn show_prints_an_empty_grant_as_empty_not_as_absent() {
+    let dir = tmpdir("show-empty-grant");
+    let text = ALLOWLIST
+        .replace(
+            "[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n",
+            "",
+        )
+        .replace(
+            "[[secrets]]\nname = \"forge_token\"\nsource = \"env\"\nref = \"EXAMPLE_FORGE_TOKEN\"\ntarget = \"EXAMPLE_FORGE_TOKEN\"\n",
+            "",
+        );
+    let path = write_profile(&dir, "nothing.toml", &text);
+    let output = run(&["profile", "show", path.to_str().unwrap()], &dir, None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(document["egress"]["class"], "model");
+    assert_eq!(document["egress"]["grant"], serde_json::json!([]));
 }
 
 #[test]
@@ -805,6 +863,12 @@ fn allowlist_run_creates_the_class_network_and_gateway_and_then_removes_both() {
         gateway.contains("gateway/classes/model.toml"),
         "the committed class config is what is mounted: {gateway}"
     );
+    // The class config is the ceiling, not the grant: the gateway is handed the
+    // intersection of it and this profile's egress list.
+    assert!(
+        gateway.contains("--grant api.anthropic.com:443"),
+        "the gateway must be started with the profile's grant: {gateway}"
+    );
     // The image is the resolved ID, not the tag: a tag is a name.
     assert!(
         gateway.contains("sha256:5f78f0dfcc526190811f735720e01b3acfa401a40eb3406801a3e5a8b25d9783"),
@@ -858,6 +922,57 @@ fn a_failed_run_removes_the_class_network_and_gateway_too() {
     assert!(events.contains("network-create"), "{events}");
     assert!(events.contains("container-rm"), "{events}");
     assert!(events.contains("network-rm"), "{events}");
+}
+
+#[test]
+fn an_allowlist_profile_that_asks_for_nothing_starts_and_says_the_grant_is_empty() {
+    let dir = tmpdir("allowlist-empty-grant");
+    let text = ALLOWLIST.replace(
+        "[[network.egress]]\nhost = \"api.anthropic.com\"\nport = 443\n",
+        "",
+    );
+    let path = write_profile(&dir, "nothing.toml", &text);
+    let podman = fake_podman(&dir);
+    let gateway_argv = dir.join("gateway-argv.txt");
+    let argv_path = dir.join("argv.txt");
+    let output = run_with_env(
+        &["run", path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[
+            (
+                "AGENTJAIL_TEST_GATEWAY_ARGV",
+                gateway_argv.to_str().unwrap(),
+            ),
+            ("AGENTJAIL_TEST_ARGV", argv_path.to_str().unwrap()),
+            ("EXAMPLE_FORGE_TOKEN", "fake-token-value"),
+        ],
+    );
+    // Starting is the point: a profile that asks for nothing is legitimate, and
+    // refusing it would push people back to `mode = "none"` for the same
+    // guarantee. It is loud, not silent.
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("egress grant is empty: this jail has no route out"),
+        "{}",
+        stderr(&output)
+    );
+    // The jail still starts and is still given the gateway as its resolver and
+    // proxy, so everything else in the profile is untouched.
+    let jail = recorded_argv(&argv_path).join(" ");
+    assert!(jail.contains("--dns 10.89.0.2"), "{jail}");
+    assert!(
+        jail.contains("--env HTTPS_PROXY=http://10.89.0.2:3128"),
+        "{jail}"
+    );
+    // And the gateway is told the grant is empty rather than left with the
+    // class allowlist.
+    let gateway = recorded_argv(&gateway_argv);
+    let index = gateway
+        .iter()
+        .position(|arg| arg == "--grant")
+        .expect("the gateway is always told its grant");
+    assert_eq!(gateway.get(index + 1).map(String::as_str), Some(""));
 }
 
 #[test]
@@ -1343,5 +1458,221 @@ fn a_class_name_outside_the_built_ins_needs_an_operator_directory() {
     assert!(
         text.contains("needs network.class_dir and network.class_digest"),
         "{text}"
+    );
+}
+
+// ---------------------------------- the grant, and the image tag, end to end
+
+/// The intersection logic must not assume the three shipped classes: an operator
+/// class is loaded from a directory and pinned by digest, and the grant is then
+/// the intersection of *that* class and the profile.
+#[test]
+fn the_grant_is_the_intersection_for_an_operator_class_too() {
+    let dir = tmpdir("operator-grant");
+    let classes = dir.join("classes");
+    std::fs::create_dir_all(&classes).expect("class dir");
+    let class_path = classes.join("bot.toml");
+    std::fs::write(
+        &class_path,
+        "class = \"bot\"\nlisten = \"0.0.0.0:3128\"\ndns = \"0.0.0.0:53\"\n\
+         max_bytes = 1048576\nmax_connections = 4\naddress_policy = \"lan\"\n\
+         allow = [\n  \"api.anthropic.com:443\",\n  \"api.openai.com:443\",\n]\n",
+    )
+    .expect("write class");
+    let digest = agentjail_core::class::file_digest(&class_path).expect("digest");
+    // The profile lists one of the two destinations the operator class allows.
+    let path = write_profile(
+        &dir,
+        "operator.toml",
+        &operator_profile(&classes, "bot", &digest),
+    );
+
+    // `profile show` prints the grant, and it is the intersection: one of two.
+    let output = run(
+        &["profile", "show", path.to_str().expect("path")],
+        &dir,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(document["egress"]["class"], "bot");
+    assert_eq!(
+        document["egress"]["grant"],
+        serde_json::json!(["api.anthropic.com:443"]),
+        "the grant is the profile's list, not the operator class's"
+    );
+
+    // And `run` hands exactly that to the gateway.
+    let podman = fake_podman(&dir);
+    let gateway_argv = dir.join("gateway-argv.txt");
+    let output = run_with_env(
+        &["run", path.to_str().expect("path")],
+        &dir,
+        Some(&podman),
+        &[
+            (
+                "AGENTJAIL_TEST_GATEWAY_ARGV",
+                gateway_argv.to_str().expect("path"),
+            ),
+            ("EXAMPLE_FORGE_TOKEN", "fake-token-value"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let gateway = recorded_argv(&gateway_argv).join(" ");
+    assert!(
+        gateway.contains("--grant api.anthropic.com:443"),
+        "the operator class is the ceiling, the profile is the grant: {gateway}"
+    );
+    assert!(
+        !gateway.contains("api.openai.com"),
+        "a destination only the class allows must not reach the gateway: {gateway}"
+    );
+    assert!(
+        gateway.contains(&classes.to_string_lossy().into_owned()),
+        "the operator class file is what gets mounted: {gateway}"
+    );
+}
+
+/// `run` derives the gateway tag in Rust and the build script derives it in
+/// shell. If the two rules drift, `run` looks for an image nobody built, and the
+/// failure reads as a missing image rather than a bug.
+#[test]
+fn run_and_the_build_script_agree_on_the_workspace_gateway_tag() {
+    let dir = tmpdir("image-tag");
+    let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+    let podman = fake_podman(&dir);
+    let output = run_with_env(
+        &["run", path.to_str().expect("path")],
+        &dir,
+        Some(&podman),
+        &[("EXAMPLE_FORGE_TOKEN", "fake-token-value")],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // `agentjail: gateway image "localhost/agentjail-gateway:ws-xxxxxxxx" is …`
+    let line = stderr(&output)
+        .lines()
+        .find(|line| line.contains("gateway image"))
+        .unwrap_or_default()
+        .to_string();
+    let tag = line
+        .split('"')
+        .nth(1)
+        .unwrap_or_else(|| panic!("no quoted image tag in {line:?}"));
+    assert!(
+        !tag.ends_with(":1"),
+        "the shared mutable tag must not be the default: {tag}"
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
+    let output = Command::new("sh")
+        .arg(root.join("scripts/gateway-image-tag.sh"))
+        .arg(&root)
+        .output()
+        .expect("run the tag script");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        tag,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "run and scripts/gateway-image-tag.sh disagree about this workspace's tag"
+    );
+}
+
+/// A gateway that refuses to start must be reported as a refusal, not as a
+/// container that is slow to get an address.
+///
+/// The difference decides what the next person does. "No address after 15s" reads
+/// as a slow container, and the retry somebody adds is what removes the
+/// guarantee; the exit code and the gateway's own last lines say what happened
+/// and which flags are missing.
+#[test]
+fn a_gateway_that_refuses_to_start_is_reported_as_a_refusal_not_a_timeout() {
+    let dir = tmpdir("gateway-refused");
+    let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+    let podman = fake_podman(&dir);
+    let gateway_log = dir.join("gateway.log");
+    std::fs::write(
+        &gateway_log,
+        "agentjail-gateway: error: neither --grant nor --class-only: a gateway started without \
+         either would enforce the whole class allowlist\n",
+    )
+    .expect("write gateway log");
+
+    let started = std::time::Instant::now();
+    let output = run_with_env(
+        &["run", path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[
+            ("AGENTJAIL_TEST_GATEWAY_EXITED", "1"),
+            ("AGENTJAIL_TEST_GATEWAY_LOGS", gateway_log.to_str().unwrap()),
+            ("EXAMPLE_FORGE_TOKEN", "fake-token-value"),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1), "the jail must not start");
+    let err = stderr(&output);
+    assert!(
+        err.contains("refused to start"),
+        "the error must say the gateway refused to start: {err}"
+    );
+    assert!(
+        err.contains("exited with code 1"),
+        "the error must name the exit code: {err}"
+    );
+    assert!(
+        err.contains("neither --grant nor --class-only"),
+        "the error must carry the gateway's own reason: {err}"
+    );
+    assert!(
+        err.contains("policy refusal"),
+        "the error must say this is a decision, not a slow container: {err}"
+    );
+    for timeout_phrase in ["has no address", "after 15s", "is running but"] {
+        assert!(
+            !err.contains(timeout_phrase),
+            "a refusal must not be reported as a timeout ({timeout_phrase:?}): {err}"
+        );
+    }
+    // It reported the exit; it did not wait out the address deadline.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the exit should be noticed on the first poll, not after the deadline"
+    );
+}
+
+/// The other half: a gateway that is alive but never gets an address is still a
+/// timeout, and that message says the container is running.
+#[test]
+fn a_gateway_that_is_alive_and_addressless_is_still_a_timeout() {
+    let dir = tmpdir("gateway-addressless");
+    let path = write_profile(&dir, "allowlist.toml", ALLOWLIST);
+    let podman = fake_podman(&dir);
+    let output = run_with_env(
+        &["run", path.to_str().unwrap()],
+        &dir,
+        Some(&podman),
+        &[
+            // Running, but no address ever appears.
+            ("AGENTJAIL_TEST_GATEWAY_NO_ADDRESS", "1"),
+            ("EXAMPLE_FORGE_TOKEN", "fake-token-value"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(
+        err.contains("is running but has no address"),
+        "an alive gateway must be reported as still starting: {err}"
+    );
+    assert!(
+        !err.contains("refused to start"),
+        "a running gateway did not refuse anything: {err}"
     );
 }

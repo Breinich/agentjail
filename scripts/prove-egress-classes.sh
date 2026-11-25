@@ -14,9 +14,12 @@
 #            are touched;
 #   proof 6  the per-jail byte budget cuts a connection and logs the refusal with
 #            the counter that caused it;
-#   proof 7  the per-jail connection cap refuses a second tunnel and logs it.
+#   proof 7  the per-jail connection cap refuses a second tunnel and logs it;
+#   proof 9  a jail reaches only the destinations its profile listed: a class
+#            destination the profile did not list is refused with its own reason
+#            (`not-in-profile`) and does not even resolve.
 #
-# Proofs 1, 2 and 4 run against the **committed** class configs in
+# Proofs 1, 2, 4 and 9 run against the **committed** class configs in
 # gateway/classes. Proofs 3, 6 and 7 need a destination that answers, and CI must
 # not depend on an external host, so they use a proof-only class config that
 # names a target container this script starts on its own network. That config
@@ -86,14 +89,23 @@ podman image exists "$JAIL_IMAGE" || {
   echo "missing proof jail image $JAIL_IMAGE; run: podman pull $JAIL_IMAGE" >&2
   exit 1
 }
-podman image exists localhost/agentjail-gateway:1 || {
-  echo "missing gateway image; run: scripts/build-gateway-image.sh" >&2
+# One tag per workspace, derived the same way `run` derives it: two checkouts on
+# one machine must never share a gateway tag, or a proof silently runs another
+# workspace's binary. Printed on every run, so a log identifies its image.
+gateway_image=$("$root/scripts/gateway-image-tag.sh" "$root")
+say "gateway image: $gateway_image"
+podman image exists "$gateway_image" || {
+  echo "missing gateway image $gateway_image; run: scripts/build-gateway-image.sh" >&2
   exit 1
 }
-# The tag can point at an image older than the flags these proofs exercise: a
-# stale `:1` then fails every proof at "the class config is invalid" or "the
-# gateway has no address", while CI (which builds the image in the same job) stays
-# green. Assert the image understands the config shape used below, once, here.
+# The proofs drive `run`, which honours this. The tag is the workspace's, so no
+# other checkout can retag the gateway out from under a proof.
+export AGENTJAIL_GATEWAY_IMAGE=$gateway_image
+echo "      $(podman image inspect --format '{{.Id}}' "$gateway_image") is $gateway_image"
+
+# The tag can point at an image older than the flags these proofs exercise,
+# while CI (which builds the image in the same job) stays green. Assert the image
+# understands the config shape used below, once, here.
 gateway_probe=$(mktemp "${TMPDIR:-/tmp}/agentjail-gateway-probe.XXXXXX")
 cat > "$gateway_probe" <<'PROBE'
 class = "probe"
@@ -108,11 +120,11 @@ PROBE
 chmod 644 "$gateway_probe"
 if ! podman run --rm --pull=never --read-only --cap-drop=ALL \
     -v "$gateway_probe:/class.toml:ro,Z" \
-    localhost/agentjail-gateway:1 --config /class.toml --check >/dev/null 2>"$gateway_probe.err"; then
-  echo "the gateway image localhost/agentjail-gateway:1 is too old for the class" >&2
+    "$gateway_image" --config /class.toml --check >/dev/null 2>"$gateway_probe.err"; then
+  echo "the gateway image $gateway_image is too old for the class" >&2
   echo "config these proofs use (max_bytes/max_connections/address_policy):" >&2
   sed 's/^/  /' "$gateway_probe.err" >&2
-  echo "rebuild it: scripts/build-gateway-image.sh (and re-tag :1 if you build another tag)" >&2
+  echo "rebuild it: scripts/build-gateway-image.sh (it prints the tag it built)" >&2
   rm -f "$gateway_probe" "$gateway_probe.err"
   exit 1
 fi
@@ -353,6 +365,38 @@ else
   sed 's/^/      /' "$work/widen.err" >&2
 fi
 [ "$model_exit" -eq 0 ] || fail "proof 1: the unmodified model profile failed to run"
+
+# --------------------- proof 9: the profile is the grant, not a preflight promise
+#
+# The assessment's reproduction, inverted. The profile is the stock
+# one-destination profile (profiles/allowlist.toml) with the proof image: the
+# committed `model` class allows api.openai.com, the profile lists only
+# api.anthropic.com, so the jail must be refused api.openai.com with a reason
+# that names the profile, and must not even resolve the name. Nothing here needs
+# the internet: the refusal happens before any resolution.
+say "proof 9: a jail reaches only what its profile listed"
+profile_for "$work/proof-grant.toml" proof-grant model api.anthropic.com 443
+run_jail grant "$work/proof-grant.toml" "$PROXY_LIB
+echo \"openai-connect=\$(connect 3 api.openai.com:443)\"
+echo \"openai-dns=\$(getent hosts api.openai.com || echo nxdomain)\"
+echo \"listed-dns=\$(getent ahostsv4 api.anthropic.com || echo nxdomain)\"
+echo done" "dest=api.openai.com:443 decision=deny"
+
+expect "$work/grant.out" 'openai-connect=HTTP/1.1 403 Forbidden' \
+  'proof 9: a class destination the profile did not list is refused'
+expect "$work/grant.audit" 'dest=api.openai.com:443 decision=deny reason=not-in-profile' \
+  'proof 9: the refusal names the profile, not the class'
+expect "$work/grant.out" 'openai-dns=nxdomain' \
+  'proof 9: the resolver NXDOMAINs a name the profile did not ask for'
+expect "$work/grant.dns" 'qname=api.openai.com qtype=1 decision=nxdomain reason=not-in-profile' \
+  'proof 9: the DNS refusal carries the same reason'
+expect "$work/grant.out" 'listed-dns=127.0.0.1' \
+  'proof 9: the destination the profile listed still resolves (to loopback)'
+if grep -q 'dest=api.anthropic.com:443 decision=deny' "$work/grant.audit"; then
+  fail 'proof 9: the destination the profile listed was denied'
+else
+  ok 'proof 9: nothing denies the destination the profile listed'
+fi
 
 # ------------------------------------------- proofs 2, 3, 4: one reachable target
 

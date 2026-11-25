@@ -33,6 +33,12 @@ pub struct AllowEntry {
 }
 
 impl AllowEntry {
+    /// Parse one `host` or `host:port` entry, in the same vocabulary as a class
+    /// config's `allow` list (that is what a run's grant is written in).
+    pub fn parse(entry: &str) -> Result<AllowEntry, String> {
+        parse_entry(entry)
+    }
+
     /// Whether this entry covers `host`, ignoring the port.
     pub fn matches_host(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
@@ -237,7 +243,14 @@ pub struct ClassConfig {
     pub dns_policy: DnsPolicy,
     pub audit_log: String,
     pub dns_log: String,
+    /// The effective grant: what this gateway lets through. The class's whole
+    /// allowlist for a class-level run, or the intersection of that list with
+    /// one profile's `network.egress` when it runs one jail.
     pub allow: Vec<AllowEntry>,
+    /// The class's committed allowlist, kept even when `allow` is narrowed to
+    /// one jail's grant. It is only used to name the side that refused a
+    /// destination: `not-in-class` versus `not-in-profile`.
+    pub class_allow: Vec<AllowEntry>,
     pub max_bytes: u64,
     pub max_connections: usize,
     pub address_policy: AddressPolicy,
@@ -331,6 +344,7 @@ impl ClassConfig {
                 dns_policy: raw.dns_policy,
                 audit_log: raw.audit_log,
                 dns_log: raw.dns_log,
+                class_allow: allow.clone(),
                 allow,
                 max_bytes,
                 max_connections,
@@ -345,21 +359,48 @@ impl ClassConfig {
     /// the allowlist is names, and an address would let the agent pick a host by
     /// number instead of by name.
     pub fn allows(&self, host: &str, port: u16) -> bool {
-        if is_ip_literal(host) {
-            return false;
-        }
-        self.allow
-            .iter()
-            .any(|entry| entry.port == port && entry.matches_host(host))
+        grant_of(&self.allow, host, port)
     }
 
     /// The DNS half's decision: the name is reachable by some port.
     pub fn permits_name(&self, host: &str) -> bool {
-        if is_ip_literal(host) {
-            return false;
-        }
-        self.allow.iter().any(|entry| entry.matches_host(host))
+        grant_of_name(&self.allow, host)
     }
+
+    /// Whether the **class** permits `host:port`, ignoring any narrowing to one
+    /// jail's grant. This is what separates `not-in-profile` (the class would
+    /// have allowed it, this profile did not ask for it) from `not-in-class`.
+    pub fn class_allows(&self, host: &str, port: u16) -> bool {
+        grant_of(&self.class_allow, host, port)
+    }
+
+    /// The DNS half's version of [`ClassConfig::class_allows`].
+    pub fn class_permits_name(&self, host: &str) -> bool {
+        grant_of_name(&self.class_allow, host)
+    }
+
+    /// Narrow this class to one jail's grant. `class_allow` is untouched, so a
+    /// refusal still says whether the class or the profile was the obstacle.
+    pub fn with_grant(mut self, grant: Vec<AllowEntry>) -> ClassConfig {
+        self.allow = grant;
+        self
+    }
+}
+
+fn grant_of(allow: &[AllowEntry], host: &str, port: u16) -> bool {
+    if is_ip_literal(host) {
+        return false;
+    }
+    allow
+        .iter()
+        .any(|entry| entry.port == port && entry.matches_host(host))
+}
+
+fn grant_of_name(allow: &[AllowEntry], host: &str) -> bool {
+    if is_ip_literal(host) {
+        return false;
+    }
+    allow.iter().any(|entry| entry.matches_host(host))
 }
 
 fn parse_entry(entry: &str) -> Result<AllowEntry, String> {
