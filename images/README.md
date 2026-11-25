@@ -9,8 +9,14 @@ Two images exist, and neither is published:
 
   ```sh
   cargo build --locked --release --target x86_64-unknown-linux-musl -p agentjail-gateway
-  scripts/build-gateway-image.sh            # localhost/agentjail-gateway:1
+  scripts/build-gateway-image.sh          # localhost/agentjail-gateway:ws-<workspace>
   ```
+
+The tag is per workspace, not one mutable `:1` for the whole machine: two
+checkouts that build the gateway from different code would otherwise overwrite
+each other, and a run would execute the other workspace's binary. `run` derives
+the same tag; `AGENTJAIL_GATEWAY_IMAGE` names one explicitly, and a tag passed to
+`scripts/build-gateway-image.sh` overrides the default (including `:1`).
 
 `run` needs the gateway image for any `network.mode = "allowlist"` profile and
 refuses to start without it. It runs as uid 65534 with

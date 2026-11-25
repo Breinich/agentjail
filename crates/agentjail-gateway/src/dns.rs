@@ -89,6 +89,12 @@ fn decide(config: &ClassConfig, query: &Query) -> (u16, bool, &'static str, &'st
     if config.permits_name(&query.name) {
         return (RCODE_NOERROR, true, "answer", "in-class");
     }
+    // The name exists for the class but this jail was not granted it: NXDOMAIN
+    // for the same reason a CONNECT would be refused, so a name the profile did
+    // not ask for does not even resolve.
+    if config.class_permits_name(&query.name) {
+        return (RCODE_NXDOMAIN, false, "nxdomain", "not-in-profile");
+    }
     (RCODE_NXDOMAIN, false, "nxdomain", "not-in-class")
 }
 

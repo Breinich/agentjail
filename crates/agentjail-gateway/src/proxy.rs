@@ -192,7 +192,15 @@ fn handle(mut stream: TcpStream, config: &ClassConfig, logs: &Logs, jail: &Jail,
         return;
     }
     if !config.allows(&request.host, request.port) {
-        deny(logs, &peer, &dest, "not-in-class");
+        // Two different facts, two different reasons: the class would have
+        // allowed it and this profile did not ask for it, or the class itself
+        // does not allow it. One reason for both makes an incident review guess.
+        let reason = if config.class_allows(&request.host, request.port) {
+            "not-in-profile"
+        } else {
+            "not-in-class"
+        };
+        deny(logs, &peer, &dest, reason);
         let _ = respond(&mut stream, 403, "Forbidden");
         return;
     }

@@ -31,7 +31,7 @@ mod proxy;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use agentjail_core::class::ClassConfig;
+use agentjail_core::class::{AllowEntry, ClassConfig};
 use clap::Parser;
 
 const EXIT_OK: u8 = 0;
@@ -51,6 +51,18 @@ struct Cli {
     /// Jail id written into every audit and DNS line. `run` passes its run id.
     #[arg(long, value_name = "ID", default_value = "-")]
     jail_id: String,
+
+    /// Effective grant for this jail: comma-separated `host:port`, the
+    /// intersection of the class allowlist and the profile's `network.egress`.
+    /// Required for a jail run. An empty value is a grant of nothing (a jail
+    /// with no route out) and is deliberately distinct from an absent flag.
+    #[arg(long, value_name = "HOST:PORT,...")]
+    grant: Option<String>,
+
+    /// Class-level gateway: the class allowlist itself is the grant. For reading
+    /// a class, not for a jail; `agentjail run` never passes it.
+    #[arg(long)]
+    class_only: bool,
 
     /// Validate the class config and print it; start no listener.
     #[arg(long)]
@@ -82,6 +94,7 @@ fn run(cli: &Cli) -> Result<u8, String> {
                 .join("\n")
         )
     })?;
+    let config = select_grant(config, cli.grant.as_deref(), cli.class_only, cli.check)?;
 
     if cli.check {
         println!("class: {}", config.class);
@@ -107,6 +120,13 @@ fn run(cli: &Cli) -> Result<u8, String> {
         for entry in &config.allow {
             println!("  {}:{}", entry.host, entry.port);
         }
+        if config.allow != config.class_allow {
+            println!(
+                "effective grant: {} of {} class destination(s)",
+                config.allow.len(),
+                config.class_allow.len()
+            );
+        }
         return Ok(EXIT_OK);
     }
 
@@ -121,6 +141,19 @@ fn run(cli: &Cli) -> Result<u8, String> {
         config.max_connections,
         config.address_policy.as_str()
     );
+    if config.allow != config.class_allow {
+        // Printed, not implied: the operator reads what this jail gets.
+        eprintln!(
+            "agentjail-gateway: grant is {} of {} class destination(s){}",
+            config.allow.len(),
+            config.class_allow.len(),
+            if config.allow.is_empty() {
+                ": this jail has no route out"
+            } else {
+                ""
+            }
+        );
+    }
 
     let dns_logs = logs.clone();
     let dns_config = config.clone();
@@ -138,4 +171,66 @@ fn describe_stream(path: &str, default: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// Decide what this gateway enforces. Both modes are explicit and neither is a
+/// default:
+///
+/// * `--grant host:port,...` — a jail run. The empty string is a valid grant of
+///   nothing, and is deliberately distinct from an absent flag;
+/// * `--class-only` — the class allowlist itself, for a class-level gateway.
+///
+/// Absent both is a startup error rather than "enforce the whole class": a `run`
+/// regression that stopped passing `--grant` would otherwise hand the jail every
+/// destination its class lists, and look completely normal while doing it.
+/// `--check` starts no listener and so enforces nothing; it needs neither.
+fn select_grant(
+    config: ClassConfig,
+    grant: Option<&str>,
+    class_only: bool,
+    check: bool,
+) -> Result<ClassConfig, String> {
+    match (grant, class_only) {
+        (Some(_), true) => Err(
+            "--grant and --class-only are mutually exclusive: --grant is one jail's intersection \
+             with the class allowlist, --class-only is the whole class allowlist"
+                .to_string(),
+        ),
+        (Some(grant), false) => apply_grant(config, grant),
+        (None, true) => Ok(config),
+        (None, false) if check => Ok(config),
+        (None, false) => Err(
+            "neither --grant nor --class-only: a gateway started without either would enforce \
+             the whole class allowlist, so a jail whose profile listed one destination would \
+             reach every destination its class lists. Pass --grant <host:port,...> (an empty \
+             value is a jail with no route out), or --class-only for a class-level gateway."
+                .to_string(),
+        ),
+    }
+}
+
+/// Narrow the class to the grant `run` handed over.
+///
+/// A grant entry the class does not allow is refused instead of dropped: the
+/// gateway would otherwise start with a policy nobody asked for, and the
+/// difference between "the profile asked for less" and "the caller and the
+/// class config disagree" would be invisible.
+fn apply_grant(config: ClassConfig, grant: &str) -> Result<ClassConfig, String> {
+    let mut entries = Vec::new();
+    for entry in grant.split(',').map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        let parsed =
+            AllowEntry::parse(entry).map_err(|error| format!("--grant: {entry:?} {error}"))?;
+        if !config.class_allows(&parsed.host, parsed.port) {
+            return Err(format!(
+                "--grant: {entry:?} is not in the {:?} class allowlist; the grant is the \
+                 intersection of the class and the profile, so it cannot add a destination",
+                config.class
+            ));
+        }
+        entries.push(parsed);
+    }
+    Ok(config.with_grant(entries))
 }
