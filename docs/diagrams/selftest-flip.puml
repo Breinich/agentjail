@@ -1,0 +1,39 @@
+@startuml selftest-flip
+' UML activity diagram: the same probe, once without a jail and once with one.
+' Source of record for docs/diagrams/selftest-flip.svg. Do not edit the SVG:
+' render it with the pinned PlantUML image (docs/adopting.md).
+title selftest: the same probe, once without a jail and once with one
+
+|baseline executor|
+start
+:run agentjail __probe as a plain host process\n(no podman, no jail);
+if (the hazard happens on the host?) then (yes)
+  :EXPECTED: the negative is real;
+else (no)
+  :FAIL: the assertion is vacuous;
+endif
+stop
+
+|jailed executor|
+start
+:stage the same binary read-only into the jail,\na generated class (address_policy=lan), a fixture target;
+:run agentjail __probe inside the jail;
+if (the negative is denied?) then (yes)
+  :PASS;
+else (no)
+  :FAIL: names the case that escaped;
+endif
+:positive control: one granted destination answers\nthrough the gateway and its audit line is read back;
+if (answered and audited?) then (yes)
+  :PASS;
+else (no)
+  :FAIL;
+endif
+stop
+
+legend right
+  A case that cannot run in baseline prints SKIPPED-BASELINE with the reason,
+  never silently omitted. Baseline exit 0 plus jailed exit 0 means every hazard
+  is real and every hazard is denied.
+endlegend
+@enduml
