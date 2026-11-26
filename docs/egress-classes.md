@@ -59,7 +59,9 @@ own ACL file that must be kept in step with ours, or would allow more than a
 **DNS.** A query for a name the class may reach is answered `A 127.0.0.1`.
 Everything else is NXDOMAIN. Every query is logged on the DNS stream, answered or
 not, with the query name, the qtype, and the reason (`in-class`, `not-in-class`,
-`policy-off`, `ip-literal`, `qtype-not-answerable`).
+`not-in-profile`, `policy-off`, `ip-literal`, `qtype-not-answerable`,
+`not-internet-class`, and `malformed` — a packet that could not be parsed at
+all, logged with `qname=-`).
 
 Loopback is the answer on purpose. If the agent resolves a name and then dials the
 address it got, it dials **its own loopback**, where nothing is listening. The
