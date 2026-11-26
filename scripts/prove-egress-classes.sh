@@ -32,6 +32,13 @@
 #   scripts/build-gateway-image.sh
 #   podman pull "$JAIL_IMAGE"
 #   scripts/prove-egress-classes.sh
+#
+# A proof may wait for evidence under a deadline; it may not retry an assertion.
+# A retry turns a race into a slower race. What removes a timing dependence is
+# the order the streams are read in: run_jail copies the per-run streams again
+# after the run has exited, and that post-exit copy is what the assertions read.
+# Two proofs wait on the audit stream and then assert on the DNS stream (proof 1
+# and proof 9, the `grant` run); that is exactly why they were timing-dependent.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -264,8 +271,8 @@ connect_ok() { # fd target
 }
 '
 
-# One jail run, with the gateway's log streams captured before the guard removes
-# the gateway container.
+# One jail run, with the gateway's log streams copied out when the run ends: the
+# per-run files outlive the gateway container the guard removes.
 run_jail() { # label profile script wait-for-log
   label=$1
   profile=$2
@@ -317,15 +324,35 @@ run_jail() { # label profile script wait-for-log
       kill -0 "$agentjail_pid" 2>/dev/null || break
       sleep 0.5
     done
+    # A deadline that falls through to the assertions reports success on a file
+    # that is merely not written yet, which is worse than the race it hides: name
+    # the needle that never came and show what the streams did hold. A run that
+    # already exited is not a missed deadline; the post-wait read below decides.
+    if ! grep -q -- "$wait_for" "$work/$label.audit" 2>/dev/null \
+        && kill -0 "$agentjail_pid" 2>/dev/null; then
+      fail "$label: the deadline expired before the audit stream carried '$wait_for'"
+      for stream in audit dns; do
+        if [ -f "$work/$label.$stream" ]; then
+          printf '      %s stream:\n' "$stream" >&2
+          sed 's/^/      /' "$work/$label.$stream" >&2
+        else
+          printf '      %s stream: (never written)\n' "$stream" >&2
+        fi
+      done
+    fi
   fi
   snapshot
   wait "$agentjail_pid" || fail "$label: agentjail exited non-zero ($(sed -n 1p "$work/$label.err"))"
+  # The authoritative capture. The run has ended, so its per-run streams are
+  # complete, and they outlive the gateway container, so this read does not
+  # depend on when the guard removes it — nor on which line was written first.
+  # The assertions read this copy.
+  snapshot
   printf '      jail output: %s\n' "$(tr '\n' '|' < "$work/$label.out")"
 }
 
 # ------------------------------------------------------- proof 1: the class wins
 
-committed_classes=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gateway/classes
 profile_for "$work/proof-model.toml" proof-model model api.anthropic.com 443 ""
 profile_for "$work/proof-external.toml" proof-external external github.com 443 ""
 
