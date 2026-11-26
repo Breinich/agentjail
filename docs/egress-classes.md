@@ -59,7 +59,9 @@ own ACL file that must be kept in step with ours, or would allow more than a
 **DNS.** A query for a name the class may reach is answered `A 127.0.0.1`.
 Everything else is NXDOMAIN. Every query is logged on the DNS stream, answered or
 not, with the query name, the qtype, and the reason (`in-class`, `not-in-class`,
-`policy-off`, `ip-literal`, `qtype-not-answerable`).
+`not-in-profile`, `policy-off`, `ip-literal`, `qtype-not-answerable`,
+`not-internet-class`, and `malformed` — a packet that could not be parsed at
+all, logged with `qname=-`).
 
 Loopback is the answer on purpose. If the agent resolves a name and then dials the
 address it got, it dials **its own loopback**, where nothing is listening. The
@@ -203,12 +205,12 @@ ts=1795477011167 class=model jail=proof-target-2463051 peer=10.89.6.2:37898 \
 - `decision` is `allow`, `allow-close`, or `deny`; `bytes` is `up/down`, and
   `0/0` on a denial.
 - `reason` is `-` on an allow, and on a denial it is one of `not-in-class`,
-  `ip-literal`, `blocked-<range>`, `not-connect`, `malformed`, `bad-port`,
-  `no-port`, `no-host`, `client-closed`, `read-timeout`, `head-too-large`,
-  `resolve-failed`, `connect-failed`, `byte-budget`, `connection-cap`,
-  `internal-error`. **`internal-error` is a panic in the proxy itself**: the
-  denial is written even when the code errored, because a crashed thread with no
-  line looks like a connection that never happened.
+  `not-in-profile`, `ip-literal`, `blocked-<range>`, `not-connect`, `malformed`,
+  `bad-port`, `no-port`, `no-host`, `client-closed`, `read-timeout`,
+  `head-too-large`, `resolve-failed`, `connect-failed`, `byte-budget`,
+  `connection-cap`, `internal-error`. **`internal-error` is a panic in the proxy
+  itself**: the denial is written even when the code errored, because a crashed
+  thread with no line looks like a connection that never happened.
 - Extra fields appear only when they are the reason: `resolved=`/`pinned=` on an
   allow, `address=` on a blocked answer, `budget=` on a byte-budget denial,
   `connections=`/`limit=` on a connection cap, `bytes=` restated on a cut.
