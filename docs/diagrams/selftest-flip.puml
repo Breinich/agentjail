@@ -1,5 +1,7 @@
 @startuml selftest-flip
-' UML activity diagram: the same probe, once without a jail and once with one.
+' UML activity diagram only: actions, decisions, partitions and notes, and no
+' other diagram or UML element type. The same probe, once without a jail and
+' once with one.
 ' Source of record for docs/diagrams/selftest-flip.svg. Do not edit the SVG:
 ' render it with the pinned PlantUML image (docs/adopting.md).
 title selftest: the same probe, once without a jail and once with one
