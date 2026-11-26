@@ -1,7 +1,8 @@
 @startuml run-lifecycle
-' UML sequence diagram only: participants, lifelines, messages, returns and
-' notes, and no other diagram or UML element type. The order is the order
-' `run` takes it in: nothing is started before the network it joins exists.
+' UML sequence diagram only: participants, lifelines, sync and async messages,
+' replies and notes, and no other diagram or UML element type. The order is the
+' order `run` takes it in: nothing is started before the network it joins
+' exists.
 ' Source of record for docs/diagrams/run-lifecycle.svg. Do not edit the SVG:
 ' render it with the pinned PlantUML image (docs/adopting.md).
 ' &#45;&#45; is a literal "--": PlantUML reads --text-- as strikeout.
@@ -15,11 +16,15 @@ participant "jail container\nuid 10000, --rm" as J
 
 H -> C : agentjail run <profile> &#45;&#45; <agent command…>
 C -> C : load, validate, run the blockers,\nresolve the class, compute the grant
+C --> C : the class, or the refusal that stops the run
 C -> P : image inspect <gateway tag>
 P --> C : the image ID (the container starts by ID, never by tag)
 C -> P : container and network list/remove for resources\nwhose owning pid is dead (never by profile prefix alone)
+P --> C : what was removed, or an error that is not read
 C -> P : network create &#45;&#45;internal &#45;&#45;disable-dns &#45;&#45;ipv6=false\n<profile>-<pid>-<class>
+P --> C : the network, or the error that stops the run
 C -> P : network create &#45;&#45;ipv6=false <profile>-<pid>-egress
+P --> C : the network, or the error that stops the run
 C -> P : network inspect <profile>-<pid>-<class>
 P --> C : internal, one subnet, IPv4 only
 note over C
@@ -28,7 +33,8 @@ note over C
   warning.
 end note
 C -> P : run -d gateway on both networks\n&#45;&#45;grant <profile egress ∩ class allowlist>\n&#45;&#45;audit-dir <state>/audit/<class>
-P -> G : start on the class and egress networks
+P --> C : started, or the error that stops the run
+P ->> G : run detached on the class and egress networks,\nwith the class config and the grant
 note right of G
   An empty grant is announced ("this jail has no route out"), not refused:
   the gateway is started with --grant "" and permits nothing. The audit
@@ -38,13 +44,22 @@ end note
 C -> P : read the gateway's address on the class network
 P --> C : the address, or the exit code it exited with (reported as its\nrefusal), or no address after 15s: the run is refused
 C -> P : run &#45;&#45;rm &#45;&#45;interactive jail on the class network\n&#45;&#45;dns <gateway> &#45;&#45;dns-search . &#45;&#45;env HTTPS_PROXY/ALL_PROXY
-P -> J : start with fd 0/1/2 as pipes, no TTY
+P -> J : start the jail (PID 1 is tini) and wait
 J -> G : CONNECT host:port, the jail has no other peer
-H -> C : SIGINT, SIGTERM, SIGQUIT
-C -> P : forward each signal to podman, then wait
-P -> J : the signal reaches container PID 1,\ntini, which forwards it to the agent
+G --> J : 200 Connection established,\nthen the tunnelled bytes
+H ->> C : SIGINT, SIGTERM, SIGQUIT
+C ->> P : forward each signal to podman, then wait
+P ->> J : the signal reaches container PID 1,\ntini, which forwards it to the agent
 note over J : grandchildren of the agent are not signalled:\ntini forwards to its direct child only
-P --> C : exit code, or 128 + signal
+J --> P : exit code, or 128 + signal
+P --> C : the same code
 C -> P : remove the gateway, then the egress network,\nthen the class network, on every exit path
+P --> C : removed, or the warning that is printed
 C --> H : exit with the agent's own code
+note over H, J
+  Synchronous calls (->) carry their reply (-->); the bare ->> arrows are
+  asynchronous by design: a signal is a notification, and a detached gateway is
+  not waited for. The tunnelled bytes after the CONNECT reply are a stream, not
+  a message, and are not drawn.
+end note
 @enduml

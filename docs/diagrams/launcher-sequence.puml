@@ -1,7 +1,7 @@
 @startuml launcher-sequence
-' UML sequence diagram only: participants, lifelines, messages and notes, and
-' no other diagram or UML element type. The subject is the transport contract
-' `run` actually gets: the base image's PID 1 chain, not the launcher.
+' UML sequence diagram only: participants, lifelines, sync and async messages,
+' replies and notes, and no other diagram or UML element type. The subject is
+' the transport contract `run` actually gets: the base image's PID 1 chain.
 ' Source of record for docs/diagrams/launcher-sequence.svg. Do not edit the SVG:
 ' render it with the pinned PlantUML image (docs/adopting.md).
 ' &#45;&#45; is a literal "--": PlantUML reads --text-- as strikeout.
@@ -13,22 +13,25 @@ participant "podman\n(client, then conmon)" as P
 participant "container PID 1\ntini" as T
 participant "agent\n(child of tini,\nexec'd by agentjail-entrypoint)" as A
 
-H -> C : stdin (JSON-RPC frames)
-C -> P : podman run &#45;&#45;rm &#45;&#45;interactive,\nfd 0 is a pipe, not a TTY
-P -> T : the same bytes on the container's fd 0
-T -> A : inherited fd 0 (the entrypoint exec'd the agent)
-A --> T : stdout
-T --> P : stdout, never mixed with stderr
-P --> C : stdout
-C --> H : stdout
-A --> T : stderr
-T --> P : stderr, a separate stream
-P --> C : stderr
-C --> H : stderr
-H -> C : SIGINT, SIGTERM, SIGQUIT
-C -> P : forward each one unchanged\n(supervising; exec'd when nothing needs cleanup)
-P -> T : deliver to the container's PID 1
-T -> A : forward to its only child
+H -> C : start agentjail run with fd 0/1/2 attached,\nand wait for it to exit
+H ->> C : stdin (JSON-RPC frames)
+C -> P : podman run &#45;&#45;rm &#45;&#45;interactive,\nfd 0/1/2 are pipes, not a TTY
+P -> T : start the container's PID 1 and wait
+T -> A : spawn the agent (the entrypoint exec'd it) and wait
+P ->> T : the same bytes on the container's fd 0
+T ->> A : inherited fd 0
+A ->> T : stdout
+T ->> P : stdout, never mixed with stderr
+P ->> C : stdout
+C ->> H : stdout
+A ->> T : stderr
+T ->> P : stderr, a separate stream
+P ->> C : stderr
+C ->> H : stderr
+H ->> C : SIGINT, SIGTERM, SIGQUIT
+C ->> P : forward each one unchanged\n(supervising; exec'd when nothing needs cleanup)
+P ->> T : deliver to the container's PID 1
+T ->> A : forward to its only child
 A --> T : exit code 42
 T --> P : exit code 42
 P --> C : exit code 42
@@ -42,5 +45,8 @@ note over H, A
   root, exec the agent in its own process group, forward
   SIGINT/SIGTERM/SIGQUIT/SIGWINCH to that group, and exit with the agent's code
   (128 + N for signal N).
+  Synchronous calls (->) carry their reply (-->); the bare ->> arrows are
+  asynchronous by design: the three fd streams are bytes written without
+  waiting, and a signal is a notification, not a call.
 end note
 @enduml
