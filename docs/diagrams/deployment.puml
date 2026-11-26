@@ -16,7 +16,7 @@ node "host" as host {
   }
 
   artifact "gateway/classes/<class>.toml\nmodel | external | internal" as classcfg
-  artifact "state dir\n~/.local/state/agentjail/audit/<class>" <<storage>> as state
+  artifact "state dir\n~/.local/state/agentjail/audit/<class>" as state
 }
 
 cloud "destination on the class allowlist\nhost:port, exact name or *.suffix" as destination
@@ -25,6 +25,11 @@ classcfg --> gateway : bind-mounted read-only at /etc/agentjail/class.toml
 jail -- gateway : «network» agentjail-<profile>-<pid>-<class>\ninternal=true, IPv4 only, no upstream route\nits only two peers on that path
 gateway -- destination : «network» agentjail-<profile>-<pid>-egress\nCONNECT after resolve once
 gateway --> state : audit and dns streams,\nbind-mounted read-write
+
+note as netnote
+  PlantUML has no element for a container network, so the communication path
+  carries a «network» stereotype to name the one the run creates.
+end note
 
 legend bottom
   The class is decided by network membership, not by a rule inside a shared
