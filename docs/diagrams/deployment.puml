@@ -1,42 +1,42 @@
 @startuml deployment
-' UML deployment diagram: the topology of one run.
+' UML deployment diagram only: nodes, «executionEnvironment», «artifact» and
+' communication paths, and no other diagram or UML element type. A network is
+' a path between deployed elements, never an element of its own.
 ' Source of record for docs/diagrams/deployment.svg. Do not edit the SVG:
 ' render it with the pinned PlantUML image (docs/adopting.md).
 ' &#45;&#45; is a literal "--": PlantUML reads --text-- as strikeout.
-title agentjail: host, per-run network, jail, and a dual-homed class gateway
+title agentjail: host, the per-run networks, the jail and a dual-homed class gateway
 
-node "host\nrootless podman" as host {
-  node "jail container\nagentjail-<profile>-<pid>\nrootfs read-only, uid 10000 (keep-id)\nbounded tmpfs: /tmp 64m, /run 16m, home 0700" as jail {
-    artifact "agentjail-launcher\nstatic musl, PID 1" as launcher
-    component "agent process\nany agent" as agent
+node "host" as host {
+  node "rootless podman" <<executionEnvironment>> as runtime {
+    node "jail container\nagentjail-<profile>-<pid>\nrootfs read-only, uid 10000 (keep-id)\nbounded tmpfs: /tmp 64m, /run 16m, home 0700" as jail {
+      artifact "PID 1 chain, from the base image\ntini → agentjail-entrypoint → agent\n(the launcher is not in run's path)" as init
+    }
+    node "gateway container\nagentjail-<profile>-<pid>-gateway\ndual-homed: DNS :53, CONNECT :3128\nimage pinned by ID, read-only rootfs\nall caps dropped but NET_BIND_SERVICE" as gateway
   }
 
-  node "per-run internal network\nagentjail-<profile>-<pid>-<class>\ninternal=true, IPv4 only, no upstream route" as internal
-
-  node "gateway container\nagentjail-<profile>-<pid>-gateway\ndual-homed: DNS :53, CONNECT :3128\nimage pinned by ID, read-only rootfs\nall caps dropped but NET_BIND_SERVICE" as gateway
-
-  node "per-run egress network\nagentjail-<profile>-<pid>-egress" as egress
-
-  database "state dir\n~/.local/state/agentjail/audit/<class>" as state
+  artifact "gateway/classes/<class>.toml\nmodel | external | internal" as classcfg
+  artifact "state dir\n~/.local/state/agentjail/audit/<class>" as state
 }
 
-artifact "one binary, three classes\ngateway/classes/<class>.toml\nmodel | external | internal" as classcfg
 cloud "destination on the class allowlist\nhost:port, exact name or *.suffix" as destination
 
-launcher --> agent : exec
-jail -down-> internal : the gateway is its only peer
-gateway -up-> internal : internal leg
-gateway -down-> egress : egress leg
-gateway -down-> state : audit and dns streams
-gateway -right-> destination : CONNECT after resolve once
-classcfg -down-> gateway : the class this run names
-jail ..> egress : never a member
+classcfg --> gateway : bind-mounted read-only at /etc/agentjail/class.toml
+jail -- gateway : «network» agentjail-<profile>-<pid>-<class>\ninternal=true, IPv4 only, no upstream route\nits only two peers on that path
+gateway -- destination : «network» agentjail-<profile>-<pid>-egress\nCONNECT after resolve once
+gateway --> state : audit and dns streams,\nbind-mounted read-write
+
+note as netnote
+  PlantUML has no element for a container network, so the communication path
+  carries a «network» stereotype to name the one the run creates.
+end note
 
 legend bottom
   The class is decided by network membership, not by a rule inside a shared
   proxy: the jail joins the per-run network named after its class and the only
-  other peer on it is that class's gateway. model, external and internal are
-  three instances of the same binary with three different configs.
+  other peer on it is that class's gateway, which is also the only member of the
+  egress network. model, external and internal are three instances of the same
+  binary with three different configs.
   Jail: no host file, no runtime socket, no unlisted environment.
 endlegend
 @enduml

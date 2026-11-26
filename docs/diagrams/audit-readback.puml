@@ -1,5 +1,7 @@
 @startuml audit-readback
-' UML sequence diagram: the audit streams outlive the gateway container.
+' UML sequence diagram only: participants, lifelines, sync and async messages,
+' replies, delays and notes, and no other diagram or UML element type. The
+' subject is that the audit streams outlive the container that wrote them.
 ' Source of record for docs/diagrams/audit-readback.svg. Do not edit the SVG:
 ' render it with the pinned PlantUML image (docs/adopting.md).
 ' &#45;&#45; is a literal "--": PlantUML reads --text-- as strikeout.
@@ -10,15 +12,24 @@ participant "state dir\n~/.local/state/agentjail/audit/<class>" as S
 participant "next run of the class\nagentjail run" as R
 participant "operator\nagentjail audit &#45;&#45;class <class>" as A
 
-G -> S : <jail-id>.audit.log\none line per decision: allow (resolved, pinned),\nallow-close (bytes), deny (reason)
-G -> S : <jail-id>.dns.log\none line per query: answer, nxdomain, refused, drop
+G ->> S : <jail-id>.audit.log\none line per decision: allow (resolved, pinned),\nallow-close (bytes), deny (reason)
+G ->> S : <jail-id>.dns.log\none line per query: answer, nxdomain, refused, drop
 note over G : written at decision time, not when the connection ends:\na tunnel that is established and then reset is still a line
-... gateway container removed (&#45;&#45;rm), jail gone ...
-note over S : the record is this directory, not the container log
+... run over: the jail, started with &#45;&#45;rm, is gone; the gateway, which has no &#45;&#45;rm, was removed by the run's cleanup guard ...
+note over S
+  The record is this directory, not the container log. The gateway carries no
+  &#45;&#45;rm on purpose: a gateway that refuses to start keeps its exit code and
+  its output, which is how the refusal is reported. A gateway left behind by a
+  killed run is pruned by dead pid on a later run.
+end note
 R -> S : prune at start: keep the newest 20 runs per class,\ndelete both files of the oldest
+S --> R : the files it deleted, if any
 A -> S : read both streams, newest run first,\nmerge in time order
 S --> A : key=value lines, filtered by\nclass, jail, decision, stream
-note over A
+note over S, A
+  Synchronous calls (->) carry their reply (-->): the prune returns what it
+  deleted and the read returns the lines. The bare ->> arrows are the gateway
+  appending a line, which it does not wait on.
   With no per-run files, the streams configured in the class config are read;
   auditing stdin reads a captured `podman logs` stream instead.
 end note

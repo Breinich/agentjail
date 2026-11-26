@@ -1,5 +1,7 @@
 @startuml egress-decision
-' UML activity diagram: the grant at run start, then one decision per connection.
+' UML activity diagram only: actions, decisions, merges and notes, and no
+' other diagram or UML element type. The grant at run start, then one decision
+' per connection.
 ' Source of record for docs/diagrams/egress-decision.svg. Do not edit the SVG:
 ' render it with the pinned PlantUML image (docs/adopting.md).
 ' &#45;&#45; is a literal "--": PlantUML reads --text-- as strikeout.
@@ -15,7 +17,8 @@ endif
 if (grant empty?) then (yes)
   :announce "egress grant is empty: this jail has no route out"\n(started, not refused);
 endif
-:start the gateway with &#45;&#45;grant <host:port,…>;
+:start the gateway with &#45;&#45;grant <host:port,…>,
+which the code renders as &#45;&#45;grant "" when the grant is empty;
 :CONNECT host:port from the jail;
 if (host is an IP literal?) then (yes)
   :deny reason=ip-literal;
