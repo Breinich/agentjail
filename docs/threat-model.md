@@ -362,6 +362,36 @@ the home parent), bounded by the sizes in `resources.tmpfs`. An agent cannot
 write more than the sum of those mounts, but that sum — not a single "disk"
 number — is the real budget.
 
+That budget covers the tmpfs scratch and nothing else: a `mounts[]` entry with
+`read_only = false` is a host bind mount and is unbounded — see
+[The writable state mount has no size limit](#the-writable-state-mount-has-no-size-limit).
+
+### The writable state mount has no size limit
+
+A `mounts[]` entry with `read_only = false` — in practice the agent's own state
+directory, the one it keeps sessions, memory and authentication in — is a plain
+host bind mount (`--mount type=bind,…,rw` in `crates/agentjail-core/src/run.rs`).
+The profile's `cpus`, `memory`, `pids`, `nofile` and `resources.tmpfs` limits do
+not bound it. A prompt-injected or runaway agent can fill the host filesystem
+through that one path, and what protects the operator today is free space and
+monitoring on the host, not the jail. This is the residual risk of granting a
+writable mount at all, and it is why `read_only = true` is the default.
+
+The audit stream has the same failure mode on a smaller footprint, and it is
+ours rather than the agent's. Retention is by run count — `run` keeps the newest
+20 runs per class (`AUDIT_RETAIN_RUNS` in `crates/agentjail-core/src/run.rs`) —
+and one run's `<jail-id>.audit.log` and `<jail-id>.dns.log` have no size cap: the
+gateway appends and never rotates. A run that talks a great deal grows its two
+files until the disk says otherwise, and twenty of them per class are a count,
+not a budget.
+
+We revisit this at the first adopter who needs a multi-tenant or long-running
+deployment, and on any host where the state root shares a filesystem with
+something that must not fill. Three candidate mechanisms have been identified
+so far — a tmpfs with an explicit sync, an XFS project quota on the state root,
+and a loopback ext4 of a fixed size — and none of them is implemented or
+decided here.
+
 ### File-delivery secrets are unsupported
 
 `secrets[].delivery = "file"` is valid schema but refused by `run`: secrets are
