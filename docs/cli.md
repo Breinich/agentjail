@@ -101,7 +101,9 @@ session **inside the jail**, which needs the run path.
 
 ![Launcher contract: pipes, signals, exit code](diagrams/launcher-sequence.svg)
 
-![run: validate, verify, exec, reap](diagrams/run-lifecycle.svg)
+![run: validate, verify, the networks, the gateway](diagrams/run-setup.svg)
+
+![run: the jail, the tunnel, the exit code](diagrams/run-exec.svg)
 
 ### Signals and exit codes
 

@@ -242,7 +242,8 @@ fails on invalid syntax or on an SVG that no longer matches its source, so a
 diagram here describes this commit and not an earlier design.
 
 - [`deployment.svg`](docs/diagrams/deployment.svg) — the host, the per-run internal network, the jail, and the dual-homed class gateway.
-- [`run-lifecycle.svg`](docs/diagrams/run-lifecycle.svg) — one `run` from the preflight to the reap: per-run network, gateway with the grant and the audit destination, jail, teardown.
+- [`run-setup.svg`](docs/diagrams/run-setup.svg) — what `run` does before the jail exists: preflight, dead-pid prune, the two per-run networks, the gateway with the grant and the audit destination.
+- [`run-exec.svg`](docs/diagrams/run-exec.svg) — from the jail starting to it being reaped: the tunnel, signal forwarding, the exit code, teardown on every path.
 - [`egress-decision.svg`](docs/diagrams/egress-decision.svg) — the grant as `profile egress ∩ class allowlist`, and why one connection is denied `not-in-profile` or `not-in-class`.
 - [`audit-readback.svg`](docs/diagrams/audit-readback.svg) — the per-run audit and DNS files, and reading them back after the container is gone.
 - [`launcher-sequence.svg`](docs/diagrams/launcher-sequence.svg) — the launcher transport: pipes, signals, exit code.

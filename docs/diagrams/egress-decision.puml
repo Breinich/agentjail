@@ -1,50 +1,37 @@
 @startuml egress-decision
-' UML activity diagram only: actions, decisions, merges and notes, and no
-' other diagram or UML element type. The grant at run start, then one decision
-' per connection.
-' Source of record for docs/diagrams/egress-decision.svg. Do not edit the SVG:
-' render it with the pinned PlantUML image (docs/adopting.md).
-' &#45;&#45; is a literal "--": PlantUML reads --text-- as strikeout.
-title The egress decision: grant at start, checked answer per connection
+' UML activity diagram: the grant at start, then one CONNECT decision.
+' Source of record for egress-decision.svg - render with the pinned PlantUML image.
+title The egress decision: grant, then CONNECT
 
 start
-:read the profile's network.egress\nand the class allowlist gateway/classes/<class>.toml;
-if (a profile destination is outside the class?) then (yes)
-  :refuse before anything starts:\nthe class is a ceiling the profile cannot raise;
+:read profile network.egress and the class allowlist;
+if (profile destination outside the class?) then (yes)
+  :refuse before start: the class is a ceiling;
   stop
 endif
-:grant = profile egress ∩ class allowlist,\nwith the class's wildcard and port matching;
+:grant = profile egress matched by class;
 if (grant empty?) then (yes)
-  :announce "egress grant is empty: this jail has no route out"\n(started, not refused);
+  :announce "this jail has no route out";
 endif
-:start the gateway with &#45;&#45;grant <host:port,…>,
-which the code renders as &#45;&#45;grant "" when the grant is empty;
-:CONNECT host:port from the jail;
-if (host is an IP literal?) then (yes)
+:CONNECT host:port;
+if (IP literal?) then (yes)
   :deny reason=ip-literal;
   stop
 endif
-switch (host:port against the grant)
-case (in the grant)
-  :resolve the name once;
-  :check every answer against the blocked ranges;
-  if (an answer is blocked?) then (yes)
-    :deny reason=blocked-<range>,\nno address is tried;
-    stop
-  endif
-  :connect to the pinned address,\nno re-resolution, no unchecked fallback;
-  :audit allow with resolved=… pinned=…;
-case (in the class, not in the profile grant)
-  :deny reason=not-in-profile;
+if (in grant?) then (no)
+  :deny not-in-profile or not-in-class;
   stop
-case (not in the class either)
-  :deny reason=not-in-class;
+endif
+:resolve once, check every answer;
+if (an answer is blocked?) then (yes)
+  :deny blocked-<range>, no address tried;
   stop
-endswitch
+endif
+:connect pinned, audit allow;
 stop
-legend bottom
-  The DNS half makes the same decision in one step: a granted name answers
-  127.0.0.1, and any other name is nxdomain with reason not-in-profile (the
-  class has it, this jail was not granted it) or not-in-class.
+legend right
+  DNS half: a granted name answers 127.0.0.1; any other name is nxdomain with
+  reason=not-in-profile (the class has it, this jail was not granted it) or
+  reason=not-in-class (the class does not have it either).
 endlegend
 @enduml

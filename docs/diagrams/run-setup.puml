@@ -1,0 +1,27 @@
+@startuml run-setup
+' UML sequence diagram: what `run` does before the jail exists.
+' Source of record for run-setup.svg - render with the pinned PlantUML image.
+title run: preflight, the per-run networks, the gateway
+
+actor "operator" as H
+participant "agentjail\nrun" as C
+participant "podman" as P
+
+H -> C : run <profile> -- <cmd>
+C -> C : validate, blockers, class, grant
+C --> H : refusal, or continue
+C -> P : image inspect <tag>
+P --> C : image ID
+C -> P : prune dead-pid containers\nand networks
+P --> C : removed
+C -> P : network create --internal\n--disable-dns --ipv6=false
+P --> C : class network
+C -> P : network create --ipv6=false
+P --> C : egress network
+C -> P : network inspect <class net>
+P --> C : internal, IPv4, no route
+note over C : the same function `doctor --network`\ncalls; a refusal is not a warning
+C -> P : run -d gateway on both networks\n--grant <profile and class>\n--audit-dir <state>
+P --> C : started
+note right : an empty grant is announced\nand not refused: `--grant ""`
+@enduml

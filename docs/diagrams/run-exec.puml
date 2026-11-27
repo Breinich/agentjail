@@ -1,0 +1,26 @@
+@startuml run-exec
+' UML sequence diagram: from the jail starting to it being reaped.
+' Source of record for run-exec.svg - render with the pinned PlantUML image.
+title run: the jail, the tunnel, the exit code
+
+actor "operator" as H
+participant "agentjail\nrun" as C
+participant "podman" as P
+participant "gateway" as G
+participant "jail (PID 1 tini)" as J
+
+C -> P : read the gateway address
+P --> C : address, or the gateway's refusal
+C -> P : run --rm --interactive (class net)\n--dns <gw> --dns-search .\n--env HTTPS_PROXY
+P --> C : jail started
+J -> G : CONNECT host:port
+G --> J : 200, or a logged denial
+H ->> C : SIGINT, SIGTERM, SIGQUIT
+C ->> P : forward unchanged
+P ->> J : to container PID 1
+J --> P : exit code
+P --> C : exit code, or 128+N
+C -> P : remove gateway and networks\non every exit path
+C --> H : the agent's own code
+note over J : the agent's grandchildren\nare not signalled
+@enduml
